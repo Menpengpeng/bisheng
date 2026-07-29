@@ -8,6 +8,7 @@ from langchain_core.tools import ArgsSchema, BaseTool
 from langgraph.prebuilt import create_react_agent
 from loguru import logger
 from pydantic import BaseModel, Field, SkipValidation, field_validator
+from sqlalchemy.engine import URL
 
 from bisheng.citation.domain.schemas.citation_schema import CitationRegistryItemSchema
 from bisheng.citation.domain.services.citation_prompt_helper import (
@@ -147,7 +148,7 @@ class SqlAgentParams(BaseModel):
     """SQL Agent Param Model"""
 
     database_engine: str | None = Field(
-        "mysql", description="Database type, supportmysql, db2, postgres, gaussdb, oracle"
+        "mysql", description="Database type, support mysql, db2, postgres, gaussdb, oracle, sqlserver"
     )
     db_username: str
     db_password: str
@@ -161,9 +162,9 @@ class SqlAgentParams(BaseModel):
         # Convert to lowercase
         if v:
             v = v.lower()
-            if v not in ["mysql", "db2", "postgres", "gaussdb", "oracle", "postgresql"]:
+            if v not in ["mysql", "db2", "postgres", "gaussdb", "oracle", "postgresql", "sqlserver"]:
                 raise ValueError(
-                    "Unsupported database engine. Supported engines are: MySQL, DB2, PostgreSql, GaussDB, Oracle."
+                    "Unsupported database engine. Supported engines are: MySQL, DB2, PostgreSql, GaussDB, Oracle, SQLServer."
                 )
         return v
 
@@ -397,42 +398,115 @@ class AgentNode(BaseNode):
             search_kwargs={"filter": [{"term": {"metadata.document_id": file_metadata["document_id"]}}]}
         )
 
+    def _parse_db_host_port(self, address: str, default_port: int):
+        """Parse host:port from address string."""
+        if ':' in address:
+            host, port = address.rsplit(':', 1)
+            return host, int(port)
+        return address, default_port
+
     def _init_sql_address(self) -> str:
-        """Inisialisasi SQL Database Address"""
+        """Initialize SQL Database Address"""
         if not self._sql_agent:
             return ""
-        if self._sql_agent.database_engine == "mysql":
+        db = self._sql_agent
+        if db.database_engine == "mysql":
             try:
                 pass
             except ImportError:
                 raise ImportError("Please install pymysql and sqlalchemy to use mysql database")
-            return f"mysql+pymysql://{self._sql_agent.db_username}:{self._sql_agent.db_password}@{self._sql_agent.db_address}/{self._sql_agent.db_name}?charset=utf8mb4"
-        elif self._sql_agent.database_engine == "db2":
+            host, port = self._parse_db_host_port(db.db_address, 3306)
+            url = URL.create(
+                "mysql+pymysql",
+                username=db.db_username,
+                password=db.db_password,
+                host=host,
+                port=port,
+                database=db.db_name,
+                query={"charset": "utf8mb4"},
+            )
+            return url.render_as_string(hide_password=False)
+        elif db.database_engine == "db2":
             try:
                 pass
             except ImportError:
                 raise ImportError("Please install ibm_db and ibm_db_sa to use db2 database")
-            return f"db2+ibm_db://{self._sql_agent.db_username}:{self._sql_agent.db_password}@{self._sql_agent.db_address}/{self._sql_agent.db_name}"
-        elif self._sql_agent.database_engine in ["postgres", "postgresql"]:
+            host, port = self._parse_db_host_port(db.db_address, 50000)
+            url = URL.create(
+                "db2+ibm_db",
+                username=db.db_username,
+                password=db.db_password,
+                host=host,
+                port=port,
+                database=db.db_name,
+            )
+            return url.render_as_string(hide_password=False)
+        elif db.database_engine in ["postgres", "postgresql"]:
             try:
                 pass
             except ImportError:
                 raise ImportError("Please install psycopg2 and sqlalchemy to use postgresql database")
-            return f"postgresql+psycopg2://{self._sql_agent.db_username}:{self._sql_agent.db_password}@{self._sql_agent.db_address}/{self._sql_agent.db_name}"
-        elif self._sql_agent.database_engine == "gaussdb":
+            host, port = self._parse_db_host_port(db.db_address, 5432)
+            url = URL.create(
+                "postgresql+psycopg2",
+                username=db.db_username,
+                password=db.db_password,
+                host=host,
+                port=port,
+                database=db.db_name,
+            )
+            return url.render_as_string(hide_password=False)
+        elif db.database_engine == "gaussdb":
             try:
                 pass
             except ImportError:
                 raise ImportError("Please install psycopg2 and opengauss_sqlalchemy to use gaussdb database")
-            return f"opengauss+psycopg2://{self._sql_agent.db_username}:{self._sql_agent.db_password}@{self._sql_agent.db_address}/{self._sql_agent.db_name}"
-        elif self._sql_agent.database_engine == "oracle":
+            host, port = self._parse_db_host_port(db.db_address, 5432)
+            url = URL.create(
+                "opengauss+psycopg2",
+                username=db.db_username,
+                password=db.db_password,
+                host=host,
+                port=port,
+                database=db.db_name,
+            )
+            return url.render_as_string(hide_password=False)
+        elif db.database_engine == "oracle":
             try:
                 pass
             except ImportError:
                 raise ImportError("Please install oracledb and sqlalchemy to use oracle database")
-            return f"oracle+oracledb://{self._sql_agent.db_username}:{self._sql_agent.db_password}@{self._sql_agent.db_address}?service_name={self._sql_agent.db_name}"
+            host, port = self._parse_db_host_port(db.db_address, 1521)
+            url = URL.create(
+                "oracle+oracledb",
+                username=db.db_username,
+                password=db.db_password,
+                host=host,
+                port=port,
+                query={"service_name": db.db_name},
+            )
+            return url.render_as_string(hide_password=False)
+        elif db.database_engine == "sqlserver":
+            try:
+                pass
+            except ImportError:
+                raise ImportError("Please install pyodbc and sqlalchemy to use sqlserver database")
+            host, port = self._parse_db_host_port(db.db_address, 1433)
+            url = URL.create(
+                "mssql+pyodbc",
+                username=db.db_username,
+                password=db.db_password,
+                host=host,
+                port=port,
+                database=db.db_name,
+                query={
+                    "driver": "ODBC Driver 18 for SQL Server",
+                    "TrustServerCertificate": "yes",
+                },
+            )
+            return url.render_as_string(hide_password=False)
         else:
-            raise ValueError(f"Unsupported database engine: {self._sql_agent.database_engine}")
+            raise ValueError(f"Unsupported database engine: {db.database_engine}")
 
     def _run(self, unique_id: str):
         ret = {}

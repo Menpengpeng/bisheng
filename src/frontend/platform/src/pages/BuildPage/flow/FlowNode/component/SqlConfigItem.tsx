@@ -13,12 +13,12 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
     const { database_engine, db_address, db_name, db_username, db_password, open } = values;
 
     // 定义可用的数据库选项
-    const DATABASE_OPTIONS = ['MySQL', 'Db2', 'PostgreSQL', 'GaussDB', 'Oracle'];
+    const DATABASE_OPTIONS = ['MySQL', 'Db2', 'PostgreSQL', 'GaussDB', 'Oracle', 'SQLServer'];
 
     // 初始化时设置默认数据库类型
     useEffect(() => {
         if (!database_engine) {
-            handleChange("database_engine", "mysql");
+            handleChange("database_engine", "MySQL");
         }
     }, []);
 
@@ -108,7 +108,7 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
                         value={database_engine}
                         onValueChange={(value) => handleChange("database_engine", value)}
                     >
-                        <SelectTrigger className={`mt-2 mb-4 nodrag ${errors.database_engine ? "border-red-500" : ""}`}>
+                        <SelectTrigger className={`mt-2 mb-4 nodrag ${errors['database_engine'] ? "border-red-500" : ""}`}>
                             <SelectValue placeholder={t("selectDbType")} />
                         </SelectTrigger>
                         <SelectContent>
@@ -123,7 +123,7 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
                     {/* 数据库地址 */}
                     <Label className="flex items-center bisheng-label">{t("dbAddress")}</Label> {/* 数据库地址 */}
                     <Input
-                        className={`mt-2 nodrag ${errors.db_address ? "border-red-500" : ""}`}
+                        className={`mt-2 nodrag ${errors['db_address'] ? "border-red-500" : ""}`}
                         value={db_address}
                         type="text"
                         onChange={(e) => handleChange("db_address", e.target.value)}
@@ -132,7 +132,7 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
                     {/* 数据库名称 */}
                     <Label className="flex items-center bisheng-label mt-4">{t("dbName")}</Label> {/* 数据库名称 */}
                     <Input
-                        className={`mt-2 nodrag ${errors.db_name ? "border-red-500" : ""}`}
+                        className={`mt-2 nodrag ${errors['db_name'] ? "border-red-500" : ""}`}
                         value={db_name}
                         type="text"
                         onChange={(e) => handleChange("db_name", e.target.value)}
@@ -141,7 +141,7 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
                     {/* 数据库用户名 */}
                     <Label className="flex items-center bisheng-label mt-4">{t("dbUsername")}</Label> {/* 数据库用户名 */}
                     <Input
-                        className={`mt-2 nodrag ${errors.db_username ? "border-red-500" : ""}`}
+                        className={`mt-2 nodrag ${errors['db_username'] ? "border-red-500" : ""}`}
                         value={db_username}
                         type="text"
                         onChange={(e) => handleChange("db_username", e.target.value)}
@@ -150,7 +150,7 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
                     {/* 数据库密码 */}
                     <Label className="flex items-center bisheng-label mt-4">{t("dbPassword")}</Label> {/* 数据库密码 */}
                     <Input
-                        className={`mt-2 nodrag ${errors.db_password ? "border-red-500" : ""}`}
+                        className={`mt-2 nodrag ${errors['db_password'] ? "border-red-500" : ""}`}
                         value={db_password}
                         type="password"
                         onChange={(e) => handleChange("db_password", e.target.value)}
