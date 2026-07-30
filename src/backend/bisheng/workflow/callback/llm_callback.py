@@ -32,6 +32,7 @@ class LLMNodeCallbackHandler(BaseCallbackHandler):
         self.node_id = node_id
         self.node_name = node_name
         self.output = output
+        self._original_output = output
         self.output_len = 0
         self.output_key = output_key
         self.stream = stream
@@ -83,7 +84,7 @@ class LLMNodeCallbackHandler(BaseCallbackHandler):
                 }
             )
         if kwargs["name"] == "sql_agent":
-            self.output = True
+            self.output = self._original_output
 
     def on_tool_error(self, error: Union[Exception, KeyboardInterrupt], **kwargs: Any) -> Any:
         """Run when tool errors."""
@@ -97,7 +98,7 @@ class LLMNodeCallbackHandler(BaseCallbackHandler):
                 }
             )
         if kwargs["name"] == "sql_agent":
-            self.output = True
+            self.output = self._original_output
 
     def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
         chunk = kwargs.get("chunk", None)

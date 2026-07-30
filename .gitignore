@@ -231,6 +231,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Local docker image tar (large binary, must not commit)
+bisheng-backend-dev-local.tar
+
 # Environments
 .env
 .venv
