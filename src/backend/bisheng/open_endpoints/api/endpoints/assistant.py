@@ -239,6 +239,13 @@ def _check_model_supports_streaming(agent: AssistantAgent) -> bool:
         bool: Does it support streaming calls?
     """
     try:
+        # ReAct 模式下 astream 内部降级为 react_run 一次性返回 AIMessage（非 AIMessageChunk），
+        # 真实流式分支的 isinstance 检查会丢弃所有 chunk，导致流式响应无内容。
+        # 因此 ReAct 模式强制走伪流式分支（先 run 再一次性吐出完整结果）。
+        if getattr(agent, 'current_agent_executor', None) == 'ReAct':
+            logger.info('act=_check_model_supports_streaming ReAct mode detected, fallback to pseudo-streaming')
+            return False
+
         # Othersagentright of privacyLLMDoes it support streaming?
         if hasattr(agent, 'llm') and agent.llm:
             # OthersBishengLLMright of privacystreamingProperty
