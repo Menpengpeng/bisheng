@@ -5,7 +5,6 @@ import os
 from collections import defaultdict
 from io import BytesIO
 
-import numpy as np
 import pandas as pd
 from fastapi import HTTPException, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -288,6 +287,8 @@ async def add_evaluation_task(evaluation_id: int):
                 one["answer"] = await asyncio.to_thread(
                     execute_workflow_get_answer, workflow_info, evaluation, one.get("question", "")
                 )
+                current_progress += progress_increment
+                redis_client.set(redis_key, round(current_progress))
 
         _llm = await LLMService.get_evaluation_llm_object(
             evaluation.user_id,
@@ -318,6 +319,8 @@ async def add_evaluation_task(evaluation_id: int):
         ]
         row_list = []
         tmp_dict = defaultdict(int)
+        # 各指标的有效样本数(非nan), 用于总分求平均
+        valid_count_dict = defaultdict(int)
         total_dict = {}
 
         for index, one in enumerate(question):
@@ -325,9 +328,12 @@ async def add_evaluation_task(evaluation_id: int):
             for field, title, unit_type in columns:
                 value = result.get(field)[index]
                 if unit_type != 1:
-                    tmp_dict[field] += value
+                    # 跳过nan值, 避免污染累加总和
+                    if not pd.isna(value):
+                        tmp_dict[field] += value
+                        valid_count_dict[field] += 1
                 if unit_type == 3:
-                    value = f"{value * 100:.2f}%" if value not in ["nan", np.nan] else value
+                    value = f"{value * 100:.2f}%" if not pd.isna(value) else value
                 row_data[title] = value
             row_list.append(row_data)
 
@@ -335,7 +341,9 @@ async def add_evaluation_task(evaluation_id: int):
         for field, title, unit_type in columns:
             value = tmp_dict.get(field)
             if unit_type == 3:
-                value = f"{(value / len(row_list)) * 100:.2f}%"
+                # 总分按有效样本数求平均, 无效样本不参与计算
+                valid_count = valid_count_dict.get(field, 0)
+                value = f"{(value / valid_count) * 100:.2f}%" if valid_count else "nan%"
                 total_dict[field] = value
             total_row_data[title] = value
         row_list.append(total_row_data)

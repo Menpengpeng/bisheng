@@ -145,7 +145,9 @@ def compute_answer_correctness(
             out["statements_num_overlap"].append(tp)
             out["statements_num_answer_only"].append(fp)
             out["statements_num_gt_only"].append(fn)
-            out["answer_f1"].append(tp / (tp + 0.5 * (fp + fn)))
+            # 分母为0时返回nan, 与precision/recall保持一致, 避免除零导致任务失败
+            f1_denominator = tp + 0.5 * (fp + fn)
+            out["answer_f1"].append(tp / f1_denominator if f1_denominator != 0 else np.nan)
             out["answer_precision"].append(tp / (tp + fp) if (tp + fp) != 0 else np.nan)
             out["answer_recall"].append(tp / (tp + fn) if (tp + fn) != 0 else np.nan)
         else:
