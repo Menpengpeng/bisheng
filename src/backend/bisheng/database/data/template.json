@@ -28713,7 +28713,10 @@
                       "db_address": "",
                       "db_password": "",
                       "db_username": "",
-                      "database_engine": "mysql"
+                      "database_engine": "mysql",
+                      "selected_tables": [],
+                      "schema_cache_enabled": false,
+                      "schema_cache_ttl": 24
                     }
                   }
                 ]

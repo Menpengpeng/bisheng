@@ -155,7 +155,7 @@ export const copyReportTemplate = async (nodeData): Promise<any> => {
     if (nodeData.type === 'report') {
         const { version_key } = nodeData.group_params[0].params[0].value
         if (version_key) {
-            return axios.post(`/api/v1/workflow/report/copy`, {
+            return axios.post<unknown, { version_key: string }>(`/api/v1/workflow/report/copy`, {
                 version_key
             }).then(res => {
                 nodeData.group_params[0].params[0].value.version_key = res.version_key
@@ -166,6 +166,41 @@ export const copyReportTemplate = async (nodeData): Promise<any> => {
     }
     return Promise.resolve('ok')
 }
+
+/**
+ * F043: fetch the visible table list of the configured database at config time.
+ * The endpoint is stateless and never persists the connection params.
+ */
+export const getDbTables = async (payload: {
+    database_engine: string;
+    db_address: string;
+    db_name: string;
+    db_username: string;
+    db_password: string;
+}): Promise<{ tables: string[]; truncated: boolean }> => {
+    return await axios.post("/api/v1/workflow/db/tables", payload);
+};
+
+/**
+ * F043: force-refresh the prefetched schema DDL cache for selected tables.
+ */
+export const refreshDbSchema = async (payload: {
+    database_engine: string;
+    db_address: string;
+    db_name: string;
+    db_username: string;
+    db_password: string;
+    selected_tables: string[];
+    schema_cache_enabled: boolean;
+    schema_cache_ttl: number;
+}): Promise<{
+    tables: string[];
+    missing_tables: string[];
+    fetched_at: string;
+    from_cache: boolean;
+}> => {
+    return await axios.post("/api/v1/workflow/db/schema/refresh", payload);
+};
 
 /**
  * 工作流节点模板
@@ -680,7 +715,10 @@ const workflowTemplate = [
                             "db_address": "",
                             "db_name": "",
                             "db_username": "",
-                            "db_password": ""
+                            "db_password": "",
+                            "selected_tables": [],
+                            "schema_cache_enabled": false,
+                            "schema_cache_ttl": 24
                         }
                     }
                 ]

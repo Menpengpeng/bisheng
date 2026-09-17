@@ -8,7 +8,6 @@ from langchain_core.tools import ArgsSchema, BaseTool
 from langgraph.prebuilt import create_react_agent
 from loguru import logger
 from pydantic import BaseModel, Field, SkipValidation, field_validator
-from sqlalchemy.engine import URL
 
 from bisheng.citation.domain.schemas.citation_schema import CitationRegistryItemSchema
 from bisheng.citation.domain.services.citation_prompt_helper import (
@@ -148,13 +147,32 @@ class SqlAgentParams(BaseModel):
     """SQL Agent Param Model"""
 
     database_engine: str | None = Field(
-        "mysql", description="Database type, support mysql, db2, postgres, gaussdb, oracle, sqlserver"
+        "mysql", description="Database type, support mysql, db2, postgres, gaussdb, oracle, sqlserver, dm"
     )
     db_username: str
     db_password: str
     db_address: str
     db_name: str
     open: bool = False
+    # F043: tables selected on the canvas; empty means the legacy self-discovery path
+    selected_tables: list[str] = Field(default_factory=list, description="Selected tables for NL2SQL")
+    # F043: when enabled, prefetched schema DDL is cached in Redis
+    schema_cache_enabled: bool = Field(False, description="Enable schema cache")
+    # F043: user-configured cache lifetime in hours; default 24h (clamped 1-720)
+    schema_cache_ttl: int = Field(24, description="Schema cache TTL in hours")
+
+    @field_validator("schema_cache_ttl")
+    @classmethod
+    def validate_schema_cache_ttl(cls, v):
+        # Clamp instead of raising: a bad saved value must never block loading
+        # the workflow; the UI also enforces the 1-720 hours range.
+        if v is None:
+            return 24
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return 24
+        return max(1, min(720, v))
 
     @field_validator("database_engine")
     @classmethod
@@ -162,9 +180,10 @@ class SqlAgentParams(BaseModel):
         # Convert to lowercase
         if v:
             v = v.lower()
-            if v not in ["mysql", "db2", "postgres", "gaussdb", "oracle", "postgresql", "sqlserver"]:
+            if v not in ["mysql", "db2", "postgres", "gaussdb", "oracle", "postgresql", "sqlserver", "dm", "dm8"]:
                 raise ValueError(
-                    "Unsupported database engine. Supported engines are: MySQL, DB2, PostgreSql, GaussDB, Oracle, SQLServer."
+                    "Unsupported database engine. "
+                    "Supported engines are: MySQL, DB2, PostgreSql, GaussDB, Oracle, SQLServer, DM."
                 )
         return v
 
@@ -227,6 +246,9 @@ class AgentNode(BaseNode):
             else None
         )
         self._sql_address = ""
+        # F043: schema source summary (cache hit / db fetch), shown in the
+        # run log panel via parse_log -> on_node_end. None when SQL is unused.
+        self._sql_schema_log: str | None = None
         if self._sql_agent and self._sql_agent.open:
             self._sql_address = self._init_sql_address()
 
@@ -331,8 +353,48 @@ class AgentNode(BaseNode):
     def init_sql_agent_tool(self):
         if not self._sql_address:
             return []
-        tool_params = {"sql_agent": {"llm": self._llm, "sql_address": self._sql_address}}
+        sql_tool_config = {"llm": self._llm, "sql_address": self._sql_address}
+
+        # F043: when tables are preselected, fetch their schema DDL up front
+        # (Redis cached when enabled) and narrow the SQL agent to them. An
+        # empty selection keeps the legacy list/schema self-discovery path.
+        selected_tables = self._sql_agent.selected_tables or []
+        if selected_tables:
+            from bisheng.workflow.nodes.agent.db_schema_service import get_schema_with_cache
+
+            schema_result = get_schema_with_cache(self._sql_agent, self.tenant_id)
+            sql_tool_config["selected_tables"] = schema_result.found
+            if schema_result.ddl:
+                sql_tool_config["schema_ddl"] = schema_result.ddl
+            # 运行日志面板展示 Schema 来源(缓存命中/回源), 经 parse_log 推送前端
+            self._sql_schema_log = self._format_schema_cache_log(
+                schema_result, self._sql_agent.schema_cache_enabled)
+            logger.info(
+                "act=sql_agent_schema_prepared tables={} missing={} from_cache={}",
+                len(schema_result.found), len(schema_result.missing), schema_result.from_cache,
+            )
+        else:
+            # 未选表: 走运行时自发现路径, 不使用缓存, 也在运行日志中说明
+            self._sql_schema_log = "未选择数据表, Agent 将在运行时自行获取表结构(不使用 Schema 缓存)"
+
+        tool_params = {"sql_agent": sql_tool_config}
         return load_tools(tool_params=tool_params, llm=self._llm)
+
+    @staticmethod
+    def _format_schema_cache_log(schema_result, cache_enabled: bool) -> str:
+        """Summarize the schema source for the run log panel."""
+        if schema_result.from_cache:
+            source = "Schema 缓存(命中)"
+        elif cache_enabled:
+            source = "数据库实时拉取(缓存未命中, 已写回缓存)"
+        else:
+            source = "数据库实时拉取(缓存未启用)"
+        lines = [f"Schema 来源: {source}", f"表数量: {len(schema_result.found)}"]
+        if schema_result.missing:
+            lines.append(f"缺失表: {', '.join(schema_result.missing)}")
+        if schema_result.fetched_at:
+            lines.append(f"拉取时间: {schema_result.fetched_at}")
+        return "\n".join(lines)
 
     def _init_knowledge_tools(self, knowledge_retriever: dict):
         if not self._knowledge_ids:
@@ -398,115 +460,13 @@ class AgentNode(BaseNode):
             search_kwargs={"filter": [{"term": {"metadata.document_id": file_metadata["document_id"]}}]}
         )
 
-    def _parse_db_host_port(self, address: str, default_port: int):
-        """Parse host:port from address string."""
-        if ':' in address:
-            host, port = address.rsplit(':', 1)
-            return host, int(port)
-        return address, default_port
-
     def _init_sql_address(self) -> str:
-        """Initialize SQL Database Address"""
+        """Initialize SQL Database Address (delegated to db_schema_service)."""
         if not self._sql_agent:
             return ""
-        db = self._sql_agent
-        if db.database_engine == "mysql":
-            try:
-                pass
-            except ImportError:
-                raise ImportError("Please install pymysql and sqlalchemy to use mysql database")
-            host, port = self._parse_db_host_port(db.db_address, 3306)
-            url = URL.create(
-                "mysql+pymysql",
-                username=db.db_username,
-                password=db.db_password,
-                host=host,
-                port=port,
-                database=db.db_name,
-                query={"charset": "utf8mb4"},
-            )
-            return url.render_as_string(hide_password=False)
-        elif db.database_engine == "db2":
-            try:
-                pass
-            except ImportError:
-                raise ImportError("Please install ibm_db and ibm_db_sa to use db2 database")
-            host, port = self._parse_db_host_port(db.db_address, 50000)
-            url = URL.create(
-                "db2+ibm_db",
-                username=db.db_username,
-                password=db.db_password,
-                host=host,
-                port=port,
-                database=db.db_name,
-            )
-            return url.render_as_string(hide_password=False)
-        elif db.database_engine in ["postgres", "postgresql"]:
-            try:
-                pass
-            except ImportError:
-                raise ImportError("Please install psycopg2 and sqlalchemy to use postgresql database")
-            host, port = self._parse_db_host_port(db.db_address, 5432)
-            url = URL.create(
-                "postgresql+psycopg2",
-                username=db.db_username,
-                password=db.db_password,
-                host=host,
-                port=port,
-                database=db.db_name,
-            )
-            return url.render_as_string(hide_password=False)
-        elif db.database_engine == "gaussdb":
-            try:
-                pass
-            except ImportError:
-                raise ImportError("Please install psycopg2 and opengauss_sqlalchemy to use gaussdb database")
-            host, port = self._parse_db_host_port(db.db_address, 5432)
-            url = URL.create(
-                "opengauss+psycopg2",
-                username=db.db_username,
-                password=db.db_password,
-                host=host,
-                port=port,
-                database=db.db_name,
-            )
-            return url.render_as_string(hide_password=False)
-        elif db.database_engine == "oracle":
-            try:
-                pass
-            except ImportError:
-                raise ImportError("Please install oracledb and sqlalchemy to use oracle database")
-            host, port = self._parse_db_host_port(db.db_address, 1521)
-            url = URL.create(
-                "oracle+oracledb",
-                username=db.db_username,
-                password=db.db_password,
-                host=host,
-                port=port,
-                query={"service_name": db.db_name},
-            )
-            return url.render_as_string(hide_password=False)
-        elif db.database_engine == "sqlserver":
-            try:
-                pass
-            except ImportError:
-                raise ImportError("Please install pyodbc and sqlalchemy to use sqlserver database")
-            host, port = self._parse_db_host_port(db.db_address, 1433)
-            url = URL.create(
-                "mssql+pyodbc",
-                username=db.db_username,
-                password=db.db_password,
-                host=host,
-                port=port,
-                database=db.db_name,
-                query={
-                    "driver": "ODBC Driver 18 for SQL Server",
-                    "TrustServerCertificate": "yes",
-                },
-            )
-            return url.render_as_string(hide_password=False)
-        else:
-            raise ValueError(f"Unsupported database engine: {db.database_engine}")
+        from bisheng.workflow.nodes.agent.db_schema_service import build_sql_uri
+
+        return build_sql_uri(self._sql_agent).uri
 
     def _run(self, unique_id: str):
         ret = {}
@@ -590,6 +550,13 @@ class AgentNode(BaseNode):
             if self._batch_variable_list:
                 one_ret.insert(
                     0, {"key": "batch_variable", "value": self._batch_variable_list[index], "type": "variable"}
+                )
+
+            # F043: schema cache source summary (sql agent only)
+            sql_schema_log = getattr(self, "_sql_schema_log", None)
+            if sql_schema_log:
+                one_ret.append(
+                    {"key": "sql_schema_cache", "value": sql_schema_log, "type": "params"}
                 )
 
             # Handler Call Log

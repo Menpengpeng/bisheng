@@ -1,6 +1,7 @@
 import time
 from typing import Optional, Union
 
+import anyio
 from fastapi import APIRouter, Body, Depends, Query, WebSocket, WebSocketException, Request, \
     status as http_status
 from loguru import logger
@@ -9,10 +10,17 @@ from sqlmodel import select
 from bisheng.api.services.flow import FlowService
 from bisheng.api.services.workflow import WorkFlowService
 from bisheng.api.v1.chat import chat_manager
+from bisheng.api.v1.schema.workflow import (
+    DbSchemaRefreshRequest,
+    DbSchemaRefreshResponse,
+    DbTableListRequest,
+    DbTableListResponse,
+)
 from bisheng.api.v1.schemas import FlowVersionCreate, resp_200
 from bisheng.common.chat.types import WorkType
 from bisheng.common.constants.enums.telemetry import BaseTelemetryTypeEnum
 from bisheng.common.dependencies.user_deps import UserPayload
+from bisheng.common.errcode.base import BaseErrorCode
 from bisheng.common.errcode.flow import WorkflowNameExistsError, WorkFlowOnlineEditError, AppWriteAuthError
 from bisheng.common.errcode.http_error import UnAuthorizedError, NotFoundError
 from bisheng.common.services import telemetry_service
@@ -29,6 +37,7 @@ from bisheng.role.domain.services.quota_service import require_quota, QuotaResou
 from bisheng.share_link.api.dependencies import header_share_token_parser
 from bisheng.share_link.domain.models.share_link import ShareLink
 from bisheng.utils import generate_uuid
+from bisheng.workflow.nodes.agent.db_schema_service import list_tables, refresh_schema_cache
 from bisheng_langchain.utils.requests import Requests
 
 router = APIRouter(prefix='/workflow', tags=['Workflow'])
@@ -360,3 +369,41 @@ async def read_flows(*,
         permission_id=permission_id,
     )
     return resp_200(data=result)
+
+
+# ---------------------------------------------------------------------------
+# F043: stateless database inspection for the assistant node SQL config
+# ---------------------------------------------------------------------------
+
+@router.post('/db/tables', status_code=200)
+async def list_db_tables(
+        payload: DbTableListRequest,
+        login_user: UserPayload = Depends(UserPayload.get_login_user)):
+    """List visible tables of the configured database at config time.
+
+    The endpoint is stateless: connection params arrive in the body and are
+    never persisted. Only read-only metadata is queried.
+    """
+    try:
+        tables, truncated = await anyio.to_thread.run_sync(list_tables, payload)
+    except BaseErrorCode as e:
+        return e.return_resp_instance()
+    return resp_200(DbTableListResponse(tables=tables, truncated=truncated).model_dump())
+
+
+@router.post('/db/schema/refresh', status_code=200)
+async def refresh_db_schema(
+        payload: DbSchemaRefreshRequest,
+        login_user: UserPayload = Depends(UserPayload.get_login_user)):
+    """Force-refresh the prefetched schema DDL for the selected tables."""
+    try:
+        result = await anyio.to_thread.run_sync(
+            refresh_schema_cache, payload, login_user.tenant_id)
+    except BaseErrorCode as e:
+        return e.return_resp_instance()
+    return resp_200(DbSchemaRefreshResponse(
+        tables=result.found,
+        missing_tables=result.missing,
+        fetched_at=result.fetched_at,
+        from_cache=result.from_cache,
+    ).model_dump())

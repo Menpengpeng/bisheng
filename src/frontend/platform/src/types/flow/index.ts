@@ -121,6 +121,8 @@ export interface WorkFlow {
   nodes: Node[];
   edges: Edge[];
   viewport: Viewport;
+  /** Workflow logo path; optional, written by saveWorkflow. */
+  logo?: string;
   // status: number;
   // style?: FlowStyleType;
   // user_name?: string;

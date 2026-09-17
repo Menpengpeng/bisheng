@@ -69,3 +69,41 @@ class WorkflowEvent(BaseModel):
 class WorkflowStream(BaseModel):
     session_id: str = Field(default=None, description='The session id')
     data: WorkflowEvent | list[WorkflowEvent] = Field(default=None, description='The event data or event data list')
+
+
+# ---------------------------------------------------------------------------
+# F043: stateless SQL database inspection endpoints (assistant node)
+# ---------------------------------------------------------------------------
+
+class DbTableListRequest(BaseModel):
+    """Connection params for listing tables at config time (never persisted)."""
+
+    database_engine: str = Field(
+        default='mysql',
+        description='mysql, postgresql, oracle, sqlserver, db2, gaussdb, dm',
+    )
+    db_address: str = Field(..., description='host:port')
+    db_name: str = Field(..., description='database/schema name')
+    db_username: str = Field(..., description='database user')
+    db_password: str = Field(..., description='database password')
+
+
+class DbTableListResponse(BaseModel):
+    tables: List[str] = Field(default_factory=list, description='Visible table names')
+    truncated: bool = Field(default=False, description='Soft limit (2000) reached')
+
+
+class DbSchemaRefreshRequest(DbTableListRequest):
+    selected_tables: List[str] = Field(
+        default_factory=list, description='Tables whose schema should be prefetched')
+    schema_cache_enabled: bool = Field(
+        default=False, description='Rebuild the Redis cache when True')
+    schema_cache_ttl: int = Field(
+        default=24, ge=1, le=720, description='Cache lifetime in hours (default 24)')
+
+
+class DbSchemaRefreshResponse(BaseModel):
+    tables: List[str] = Field(default_factory=list, description='Tables that exist')
+    missing_tables: List[str] = Field(default_factory=list, description='Tables not found')
+    fetched_at: Optional[str] = Field(default=None, description='ISO8601 fetch timestamp')
+    from_cache: bool = Field(default=False, description='Served from cache')

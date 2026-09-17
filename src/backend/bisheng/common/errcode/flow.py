@@ -77,3 +77,24 @@ class AppWriteAuthError(BaseErrorCode):
 class AppInvalidCursorError(BaseErrorCode):
     Code: int = 10550
     Msg: str = 'Invalid pagination cursor'
+
+
+# F043: assistant node sql_agent schema inspection (module 105, segment 10560-10563)
+class DbConnectionFailedError(BaseErrorCode):
+    Code: int = 10560
+    Msg: str = 'Database connection failed, please check the connection settings'
+
+
+class DbDriverMissingError(BaseErrorCode):
+    Code: int = 10561
+    Msg: str = 'Missing database driver or client dependency, please check the environment'
+
+
+class DbInspectTimeoutError(BaseErrorCode):
+    Code: int = 10562
+    Msg: str = 'Timed out while fetching metadata, please check the network and connection settings'
+
+
+class DbSchemaNoValidTableError(BaseErrorCode):
+    Code: int = 10563
+    Msg: str = 'None of the selected tables exist in the database, please reselect'
