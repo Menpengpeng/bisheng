@@ -1,7 +1,6 @@
 import { PlusIcon } from "@/components/bs-icons/plus"
 import { bsConfirm } from "@/components/bs-ui/alertDialog/useConfirm"
 import { Button } from "@/components/bs-ui/button"
-import { Checkbox } from "@/components/bs-ui/checkBox"
 import { Switch } from "@/components/bs-ui/switch"
 import {
   Dialog,
@@ -42,74 +41,28 @@ import { DepartmentTreeNode } from "@/types/api/department"
 import { ROLE } from "@/types/api/user"
 import { useContext, useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
+import {
+  ADMIN_CHILD_MENUS,
+  ADMIN_PARENT_ID,
+  CHILD_DEPENDENTS,
+  normalizeRoleMenuSelection,
+  TASK_MODE_MENU_ID,
+  WORKBENCH_CHILD_MENUS,
+  WORKBENCH_PARENT_ID,
+} from "./roleMenuSelection"
+import { RoleQuotaFields } from "./RoleQuotaFields"
+import {
+  buildRoleQuotaConfig,
+  createDefaultRoleQuota,
+  formatRoleQuotaCount,
+  formatRoleQuotaGb,
+  parseRoleQuota,
+  ROLE_QUOTA_DEFAULT_CHANNEL,
+  RoleQuotaState,
+  serializeRoleQuotaSnapshot,
+  validateRoleQuota,
+} from "./roleQuotaConfig"
 
-const WORKBENCH_PARENT_ID = "workstation"
-const ADMIN_PARENT_ID = "admin"
-const WORKBENCH_CHILD_MENUS = ["home", "apps", "subscription", "knowledge_space"] as const
-const ADMIN_CHILD_MENUS = [
-  "board",
-  "model",
-  "log",
-  "knowledge",
-  "create_knowledge",
-  "build",
-  "create_app",
-  "evaluation",
-  "mark_task",
-] as const
-/**
- * 工作台「首页」下挂的子能力：任务模式。它本身就是客户端早已消费的菜单键
- * `linsight_task_mode`（user.plugins）——开启后工作台首页展示技能与任务模式
- * 选择、左上角「新建任务」入口；关闭则全部隐藏。归属首页，作为其依赖项。
- */
-const TASK_MODE_MENU_ID = "linsight_task_mode"
-const WORKBENCH_CHILD_DEPENDENTS: Record<string, readonly string[]> = {
-  home: [TASK_MODE_MENU_ID],
-}
-/**
- * 某些子菜单依赖另一个子菜单（父项关闭则隐藏、且会级联移除）。
- * `create_app` 依赖 `build`；"新建知识库"依赖 `knowledge`（PRD 3.3.3）。
- */
-const ADMIN_CHILD_DEPENDENTS: Record<string, readonly string[]> = {
-  build: ["create_app"],
-  knowledge: ["create_knowledge"],
-}
-/** 工作台 + 管理后台父子依赖合并表，供加载 / 保存 / 级联删除统一引用。 */
-const CHILD_DEPENDENTS: Record<string, readonly string[]> = {
-  ...WORKBENCH_CHILD_DEPENDENTS,
-  ...ADMIN_CHILD_DEPENDENTS,
-}
-
-/** Knowledge-space total upload quota (GB); one decimal, inclusive bounds. */
-const KB_SPACE_FILE_GB_MIN = 0.1
-const KB_SPACE_FILE_GB_MAX = 999
-
-function normalizeKnowledgeSpaceFileGb(raw: string): number | null {
-  const n = Number(raw)
-  if (!Number.isFinite(n)) return null
-  const r = Math.round(n * 10) / 10
-  if (r < KB_SPACE_FILE_GB_MIN || r > KB_SPACE_FILE_GB_MAX) return null
-  if (Math.abs(r - n) > 1e-6) return null
-  return r
-}
-
-function formatKnowledgeSpaceGbInput(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return "500"
-  const r = Math.round(n * 10) / 10
-  if (r < KB_SPACE_FILE_GB_MIN || r > KB_SPACE_FILE_GB_MAX) return "500"
-  return Number.isInteger(r) ? String(r) : r.toFixed(1)
-}
-
-/** Clamp and format after blur — allows odd drafts while typing, fixes display on blur. */
-function clampKnowledgeQuotaGbDisplay(raw: string): string {
-  const t = raw.trim().replace(/，/g, ".")
-  if (!t) return "500"
-  const n = Number(t)
-  if (!Number.isFinite(n)) return "500"
-  const r = Math.round(n * 10) / 10
-  const clamped = Math.max(KB_SPACE_FILE_GB_MIN, Math.min(KB_SPACE_FILE_GB_MAX, r))
-  return Number.isInteger(clamped) ? String(clamped) : clamped.toFixed(1)
-}
 /** 工作台四项（首页 / 应用 / 订阅 / 知识空间）新建角色默认全开，与 PRD 一致 */
 const DEFAULT_ENABLED_MENU_IDS = [
   WORKBENCH_PARENT_ID,
@@ -137,12 +90,7 @@ export default function Roles() {
   const [activeRole, setActiveRole] = useState<ROLE | null>(null)
   const [roleName, setRoleName] = useState("")
   const [departmentId, setDepartmentId] = useState<string>("none")
-  const [quotaFileUnlimited, setQuotaFileUnlimited] = useState(false)
-  const [quotaFileGb, setQuotaFileGb] = useState("500")
-  const [quotaChannelUnlimited, setQuotaChannelUnlimited] = useState(false)
-  const [quotaChannelCount, setQuotaChannelCount] = useState("10")
-  const [quotaSpaceSubscribeUnlimited, setQuotaSpaceSubscribeUnlimited] = useState(false)
-  const [quotaSpaceSubscribeCount, setQuotaSpaceSubscribeCount] = useState("100")
+  const [quota, setQuota] = useState<RoleQuotaState>(createDefaultRoleQuota)
   const [menuIds, setMenuIds] = useState<string[]>([])
   // Per-area "show unauthorized menus (apply)" toggles, split from the legacy
   // single flag so workbench and admin can be configured independently.
@@ -174,6 +122,7 @@ export default function Roles() {
       // `create_app` 依赖 `build`：只有当构建开启时渲染，关闭构建时级联移除。
       { id: "create_app", label: t("menu.createApp"), parentMenuId: "build" as const },
       { id: "evaluation", label: t("menu.evaluation") },
+      { id: "dataset", label: t("menu.dataset") },
       { id: "mark_task", label: t("menu.annotation") },
     ],
     [t]
@@ -199,30 +148,25 @@ export default function Roles() {
   /** 最后一列（操作）不显示列宽拖拽把手，见 ColumnResizeHandle */
   const roleLastResizeColIndex = roleTableCols.length - 2
 
-  const buildEditSnapshot = (
-    roleNameVal: string,
-    departmentIdVal: string,
-    quotaFileUnlimitedVal: boolean,
-    quotaFileGbVal: string,
-    quotaChannelUnlimitedVal: boolean,
-    quotaChannelCountVal: string,
-    quotaSpaceSubscribeUnlimitedVal: boolean,
-    quotaSpaceSubscribeCountVal: string,
-    menuIdsVal: string[],
-    workbenchApprovalModeVal: boolean,
-    adminApprovalModeVal: boolean,
-  ) => JSON.stringify({
-    roleNameVal,
-    departmentIdVal,
-    quotaFileUnlimitedVal,
-    quotaFileGbVal,
-    quotaChannelUnlimitedVal,
-    quotaChannelCountVal,
-    quotaSpaceSubscribeUnlimitedVal,
-    quotaSpaceSubscribeCountVal,
-    menuIds: [...menuIdsVal].sort(),
-    workbenchApprovalModeVal,
-    adminApprovalModeVal,
+  /**
+   * Dirty-check snapshot. Takes an options object on purpose: the previous
+   * eleven positional booleans/strings alternated types, so a mis-ordered call
+   * type-checked fine and silently broke the unsaved-changes prompt.
+   */
+  const buildEditSnapshot = (input: {
+    roleName: string
+    departmentId: string
+    quota: RoleQuotaState
+    menuIds: string[]
+    workbenchApprovalMode: boolean
+    adminApprovalMode: boolean
+  }) => JSON.stringify({
+    roleName: input.roleName,
+    departmentId: input.departmentId,
+    quota: serializeRoleQuotaSnapshot(input.quota),
+    menuIds: [...input.menuIds].sort(),
+    workbenchApprovalMode: input.workbenchApprovalMode,
+    adminApprovalMode: input.adminApprovalMode,
   })
 
   const loadDepartments = async () => {
@@ -259,29 +203,27 @@ export default function Roles() {
     setActiveRole(null)
     setRoleName("")
     setDepartmentId(nextDepartmentId)
-    setQuotaFileUnlimited(false)
-    setQuotaFileGb("500")
-    setQuotaChannelUnlimited(false)
-    setQuotaChannelCount("10")
-    setQuotaSpaceSubscribeUnlimited(false)
-    setQuotaSpaceSubscribeCount("100")
+    const nextQuota = createDefaultRoleQuota()
+    setQuota(nextQuota)
     setWorkbenchApprovalMode(false)
     setAdminApprovalMode(false)
     setMenuIds(nextMenuIds)
     setIsMenuLoading(false)
     setMenuLoadFailed(false)
     setInitialEditSnapshot(
-      buildEditSnapshot("", nextDepartmentId, false, "500", false, "10", false, "100", nextMenuIds, false, false)
+      buildEditSnapshot({
+        roleName: "",
+        departmentId: nextDepartmentId,
+        quota: nextQuota,
+        menuIds: nextMenuIds,
+        workbenchApprovalMode: false,
+        adminApprovalMode: false,
+      })
     )
     setEditOpen(true)
   }
 
-  const loadRoleMenus = async (
-    role: ROLE,
-    fileLimit: number,
-    channelLimit: number,
-    spaceSubscribeLimit: number
-  ) => {
+  const loadRoleMenus = async (role: ROLE, roleQuota: RoleQuotaState) => {
     setIsMenuLoading(true)
     setMenuLoadFailed(false)
     const menuRes = await captureAndAlertRequestErrorHoc(getRoleMenuV2Api(role.id))
@@ -291,11 +233,7 @@ export default function Roles() {
       setIsMenuLoading(false)
       return
     }
-    let ids = [...menuRes].filter((id) => id !== "system_config")
-    // 依赖约束：若父项未启用则剔除依赖项（例如 create_app 依赖 build、任务模式依赖首页）。
-    Object.entries(CHILD_DEPENDENTS).forEach(([parent, deps]) => {
-      if (!ids.includes(parent)) ids = ids.filter((id) => !deps.includes(id))
-    })
+    const ids = normalizeRoleMenuSelection(menuRes)
     setMenuIds(ids)
     const qc = (role.quota_config || {}) as Record<string, unknown>
     // Scoped keys supersede the legacy global flag; fall back to it for roles
@@ -306,55 +244,35 @@ export default function Roles() {
     setWorkbenchApprovalMode(workbenchApproval)
     setAdminApprovalMode(adminApproval)
     setInitialEditSnapshot(
-      buildEditSnapshot(
-        role.role_name || "",
-        role.department_id ? String(role.department_id) : "none",
-        fileLimit === -1,
-        fileLimit > 0 ? formatKnowledgeSpaceGbInput(fileLimit) : "500",
-        channelLimit === -1,
-        channelLimit >= 0 ? String(channelLimit) : "10",
-        spaceSubscribeLimit === -1,
-        spaceSubscribeLimit >= 0 ? String(spaceSubscribeLimit) : "100",
-        ids,
-        workbenchApproval,
-        adminApproval,
-      )
+      buildEditSnapshot({
+        roleName: role.role_name || "",
+        departmentId: role.department_id ? String(role.department_id) : "none",
+        quota: roleQuota,
+        menuIds: ids,
+        workbenchApprovalMode: workbenchApproval,
+        adminApprovalMode: adminApproval,
+      })
     )
     setIsMenuLoading(false)
   }
 
   const openEdit = async (role: ROLE) => {
-    const qc = role.quota_config || {}
     setActiveRole(role)
     setRoleName(role.role_name || "")
     setDepartmentId(role.department_id ? String(role.department_id) : "none")
-    const rawFile = qc.knowledge_space_file
-    const fileLimit = typeof rawFile === "number" ? rawFile : Number(rawFile ?? -1)
-    const channelLimit = Number(qc.channel ?? 10)
-    const spaceSubscribeLimit = Number(qc.knowledge_space_subscribe ?? 100)
-    setQuotaFileUnlimited(fileLimit === -1)
-    setQuotaFileGb(fileLimit > 0 ? formatKnowledgeSpaceGbInput(fileLimit) : "500")
-    setQuotaChannelUnlimited(channelLimit === -1)
-    setQuotaChannelCount(channelLimit >= 0 ? String(channelLimit) : "10")
-    setQuotaSpaceSubscribeUnlimited(spaceSubscribeLimit === -1)
-    setQuotaSpaceSubscribeCount(spaceSubscribeLimit >= 0 ? String(spaceSubscribeLimit) : "100")
+    const roleQuota = parseRoleQuota(role.quota_config)
+    setQuota(roleQuota)
     setMenuIds([])
     setMenuLoadFailed(false)
     setEditOpen(true)
-    await loadRoleMenus(role, fileLimit, channelLimit, spaceSubscribeLimit)
+    await loadRoleMenus(role, roleQuota)
   }
 
   const buildQuotaConfig = (): Record<string, unknown> => {
-    const base: Record<string, unknown> = activeRole?.quota_config
-      ? { ...(activeRole.quota_config as Record<string, unknown>) }
-      : {}
-    base.knowledge_space_file = quotaFileUnlimited
-      ? -1
-      : (normalizeKnowledgeSpaceFileGb(quotaFileGb) ?? KB_SPACE_FILE_GB_MIN)
-    base.channel = quotaChannelUnlimited ? -1 : Math.max(0, Number(quotaChannelCount || 0))
-    base.knowledge_space_subscribe = quotaSpaceSubscribeUnlimited
-      ? -1
-      : Math.max(0, Number(quotaSpaceSubscribeCount || 0))
+    const base = buildRoleQuotaConfig(
+      quota,
+      activeRole?.quota_config ? { ...(activeRole.quota_config as Record<string, unknown>) } : {}
+    )
     base.menu_approval_mode_workbench = workbenchApprovalMode
     base.menu_approval_mode_admin = adminApprovalMode
     // Keep the legacy global flag in sync (= OR of both scopes) for any
@@ -365,25 +283,22 @@ export default function Roles() {
 
   const submitRole = async () => {
     if (isSaving || !roleName.trim() || isMenuLoading || menuLoadFailed) return
-    if (!quotaFileUnlimited && normalizeKnowledgeSpaceFileGb(quotaFileGb) === null) {
-      message({ variant: "error", description: t("system.knowledgeSpaceFileQuotaInvalid") })
+    const quotaError = validateRoleQuota(quota)
+    if (quotaError) {
+      message({ variant: "error", description: t(quotaError) })
       return
     }
     setIsSaving(true)
     const quota_config = buildQuotaConfig()
-    // 保存前清理依赖：父项未开则不应持久化依赖项（例如 build 关闭时移除 create_app）。
-    const sanitizedMenuIds = menuIds.filter((id) => {
-      const parent = Object.entries(CHILD_DEPENDENTS).find(([, deps]) =>
-        (deps as readonly string[]).includes(id),
-      )?.[0]
-      return !parent || menuIds.includes(parent)
-    })
+    // Build the payload only from the current UI selection. API-only legacy or
+    // unknown values must not survive an edit just because they were loaded.
+    const selectedMenuIds = normalizeRoleMenuSelection(menuIds)
     const payload = {
       role_name: roleName.trim(),
       department_id: departmentId === "none" ? null : Number(departmentId),
       quota_config,
       remark: "PRD 2.5 role",
-      menu_ids: sanitizedMenuIds,
+      menu_ids: selectedMenuIds,
     }
     try {
       if (!activeRole) {
@@ -509,52 +424,33 @@ export default function Roles() {
     return el.creator_name?.trim() || "-"
   }
 
-  const formatKnowledgeSpaceUploadQuota = (el: ROLE) => {
-    const qc = (el.quota_config || {}) as Record<string, unknown>
-    const raw = qc.knowledge_space_file
-    const v = typeof raw === "number" ? raw : Number(raw ?? -1)
-    if (Number.isNaN(v)) return "-"
-    if (v === -1) return t("system.unlimited")
-    const r = Math.round(v * 10) / 10
-    const label = Number.isInteger(r) ? String(r) : r.toFixed(1)
-    return `${label} GB`
-  }
+  const formatKnowledgeSpaceUploadQuota = (el: ROLE) =>
+    formatRoleQuotaGb((el.quota_config || {}).knowledge_space_file, t("system.unlimited"))
 
-  const formatChannelCreationLimit = (el: ROLE) => {
-    const qc = (el.quota_config || {}) as Record<string, unknown>
-    const v = Number(qc.channel ?? 10)
-    if (Number.isNaN(v)) return "-"
-    if (v === -1) return t("system.unlimited")
-    return String(v)
-  }
+  const formatChannelCreationLimit = (el: ROLE) =>
+    formatRoleQuotaCount(
+      (el.quota_config || {}).channel,
+      ROLE_QUOTA_DEFAULT_CHANNEL,
+      t("system.unlimited")
+    )
 
   const hasUnsavedEditChanges = useMemo(() => {
     if (!editOpen || !initialEditSnapshot) return false
-    const current = buildEditSnapshot(
+    const current = buildEditSnapshot({
       roleName,
       departmentId,
-      quotaFileUnlimited,
-      quotaFileGb,
-      quotaChannelUnlimited,
-      quotaChannelCount,
-      quotaSpaceSubscribeUnlimited,
-      quotaSpaceSubscribeCount,
+      quota,
       menuIds,
       workbenchApprovalMode,
       adminApprovalMode,
-    )
+    })
     return current !== initialEditSnapshot
   }, [
     editOpen,
     initialEditSnapshot,
     roleName,
     departmentId,
-    quotaFileUnlimited,
-    quotaFileGb,
-    quotaChannelUnlimited,
-    quotaChannelCount,
-    quotaSpaceSubscribeUnlimited,
-    quotaSpaceSubscribeCount,
+    quota,
     menuIds,
     workbenchApprovalMode,
     adminApprovalMode,
@@ -794,72 +690,7 @@ export default function Roles() {
               />
             </div>
 
-            <div className="rounded-md border p-3">
-              <Label>{t("system.knowledgeSpaceFileUploadLimit")}</Label>
-              <p className="mt-1 text-xs text-muted-foreground">{t("system.knowledgeSpaceFileLimitDesc")}</p>
-              <div className="mt-2 flex flex-wrap items-center gap-3">
-                <Checkbox
-                  checked={quotaFileUnlimited}
-                  onCheckedChange={(v) => setQuotaFileUnlimited(Boolean(v))}
-                />
-                <span className="text-sm">{t("system.unlimited")}</span>
-                {!quotaFileUnlimited && (
-                  <>
-                    <Input
-                      type="number"
-                      step={0.1}
-                      value={quotaFileGb}
-                      onChange={(e) => setQuotaFileGb(e.target.value)}
-                      onBlur={() => setQuotaFileGb((prev) => clampKnowledgeQuotaGbDisplay(prev))}
-                      className="w-[120px]"
-                      inputMode="decimal"
-                    />
-                    <span className="text-sm">GB</span>
-                  </>
-                )}
-              </div>
-            </div>
-
-            <div className="rounded-md border p-3">
-              <Label>{t("system.channelQuotaLimit")}</Label>
-              <div className="mt-2 flex flex-wrap items-center gap-3">
-                <Checkbox
-                  checked={quotaChannelUnlimited}
-                  onCheckedChange={(v) => setQuotaChannelUnlimited(Boolean(v))}
-                />
-                <span className="text-sm">{t("system.unlimited")}</span>
-                {!quotaChannelUnlimited && (
-                  <Input
-                    type="number"
-                    min={0}
-                    value={quotaChannelCount}
-                    onChange={(e) => setQuotaChannelCount(e.target.value)}
-                    className="w-[120px]"
-                  />
-                )}
-              </div>
-            </div>
-
-            <div className="rounded-md border p-3">
-              <Label>{t("system.spaceSubscribeQuotaLimit")}</Label>
-              <p className="mt-1 text-xs text-muted-foreground">{t("system.spaceSubscribeQuotaLimitDesc")}</p>
-              <div className="mt-2 flex flex-wrap items-center gap-3">
-                <Checkbox
-                  checked={quotaSpaceSubscribeUnlimited}
-                  onCheckedChange={(v) => setQuotaSpaceSubscribeUnlimited(Boolean(v))}
-                />
-                <span className="text-sm">{t("system.unlimited")}</span>
-                {!quotaSpaceSubscribeUnlimited && (
-                  <Input
-                    type="number"
-                    min={0}
-                    value={quotaSpaceSubscribeCount}
-                    onChange={(e) => setQuotaSpaceSubscribeCount(e.target.value)}
-                    className="w-[120px]"
-                  />
-                )}
-              </div>
-            </div>
+            <RoleQuotaFields value={quota} onChange={setQuota} />
 
             <div className="rounded-md border p-3">
               <Label>{t("system.menuPermissionSection")}</Label>
@@ -876,14 +707,7 @@ export default function Roles() {
                     type="button"
                     variant="link"
                     className="h-auto p-0 text-xs"
-                    onClick={() => {
-                      const qc = activeRole.quota_config || {}
-                      const rawF = qc.knowledge_space_file
-                      const fileLimit = typeof rawF === "number" ? rawF : Number(rawF ?? -1)
-                      const channelLimit = Number(qc.channel ?? 10)
-                      const spaceSubscribeLimit = Number(qc.knowledge_space_subscribe ?? 100)
-                      void loadRoleMenus(activeRole, fileLimit, channelLimit, spaceSubscribeLimit)
-                    }}
+                    onClick={() => void loadRoleMenus(activeRole, parseRoleQuota(activeRole.quota_config))}
                   >
                     {t("retry")}
                   </Button>

@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { ClearIcon } from "@/components/bs-icons/clear";
 import { FormIcon } from "@/components/bs-icons/form";
 import { SendIcon } from "@/components/bs-icons/send";
@@ -13,7 +14,7 @@ import { CirclePause } from "lucide-react";
 import { useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import GuideQuestions from "./GuideQuestions";
-import { resolveChatErrorMessage } from "./chatErrorMessage";
+import { isBlockingChatError, resolveChatErrorMessage } from "./chatErrorMessage";
 import { useMessageStore } from "./messageStore";
 
 export default function ChatInput({ clear, form, questions, inputForm, wsUrl, onBeforSend, onClickClear }) {
@@ -28,7 +29,7 @@ export default function ChatInput({ clear, form, questions, inputForm, wsUrl, on
 
     const { isLoading: audioOpening } = useAudioStore()
 
-    const { messages, hisMessages, chatId, createSendMsg, createWsMsg, updateCurrentMessage, destory, setShowGuideQuestion } = useMessageStore()
+    const { messages, hisMessages, chatId, createSendMsg, createWsMsg, updateCurrentMessage, closeDanglingRunLogs, destory, setShowGuideQuestion } = useMessageStore()
     const currentChatIdRef = useRef(null)
     const inputRef = useRef(null)
     const continueRef = useRef(false)
@@ -128,16 +129,16 @@ export default function ChatInput({ clear, form, questions, inputForm, wsUrl, on
 
         return new Promise((res, rej) => {
             try {
-                let startTime = Date.now();
+                const startTime = Date.now();
                 const ws = new WebSocket(`${webSocketProtocol}://${wsUrl}&chat_id=${chatId}`)
                 wsRef.current = ws
                 // websocket linsen
                 ws.onopen = () => {
                     // 记录连接成功的时间
-                    let endTime = Date.now();
+                    const endTime = Date.now();
 
                     // 计算连接建立所需的时间
-                    let connectionTime = endTime - startTime;
+                    const connectionTime = endTime - startTime;
 
                     // console.log('WebSocket 连接建立时间: ' + connectionTime + ' 毫秒');
                     console.log("WebSocket connection established!");
@@ -147,23 +148,24 @@ export default function ChatInput({ clear, form, questions, inputForm, wsUrl, on
                     // console.log(`WebSocket get: ${Date.now()} 毫秒；与send差值${Date.now() - diffRef.current}毫秒`);
                     const data = JSON.parse(event.data);
 
-                    let errorMsg = ''
                     if (data.category === 'error') {
-                        errorMsg = resolveChatErrorMessage(data.message, t)
+                        const errorMsg = resolveChatErrorMessage(data.message, t)
                         toast({
                             variant: 'error',
                             description: errorMsg
                         })
-                    }
-                    // 异常类型处理，提示
-                    if (errorMsg) {
                         updateCurrentMessage({
                             type: 'end_cover',
                             category: 'tool',
                             message: "{}"
                         }, true)
                         setStop({ show: false, disable: false })
-                        return setInputLock({ locked: true, reason: errorMsg })
+                        // A runtime failure (model auth, tool error) is retryable: keep the input
+                        // usable instead of parking the raw error in its placeholder. Only a dead
+                        // conversation (assistant deleted / offline) locks the input.
+                        return setInputLock(isBlockingChatError(data.message)
+                            ? { locked: true, reason: errorMsg }
+                            : { locked: false, reason: '' })
                     }
                     // 拦截会话串台情况
                     if (currentChatIdRef.current && currentChatIdRef.current !== data.chat_id) return
@@ -254,6 +256,7 @@ export default function ChatInput({ clear, form, questions, inputForm, wsUrl, on
 
             if (!msgClosedRef.current) msgClosedRef.current = true
         } else if (data.type === "close") {
+            closeDanglingRunLogs()
             setStop({ show: false, disable: false })
             setInputLock((prev) => (prev.reason ? prev : { locked: false, reason: '' }))
         }

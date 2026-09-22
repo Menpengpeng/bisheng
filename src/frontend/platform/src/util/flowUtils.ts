@@ -1,9 +1,11 @@
+// @ts-strict-ignore
 import { getAssistantModelConfig, getLlmDefaultModel } from "@/controllers/API/finetune";
 import { copyReportTemplate } from "@/controllers/API/workflow";
 import { Node } from "@xyflow/react";
 import i18next from "i18next";
 import { cloneDeep } from "lodash-es";
 import { useEffect, useRef, useState } from "react";
+import { acceptsImages } from "@/util/fileAcceptUtils";
 
 // 节点名称自动命名
 export function autoNodeName(nodes: Node[], name: string): string {
@@ -147,7 +149,7 @@ export function filterParamByinputCheck(group) {
                 return false;
             }
             // image variable only when the upload type allows images
-            if (key === 'dialog_image_files' && acceptType === 'file') {
+            if (key === 'dialog_image_files' && !acceptsImages(acceptType)) {
                 return false;
             }
             // dialog_file_paths is always exposed (path 恒暴露)
@@ -342,7 +344,7 @@ export function importFlow() {
                 const currentfile = (e.target as HTMLInputElement).files[0];
                 currentfile.text().then(async (text) => {
                     try {
-                        let flow = JSON.parse(text);
+                        const flow = JSON.parse(text);
 
                         if (!flow || !Array.isArray(flow.nodes)) {
                             return reject("flow.nodes 不存在或不是数组");

@@ -3,13 +3,14 @@ GitHub fetcher (httpx mocked) and SkillService.create_from_github (which reuses
 the same _create chain as the upload path). DAO is an in-memory fake; disk IO
 runs against a tmp SkillStore."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
 from bisheng.common.errcode.linsight import (
-    SkillFileTooLargeError,
+    SkillBundleTooLargeError,
     SkillGitHubFetchError,
     SkillGitHubRateLimitError,
     SkillGitHubUrlInvalidError,
@@ -24,7 +25,9 @@ from bisheng.linsight.domain.services.github_skill_fetcher import (
     fetch_skill_files,
     parse_github_url,
 )
-from bisheng.linsight.domain.services.skill_store import MAX_BUNDLE_SIZE, SKILL_MD, SkillStore
+from test.linsight.fixtures.fake_minio import FakeMinioStorage
+
+from bisheng.linsight.domain.services.skill_store import MAX_UNPACKED_SIZE, SKILL_MD, SkillStore
 
 TENANT = 1
 USER = 7
@@ -179,14 +182,14 @@ class TestFetchSkillFiles:
                     {
                         "name": "SKILL.md",
                         "type": "file",
-                        "size": MAX_BUNDLE_SIZE + 1,
+                        "size": MAX_UNPACKED_SIZE + 1,
                         "download_url": f"{RAW}/SKILL.md",
                     },
                 ]
             )
 
         _patch_httpx(monkeypatch, handler)
-        with pytest.raises(SkillFileTooLargeError):
+        with pytest.raises(SkillBundleTooLargeError):
             await fetch_skill_files(GithubTarget("o", "r", "main", ""))
 
     async def test_download_from_unexpected_host_rejected(self, monkeypatch):
@@ -246,8 +249,11 @@ class _FakeSkillDao:
 def service(tmp_path, monkeypatch):
     _FakeSkillDao.reset()
     monkeypatch.setattr(service_module, "LinsightSkillDao", _FakeSkillDao)
-    monkeypatch.setattr(service_module.PermissionService, "authorize", AsyncMock())
-    return service_module.SkillService(store=SkillStore(root=tmp_path))
+    owner_projection = SimpleNamespace(authorize_created=AsyncMock())
+    return service_module.SkillService(
+        store=SkillStore(root=tmp_path, minio=FakeMinioStorage()),
+        owner_projection=owner_projection,
+    )
 
 
 def _patch_fetch(monkeypatch, files):
@@ -262,7 +268,7 @@ class TestCreateFromGithub:
         assert detail.display_name == "演示技能"
         assert detail.source == "manual"
         assert {f.path for f in detail.files} == {SKILL_MD, "scripts/a.py"}
-        service_module.PermissionService.authorize.assert_awaited_once()
+        service._owner_projection.authorize_created.assert_awaited_once()
 
     async def test_missing_skill_md_rejected(self, service, monkeypatch):
         _patch_fetch(monkeypatch, {"readme.md": b"x"})

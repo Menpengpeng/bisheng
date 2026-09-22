@@ -152,7 +152,7 @@ export default function AppRoot() {
             >
                 <div
                     className={cn(
-                        "relative z-0 flex h-full w-full overflow-hidden rounded-[12px] touch-mobile:rounded-none",
+                        "relative z-0 flex h-full w-full overflow-hidden rounded-xl touch-mobile:rounded-none",
                         "bg-white p-0",
                     )}
                 >
@@ -187,10 +187,10 @@ export default function AppRoot() {
                             <button
                                 type="button"
                                 onClick={handleGoBack}
-                                className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-[#ebecf0] bg-white text-[#212121] shadow-sm transition-colors hover:bg-gray-50"
+                                className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-border-base bg-white text-text-1 shadow-sm transition-colors hover:bg-gray-50"
                                 aria-label={localize('com_ui_go_back')}
                             >
-                                <ChevronLeft size={16} className="text-[#212121]" />
+                                <ChevronLeft size={16} className="text-text-1" />
                             </button>
                         </div>
                     )}
@@ -198,7 +198,7 @@ export default function AppRoot() {
                     {/* Chat panel (routed) */}
                     <div className="relative flex h-full max-w-full min-w-0 flex-1 flex-col overflow-hidden">
                         {isAppSurface && isAppChatCompact && !mobileNavHidden && (
-                            <div className="shrink-0 overflow-hidden rounded-t-[12px] bg-white">
+                            <div className="shrink-0 overflow-hidden rounded-t-xl bg-white">
                                 <MobileNav
                                     variant="chat"
                                     navVisible={sidebarVisible}

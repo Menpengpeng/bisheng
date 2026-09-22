@@ -5,6 +5,7 @@
  * legacy task flow but kept here so P5 can delete the Sop components.
  */
 import { getLinsightFileDownloadApi } from '~/api/chat/data-service';
+import { getShareTokenFromPath } from '~/utils/shareToken';
 
 /** Output file shape of `output_result.final_files` (= store `file_list`). */
 export interface ArtifactFile {
@@ -115,10 +116,70 @@ export function toUploadedArtifacts(files: any[] | undefined): ArtifactFile[] {
         });
 }
 
-/** Resolve a MinIO share url into a same-origin fetchable path. */
-export async function resolveArtifactUrl(fileUrl: string, versionId: string): Promise<string> {
+export interface WorkspaceArtifactSnapshot {
+    files?: Parameters<typeof toUploadedArtifacts>[0];
+    file_list?: ArtifactFile[];
+    history?: Array<{ file_list?: ArtifactFile[] }>;
+}
+
+function getWorkspaceArtifactKey(file: ArtifactFile): string {
+    const source = file.source || 'output';
+    const normalizedPath = decodeSafe(file.file_path || '').replace(/\\/g, '/');
+    const workspacePath = normalizedPath.match(/(?:^|\/)(output|uploads)\/(.+)$/i);
+    const identity = workspacePath
+        ? `${workspacePath[1].toLowerCase()}/${workspacePath[2]}`
+        : decodeSafe(file.file_name || '').toLowerCase();
+    return `${source}:${identity}`;
+}
+
+/**
+ * Build the conversation-scoped workspace list from per-round result snapshots.
+ *
+ * `final_files` describes what one task round delivered; it is not the workspace
+ * itself. A later greeting can legitimately have an empty `final_files` array
+ * while still inheriting every prior deliverable. Accumulate snapshots in
+ * chronological order so the drawer keeps those files, with a newer artifact
+ * replacing an older entry at the same workspace path.
+ */
+export function collectConversationWorkspaceFiles(
+    snapshots: Array<WorkspaceArtifactSnapshot | null | undefined>,
+): ArtifactFile[] {
+    const collected = new Map<string, ArtifactFile>();
+
+    const addFiles = (files: ArtifactFile[] | undefined) => {
+        for (const file of files || []) {
+            if (!file?.file_name || !file?.file_url) continue;
+            collected.set(getWorkspaceArtifactKey(file), file);
+        }
+    };
+
+    for (const snapshot of snapshots) {
+        if (!snapshot) continue;
+        addFiles(toUploadedArtifacts(snapshot.files));
+        for (const round of snapshot.history || []) {
+            addFiles(round.file_list);
+        }
+        addFiles(snapshot.file_list);
+    }
+
+    return Array.from(collected.values());
+}
+
+/**
+ * Resolve a MinIO share url into a same-origin fetchable path.
+ *
+ * `shareToken` defaults to the one in the current route: on a share page the
+ * viewer is neither the owner nor an admin, and the backend grants them only
+ * through the `share-token` header. Pass it explicitly from surfaces that run
+ * outside the share route (the standalone `/html` viewer tab).
+ */
+export async function resolveArtifactUrl(
+    fileUrl: string,
+    versionId: string,
+    shareToken: string = getShareTokenFromPath(),
+): Promise<string> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- backend returns {data:{file_path}}, not typed
-    const res: any = await getLinsightFileDownloadApi(fileUrl, versionId);
+    const res: any = await getLinsightFileDownloadApi(fileUrl, versionId, shareToken);
     return `${__APP_ENV__.BASE_URL}${res.data.file_path}`;
 }
 
@@ -175,6 +236,43 @@ export function matchArtifactByRelPath(
     return fileList.find((f) => norm(f.file_name) === base);
 }
 
+const DELIVERABLE_LINK_EXT = /\.(md|markdown|html|htm|docx|pdf)$/i;
+
+/** True when href looks like an internal workspace deliverable reference. */
+export function isDeliverableLinkHref(href: string): boolean {
+    if (!href || isAbsoluteImageSrc(href)) return false;
+    const norm = decodeSafe(href).replace(/\\/g, '/').replace(/^\.?\//, '').replace(/^output\//, '');
+    return DELIVERABLE_LINK_EXT.test(norm);
+}
+
+/**
+ * Resolve a markdown link in the task result answer to a previewable artifact.
+ * Returns undefined when the link names no file this run produced — the caller
+ * renders that as 未生成 rather than guessing which artifact was meant.
+ */
+export function resolveDeliverableLink(
+    fileList: ArtifactFile[] | undefined,
+    href: string,
+): ArtifactFile | undefined {
+    const matched = matchArtifactByRelPath(fileList, href);
+    if (matched) return matched;
+    if (!fileList?.length || !isDeliverableLinkHref(href)) return undefined;
+    const norm = decodeSafe(href).replace(/\\/g, '/').replace(/^\.?\//, '').replace(/^output\//, '');
+    if (fileList.length === 1) {
+        // Case-insensitive retry only: matchArtifactByRelPath compares exactly, so a
+        // model that got just the casing wrong should still resolve. A link naming a
+        // DIFFERENT file must not resolve — this used to map any unmatched name onto a
+        // sole 报告.md, which opened a file with other contents under another name and
+        // hid the fact that the claimed file was never written.
+        const sole = fileList[0];
+        const hrefBase = (norm.split('/').pop() ?? norm).toLowerCase();
+        if (hrefBase === sole.file_name.toLowerCase()) {
+            return sole;
+        }
+    }
+    return undefined;
+}
+
 /**
  * Remove empty raw-HTML block placeholders (e.g. the styled `<div ...></div>`
  * comment/figure boxes some report templates emit) from a markdown deliverable
@@ -201,6 +299,18 @@ export function stripEmptyHtmlPlaceholders(md: string): string {
 }
 
 /**
+ * True for a deliverable that opens in the standalone sandboxed viewer TAB
+ * instead of the in-place preview (see openHtmlArtifactViewer).
+ *
+ * Single source of truth for the two panel hooks that route the click and for
+ * the row hint that marks it, so the marker can never disagree with what the
+ * click actually does.
+ */
+export function isHtmlArtifact(file: ArtifactFile): boolean {
+    return getFileExtension(file.file_name) === 'html';
+}
+
+/**
  * Open an HTML artifact in the standalone sandboxed viewer tab (`/html`).
  *
  * `file.file_url` is a MinIO OBJECT KEY (e.g. `linsight/final_result/<svid>/x.html`),
@@ -210,9 +320,17 @@ export function stripEmptyHtmlPlaceholders(md: string): string {
  * with URLSearchParams also fixes the old bug where the raw key was concatenated
  * straight onto BASE_URL (`/workspace` + `linsight/...` → `/workspacelinsight/...`,
  * a missing-slash 404).
+ *
+ * The viewer opens as its OWN tab at `/html`, so it cannot derive the share
+ * token from its location the way in-page surfaces do — carry it in the query
+ * when we are on a share route, or a share recipient's HTML report 403s.
  */
 export function openHtmlArtifactViewer(file: ArtifactFile, versionId: string): void {
     const params = new URLSearchParams({ url: file.file_url, vid: versionId || '' });
+    const shareToken = getShareTokenFromPath();
+    if (shareToken) {
+        params.set('share', shareToken);
+    }
     window.open(`${__APP_ENV__.BASE_URL}/html?${params.toString()}`, '_blank');
 }
 

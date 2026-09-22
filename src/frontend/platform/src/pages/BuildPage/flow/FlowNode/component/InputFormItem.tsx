@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { Button } from "@/components/bs-ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/bs-ui/dialog";
 import { Input } from "@/components/bs-ui/input";
@@ -13,6 +14,7 @@ import { useTranslation } from "react-i18next";
 import useFlowStore from "../../flowStore";
 import DragOptions from "./DragOptions";
 import FileTypeSelect from "./FileTypeSelect";
+import { acceptsImages } from "@/util/fileAcceptUtils";
 import InputItem from "./InputItem";
 import VarInput from "./VarInput";
 import { t } from "i18next";
@@ -236,7 +238,7 @@ function Form({ nodeId, nodeData, initialData, onSubmit, onCancel, existingOptio
         if (formData.formType === FormType.File) {
             const isParse = formData.processingOption === FormOption.ParseOnly
                 || formData.processingOption === FormOption.ParseIngest;
-            const isImageCapable = formData.fileType === 'all' || formData.fileType === 'image';
+            const isImageCapable = acceptsImages(formData.fileType);
 
             // 解析结果变量名称（解析时）
             if (isParse) {
@@ -347,7 +349,7 @@ function Form({ nodeId, nodeData, initialData, onSubmit, onCancel, existingOptio
                 } else {
                     // 新变量名生成逻辑
                     let counter = 1;
-                    let baseName = names[formType];
+                    const baseName = names[formType];
                     let name = baseName;
                     while (existingOptions?.some(opt => opt.key === name)) {
                         counter += 1;
@@ -358,7 +360,7 @@ function Form({ nodeId, nodeData, initialData, onSubmit, onCancel, existingOptio
             } else {
                 // 新建模式生成唯一变量名
                 let counter = 1;
-                let baseName = names[formType];
+                const baseName = names[formType];
                 let name = baseName;
                 while (existingOptions?.some(opt => opt.key === name)) {
                     counter += 1;
@@ -382,7 +384,7 @@ function Form({ nodeId, nodeData, initialData, onSubmit, onCancel, existingOptio
         setFormData(prev => {
             const updates: any = { fileType };
             const fileOptions = existingOptions?.filter(opt => opt.type === FormType.File) || [];
-            const isImageCapable = fileType === 'all' || fileType === 'image';
+            const isImageCapable = acceptsImages(fileType);
 
             // Image variable only exists for image-capable types. Backfill a unique name
             // when switching into such a type with no value yet — e.g. editing an item
@@ -462,7 +464,7 @@ function Form({ nodeId, nodeData, initialData, onSubmit, onCancel, existingOptio
 
         const option = formData.processingOption;
         const isParse = option === FormOption.ParseOnly || option === FormOption.ParseIngest;
-        const isImageCapable = formData.fileType === 'all' || formData.fileType === 'image';
+        const isImageCapable = acceptsImages(formData.fileType);
 
         switch (fieldType) {
             case 'tempKnowledge':
@@ -855,15 +857,15 @@ export default function InputFormItem({ data, nodeId, onChange, onValidate, onVa
         // 按统一规则清理字段：路径恒留；图片看上传类型；解析结果看是否解析。
         let cleanedImageFile = image_file;
         let cleanedFileContent = file_content;
-        let cleanedFilePath = file_path;
-        let cleanedFileContentSize = file_content_size;
+        const cleanedFilePath = file_path;
+        const cleanedFileContentSize = file_content_size;
 
         if (type === FormType.File) {
             if (!isParse) {
                 cleanedFileContent = '';
             }
             // 图片变量仅在上传类型含图片时保留
-            if (file_type === 'file') {
+            if (!acceptsImages(file_type)) {
                 cleanedImageFile = '';
             }
             // 文件路径恒留（path 恒暴露），不清空 cleanedFilePath
@@ -958,7 +960,7 @@ export default function InputFormItem({ data, nodeId, onChange, onValidate, onVa
                     : (el.file_parse_mode ? [el.file_parse_mode] : []);
                 const isParse = arr.includes(FileProcessingStrategy.ParseContent);
                 const isIngest = arr.includes(FileProcessingStrategy.TempKnowledge);
-                const isImageCapable = el.file_type === 'all' || el.file_type === 'image';
+                const isImageCapable = acceptsImages(el.file_type);
 
                 if (isParse && el.file_content) variableParts.push(el.file_content);
                 if (isImageCapable && el.image_file) variableParts.push(el.image_file);
@@ -970,7 +972,7 @@ export default function InputFormItem({ data, nodeId, onChange, onValidate, onVa
                 }
             }
 
-            let text = `${el.value}（${variableList}）`;
+            const text = `${el.value}（${variableList}）`;
 
             return {
                 key: el.key,

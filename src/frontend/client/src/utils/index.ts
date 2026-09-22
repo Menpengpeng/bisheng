@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import axios from 'axios';
 import React from 'react';
 import { stripCitationMarkers } from '~/components/Chat/Messages/Content/citationUtils';
@@ -7,7 +8,6 @@ export { default as buildTree } from './buildTree';
 export { default as cleanupPreset } from './cleanupPreset';
 export { default as cn } from './cn';
 export * from './convos';
-export * from './duration';
 export * from './endpoints';
 export * from './files';
 export * from './forms';

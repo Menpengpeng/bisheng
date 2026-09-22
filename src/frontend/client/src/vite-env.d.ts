@@ -10,15 +10,18 @@ interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
 
+/** Build-time app config, injected by vite `define` (see vite.config.ts `app_env`). */
 declare const __APP_ENV__: {
+  /** Sub-path this app is served under. */
   BASE_URL: string;
-  BISHENG_HOST?: string;
-  /** 开发时管理端 origin，与 BASE_URL 不同端口时用于拼管理后台链接 */
-  PLATFORM_ORIGIN?: string;
-  [key: string]: any;
+  /** Sub-path of the admin/platform app, for cross-app links. */
+  BISHENG_HOST: string;
 };
 
 declare const __VCONSOLE_ENABLED__: boolean;
+
+/** Build stamp injected by vite.config, e.g. `v2.6.0 (20260806-1432)`. */
+declare const __APP_VERSION__: string;
 
 interface Window {
   /** Branding fields injected at runtime by brand-runtime.js (from /api/v1/brand/runtime-config, cached in localStorage). */

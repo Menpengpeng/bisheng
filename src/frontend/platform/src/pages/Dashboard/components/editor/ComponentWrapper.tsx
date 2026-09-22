@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { Button } from "@/components/bs-ui/button"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuTrigger } from "@/components/bs-ui/dropdownMenu"
 import { Input } from "@/components/bs-ui/input"
@@ -153,7 +154,7 @@ export const ComponentWrapper = memo(({
                             <Button
                                 variant="ghost"
                                 size="icon"
-                                className="h-6 w-6 bg-background/80 backdrop-blur-sm border border-border shadow-sm hover:bg-accent dark:border-gray-500 dark:text-gray-500"
+                                className="h-6 w-6 bg-background/80 border border-border shadow-sm hover:bg-accent dark:border-gray-500 dark:text-gray-500"
                             >
                                 <MoreVerticalIcon className="h-4 w-4" />
                             </Button>
@@ -209,7 +210,7 @@ export const ComponentWrapper = memo(({
                                                 <div className="px-2 py-1.5 text-sm text-muted-foreground">{t('noOtherDashboards')}</div>
                                             ) : (
                                                 dashboards
-                                                    .filter(d => d.id !== component.dashboard_id && d.status === 'draft' && d.write)
+                                                    .filter(d => d.id !== component.dashboard_id && d.status === 'draft')
                                                     .map(dashboard => (
                                                         <DropdownMenuItem
                                                             key={dashboard.id}
@@ -301,5 +302,4 @@ export const ComponentWrapper = memo(({
         </div>
     )
 });
-
 

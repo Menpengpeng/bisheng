@@ -343,6 +343,47 @@ async def test_direct_answer_collects_output_deliverables_without_planned_todos(
     assert called["fallback"] is False
 
 
+async def test_direct_answer_flags_a_phantom_deliverable_without_repairing_it(monkeypatch):
+    """The model claims a second file it never wrote.
+
+    The claim must be RECORDED, not honoured: no extra file appears in
+    final_files. An earlier revision answered this exact case by creating
+    详细分析报告.md, which hid the defect and invented a document nobody asked for.
+    """
+    from bisheng.linsight.domain import task_exec as te
+
+    exec_task = te.LinsightWorkflowTask()
+    exec_task.session_version_id = "svid"
+    exec_task._last_assistant_text = "已生成 [概览](output/概览.md)，详细内容见 output/详细分析报告.md。"
+    exec_task.file_dir = "/tmp/nonexistent-linsight"
+
+    sm = MagicMock()
+    sm.set_session_version_info = AsyncMock()
+    sm.get_execution_tasks = AsyncMock(return_value=[_pseudo([])])
+    sm.update_execution_task_status = AsyncMock()
+    sm.push_message = AsyncMock()
+    exec_task._state_manager = sm
+
+    real = [{"file_name": "概览.md", "file_path": "/x/output/概览.md", "file_id": "i", "file_url": "u"}]
+
+    async def _final(*a, **k):
+        return real
+
+    monkeypatch.setattr(te.linsight_execute_utils, "get_final_result_file", _final)
+    monkeypatch.setattr(te.linsight_execute_utils, "read_file_directory", AsyncMock(return_value=real))
+    monkeypatch.setattr(te.linsight_execute_utils, "persist_task_turn_message", AsyncMock())
+
+    session = MagicMock()
+    session.id = "svid"
+    session.model_dump = MagicMock(return_value={})
+
+    await exec_task._handle_direct_answer_completion(session)
+
+    assert session.output_result["phantom_deliverables"] == ["详细分析报告.md"]
+    # Detected, not repaired: the real deliverable list is untouched.
+    assert session.output_result["final_files"] == real
+
+
 def _pseudo(history):
     return LinsightExecuteTask(
         id="svid",
@@ -399,6 +440,62 @@ async def test_detail_surfaces_nonempty_pseudo_first(monkeypatch):
     ids = [node["id"] for node in result]
     assert ids[0] == "svid"  # global pseudo task first
     assert "aaaa" in ids
+
+
+def _chain(*ids):
+    """Rows wired into one previous/next linked chain, in the given order."""
+    rows = [_real_task(tid) for tid in ids]
+    for i in range(len(rows) - 1):
+        rows[i].next_task_id = rows[i + 1].id
+        rows[i + 1].previous_task_id = rows[i].id
+    return rows
+
+
+async def test_detail_does_not_replay_an_overlapping_chain(monkeypatch):
+    """Two chain heads running into a shared tail must not duplicate that tail.
+
+    ``_save_task_info`` only inserts rows it has not seen; it never rewrites an
+    existing row's previous/next pointers. So when the model reshapes its plan
+    mid-run, the new rows form a second chain stitched onto the old one's head
+    while that head keeps ``previous_task_id = None`` — two heads, one tail.
+    Session 8a570723 on 114 held 11 rows and this endpoint returned 20.
+    """
+    from bisheng.linsight.domain.services import workbench_impl as wi
+
+    rows = _chain("aaaa", "bbbb", "cccc")
+    newcomer = _real_task("dddd")
+    newcomer.next_task_id = "aaaa"  # stitched on; rows[0].previous_task_id stays None
+    tasks = [*rows, newcomer]
+
+    async def fake_get(svid, *a, **k):
+        return tasks
+
+    monkeypatch.setattr(wi.LinsightExecuteTaskDao, "get_by_session_version_id", fake_get)
+
+    result = await wi.LinsightWorkbenchImpl.get_execute_task_detail("svid")
+    ids = [node["id"] for node in result]
+    assert len(ids) == len(tasks), f"every row exactly once, got {ids}"
+    assert sorted(ids) == ["aaaa", "bbbb", "cccc", "dddd"]
+
+
+async def test_detail_survives_a_cyclic_chain(monkeypatch):
+    """A cycle must terminate instead of spinning the request forever.
+
+    Defensive: nothing writes a cycle today, but the walk had no visited guard at
+    all, so a single bad pointer pair would have hung the endpoint.
+    """
+    from bisheng.linsight.domain.services import workbench_impl as wi
+
+    a, b = _real_task("aaaa"), _real_task("bbbb")
+    a.next_task_id, b.next_task_id = "bbbb", "aaaa"
+
+    async def fake_get(svid, *a_, **k):
+        return [a, b]
+
+    monkeypatch.setattr(wi.LinsightExecuteTaskDao, "get_by_session_version_id", fake_get)
+
+    result = await wi.LinsightWorkbenchImpl.get_execute_task_detail("svid")
+    assert sorted(node["id"] for node in result) == ["aaaa", "bbbb"]
 
 
 # ---------------------------------------------------------------------------

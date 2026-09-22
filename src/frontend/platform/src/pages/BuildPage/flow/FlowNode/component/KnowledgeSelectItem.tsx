@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { Label } from "@/components/bs-ui/label";
 import MultiSelect from "@/components/bs-ui/select/multi";
 import { Tabs, TabsList, TabsTrigger } from "@/components/bs-ui/tabs";
@@ -49,6 +50,13 @@ const mergeOptionsByValue = (currentOptions, nextOptions) => {
     ]
 }
 
+export function hasTempKnowledgeMode(fileParseMode: unknown): boolean {
+    if (Array.isArray(fileParseMode)) {
+        return fileParseMode.includes('ingest_to_temp_kb')
+    }
+    return fileParseMode === 'ingest_to_temp_kb'
+}
+
 export default function KnowledgeSelectItem({ data, nodeId, onChange, onVarEvent, onValidate, i18nPrefix }) {
     const { flow } = useFlowStore()
     const { t } = useTranslation('flow')
@@ -71,7 +79,7 @@ export default function KnowledgeSelectItem({ data, nodeId, onChange, onVarEvent
     const requestSeqRef = useRef(0)
     const reload = (cursor: string | null, name: string) => {
         const requestSeq = ++requestSeqRef.current
-        readFileLibDatabase({ cursor, pageSize, name, type: 0, permissionId: 'use_kb' }).then(res => {
+        readFileLibDatabase({ cursor, pageSize, name, type: 0, action: 'use' }).then(res => {
             if (requestSeq !== requestSeqRef.current) return
             cursorRef.current = res.next_cursor
             originOptionsRef.current = res.data
@@ -89,11 +97,12 @@ export default function KnowledgeSelectItem({ data, nodeId, onChange, onVarEvent
                 group.params.forEach(param => {
                     if (param.key === 'form_input') {
                         param.value.forEach(val => {
-                            val.file_parse_mode === 'ingest_to_temp_kb' && val.type === 'file'
-                                && files.push({
+                            if (val.type === 'file' && hasTempKnowledgeMode(val.file_parse_mode)) {
+                                files.push({
                                     label: `${val.key}(${val.value})`,
                                     value: `${node.id}.${val.key}`
                                 })
+                            }
                         })
                     }
                 })
@@ -217,7 +226,7 @@ export default function KnowledgeSelectItem({ data, nodeId, onChange, onVarEvent
         }
         for (const el of value) {
             // Check if variable exists in flow
-            let _error = isVarInFlow(nodeId, flow.nodes, el.value, '');
+            const _error = isVarInFlow(nodeId, flow.nodes, el.value, '');
             if (_error) {
                 _errorKeys.push(el.value);
                 error = _error;

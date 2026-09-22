@@ -1,17 +1,18 @@
 from datetime import datetime
-from typing import List, Optional, Tuple, Any
+from typing import Any
 
 from sqlalchemy import case, func, or_
-from sqlmodel import select, col, update
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import col, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from bisheng.channel.domain.models.channel import Channel, ChannelVisibilityEnum
 from bisheng.channel.domain.repositories.interfaces.channel_repository import ChannelRepository
 from bisheng.common.models.space_channel_member import (
-    SpaceChannelMember,
+    REJECTED_STATUS_DISPLAY_WINDOW,
     BusinessTypeEnum,
     MembershipStatusEnum,
-    REJECTED_STATUS_DISPLAY_WINDOW,
+    SpaceChannelMember,
 )
 from bisheng.common.repositories.implementations.base_repository_impl import BaseRepositoryImpl
 
@@ -22,7 +23,37 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
     def __init__(self, session: AsyncSession):
         super().__init__(session, Channel)
 
-    async def find_channels_by_ids(self, channel_ids: List[str]) -> List[Channel]:
+    async def find_by_creation_request(
+        self,
+        *,
+        tenant_id: int,
+        user_id: int,
+        creation_request_id: str,
+    ) -> Channel | None:
+        query = select(Channel).where(
+            Channel.tenant_id == tenant_id,
+            Channel.user_id == user_id,
+            Channel.creation_request_id == creation_request_id,
+        )
+        return (await self.session.exec(query)).first()
+
+    async def save_creation(self, channel: Channel) -> tuple[Channel, bool]:
+        try:
+            return await self.save(channel), True
+        except IntegrityError:
+            await self.session.rollback()
+            if channel.creation_request_id is None or channel.tenant_id is None:
+                raise
+            existing = await self.find_by_creation_request(
+                tenant_id=int(channel.tenant_id),
+                user_id=channel.user_id,
+                creation_request_id=channel.creation_request_id,
+            )
+            if existing is None:
+                raise
+            return existing, False
+
+    async def find_channels_by_ids(self, channel_ids: list[str]) -> list[Channel]:
         """Find channels by a list of channel IDs."""
         if not channel_ids:
             return []
@@ -30,8 +61,40 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
         result = await self.session.exec(query)
         return list(result.all())
 
-    async def find_square_channels(self, user_id: int, keyword: Optional[str] = None,
-                                   page: int = 1, page_size: int = 20) -> List[Tuple[Any, ...]]:
+    async def find_channels_by_user_id(self, user_id: int) -> list[Channel]:
+        """Find all channels created by the given user (tenant auto-scoped)."""
+        query = select(Channel).where(Channel.user_id == user_id)
+        result = await self.session.exec(query)
+        return list(result.all())
+
+    async def find_followed_by_visible_ids(
+        self,
+        channel_ids: list[str],
+        *,
+        tenant_id: int,
+        exclude_creator_id: int,
+    ) -> list[Channel]:
+        """Load one bounded visible-id chunk under the canonical followed filters.
+
+        Called by ``_get_followed_channels`` with a page of ids that OpenFGA has
+        already declared visible for the current user; the ``tenant_id`` and
+        ``user_id != exclude_creator_id`` predicates keep the row set to the
+        active tenant and drop the user's own created channels at the DB layer,
+        so the loop never materialises them just to filter them out again.
+        """
+        if not channel_ids:
+            return []
+        query = select(Channel).where(
+            col(Channel.id).in_(channel_ids),
+            Channel.tenant_id == tenant_id,
+            Channel.user_id != exclude_creator_id,
+        )
+        result = await self.session.exec(query)
+        return list(result.all())
+
+    async def find_square_channels(
+        self, user_id: int, keyword: str | None = None, page: int = 1, page_size: int = 20
+    ) -> list[tuple[Any, ...]]:
         """
         Find released channels for the channel square with subscription status and subscriber count.
         Uses multi-table LEFT JOIN:
@@ -42,15 +105,15 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
         """
         rejection_cutoff = datetime.now() - REJECTED_STATUS_DISPLAY_WINDOW
 
-        # Subquery: count subscribers (status=ACTIVE) per channel
+        # Subquery: count unique active subscribers per channel
         subscriber_subq = (
             select(
                 SpaceChannelMember.business_id,
-                func.count().label('subscriber_count')
+                func.count(func.distinct(SpaceChannelMember.user_id)).label("subscriber_count"),
             )
             .where(
                 SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL,
-                SpaceChannelMember.status == MembershipStatusEnum.ACTIVE
+                SpaceChannelMember.status == MembershipStatusEnum.ACTIVE,
             )
             .group_by(SpaceChannelMember.business_id)
             .subquery()
@@ -60,35 +123,27 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
         query = (
             select(
                 Channel,
-                SpaceChannelMember.status.label('user_subscription_status'),
-                SpaceChannelMember.update_time.label('user_subscription_update_time'),
-                func.coalesce(subscriber_subq.c.subscriber_count, 0).label('subscriber_count')
+                SpaceChannelMember.status.label("user_subscription_status"),
+                SpaceChannelMember.update_time.label("user_subscription_update_time"),
+                func.coalesce(subscriber_subq.c.subscriber_count, 0).label("subscriber_count"),
             )
             .outerjoin(
                 SpaceChannelMember,
-                (SpaceChannelMember.business_id == Channel.id) &
-                (SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL) &
-                (SpaceChannelMember.user_id == user_id)
+                (SpaceChannelMember.business_id == Channel.id)
+                & (SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL)
+                & (SpaceChannelMember.user_id == user_id),
             )
-            .outerjoin(
-                subscriber_subq,
-                subscriber_subq.c.business_id == Channel.id
-            )
+            .outerjoin(subscriber_subq, subscriber_subq.c.business_id == Channel.id)
             .where(
-                Channel.is_released == True,
-                Channel.visibility != ChannelVisibilityEnum.PRIVATE
+                Channel.is_released == True,  # noqa: E712 — DM8 rejects `IS 1`
+                Channel.visibility != ChannelVisibilityEnum.PRIVATE,
             )
         )
 
         # Apply keyword filter (fuzzy search on name and description)
         if keyword:
-            like_pattern = f'%{keyword}%'
-            query = query.where(
-                or_(
-                    Channel.name.like(like_pattern),
-                    Channel.description.like(like_pattern)
-                )
-            )
+            like_pattern = f"%{keyword}%"
+            query = query.where(or_(Channel.name.like(like_pattern), Channel.description.like(like_pattern)))
 
         subscription_order = case(
             (SpaceChannelMember.status.is_(None), 0),
@@ -97,11 +152,13 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
                 & (SpaceChannelMember.update_time < rejection_cutoff),
                 0,
             ),
-            else_=1
+            else_=1,
         )
         query = query.order_by(
             subscription_order.asc(),
-            func.coalesce(Channel.update_time, Channel.create_time).desc()
+            subscriber_subq.c.subscriber_count.desc(),
+            func.coalesce(Channel.update_time, Channel.create_time).desc(),
+            Channel.id.asc(),
         )
 
         # Pagination
@@ -111,9 +168,7 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
         result = await self.session.exec(query)
         return list(result.all())
 
-    async def find_public_recommend_channels(
-        self, user_id: int, candidate_limit: int = 100
-    ) -> List[Tuple[Any, ...]]:
+    async def find_public_recommend_channels(self, user_id: int, candidate_limit: int = 100) -> list[tuple[Any, ...]]:
         """
         Find released PUBLIC channels for the home-page discovery carousel.
 
@@ -125,13 +180,10 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
         pre-filter — newest channels first, bounded to keep the ES batch small.
         """
         subscriber_subq = (
-            select(
-                SpaceChannelMember.business_id,
-                func.count().label('subscriber_count')
-            )
+            select(SpaceChannelMember.business_id, func.count().label("subscriber_count"))
             .where(
                 SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL,
-                SpaceChannelMember.status == MembershipStatusEnum.ACTIVE
+                SpaceChannelMember.status == MembershipStatusEnum.ACTIVE,
             )
             .group_by(SpaceChannelMember.business_id)
             .subquery()
@@ -140,23 +192,20 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
         query = (
             select(
                 Channel,
-                SpaceChannelMember.status.label('user_subscription_status'),
-                SpaceChannelMember.update_time.label('user_subscription_update_time'),
-                func.coalesce(subscriber_subq.c.subscriber_count, 0).label('subscriber_count')
+                SpaceChannelMember.status.label("user_subscription_status"),
+                SpaceChannelMember.update_time.label("user_subscription_update_time"),
+                func.coalesce(subscriber_subq.c.subscriber_count, 0).label("subscriber_count"),
             )
             .outerjoin(
                 SpaceChannelMember,
-                (SpaceChannelMember.business_id == Channel.id) &
-                (SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL) &
-                (SpaceChannelMember.user_id == user_id)
+                (SpaceChannelMember.business_id == Channel.id)
+                & (SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL)
+                & (SpaceChannelMember.user_id == user_id),
             )
-            .outerjoin(
-                subscriber_subq,
-                subscriber_subq.c.business_id == Channel.id
-            )
+            .outerjoin(subscriber_subq, subscriber_subq.c.business_id == Channel.id)
             .where(
-                Channel.is_released == True,
-                Channel.visibility == ChannelVisibilityEnum.PUBLIC
+                Channel.is_released == True,  # noqa: E712 — DM8 rejects `IS 1`
+                Channel.visibility == ChannelVisibilityEnum.PUBLIC,
             )
             .order_by(func.coalesce(Channel.update_time, Channel.create_time).desc())
             .limit(candidate_limit)
@@ -165,25 +214,20 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
         result = await self.session.exec(query)
         return list(result.all())
 
-    async def count_square_channels(self, keyword: Optional[str] = None) -> int:
+    async def count_square_channels(self, keyword: str | None = None) -> int:
         """Count total released channels matching the keyword filter."""
         query = (
             select(func.count())
             .select_from(Channel)
             .where(
-                Channel.is_released == True,
-                Channel.visibility != ChannelVisibilityEnum.PRIVATE
+                Channel.is_released == True,  # noqa: E712 — DM8 rejects `IS 1`
+                Channel.visibility != ChannelVisibilityEnum.PRIVATE,
             )
         )
 
         if keyword:
-            like_pattern = f'%{keyword}%'
-            query = query.where(
-                or_(
-                    Channel.name.like(like_pattern),
-                    Channel.description.like(like_pattern)
-                )
-            )
+            like_pattern = f"%{keyword}%"
+            query = query.where(or_(Channel.name.like(like_pattern), Channel.description.like(like_pattern)))
 
         result = await self.session.exec(query)
         return result.one()
@@ -198,7 +242,7 @@ class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository)
                 referenced.update(source_list)
         return referenced
 
-    def update_channel_latest_article_update_time(self, channles: List[Channel]) -> List[Channel]:
+    def update_channel_latest_article_update_time(self, channles: list[Channel]) -> list[Channel]:
         for channel in channles:
             stmt = (
                 update(Channel)

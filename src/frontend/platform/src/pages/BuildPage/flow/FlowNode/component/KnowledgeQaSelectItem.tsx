@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { Label } from "@/components/bs-ui/label";
 import MultiSelect from "@/components/bs-ui/select/multi";
 import { getKnowledgeDetailApi, readFileLibDatabase } from "@/controllers/API";
@@ -29,7 +30,7 @@ export default function KnowledgeQaSelectItem({ nodeId, data, onChange, onValida
     const requestSeqRef = useRef(0)
     const reload = (cursor: string | null, name: string) => {
         const requestSeq = ++requestSeqRef.current
-        readFileLibDatabase({ cursor, pageSize: PAGE_SIZE, name, type: 1, permissionId: 'use_kb' }).then(res => {
+        readFileLibDatabase({ cursor, pageSize: PAGE_SIZE, name, type: 1, action: 'use' }).then(res => {
             if (requestSeq !== requestSeqRef.current) return
             cursorRef.current = res.next_cursor
             originOptionsRef.current = res.data

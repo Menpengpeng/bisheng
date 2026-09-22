@@ -13,8 +13,10 @@ import FileIcon from '~/components/ui/icon/File';
 import { useLocalize } from '~/hooks';
 import { EmptyStateIllustration } from '~/components/illustrations';
 import { cn } from '~/utils';
-import { type ArtifactFile, downloadArtifactFile, getFileExtension } from './artifactUtils';
+import { type ArtifactFile, getFileExtension } from './artifactUtils';
+import { NewTabHint } from './NewTabHint';
 import { PreviewBody } from './PreviewBody';
+import { SaveAsButton } from './SaveAsButton';
 
 interface WorkspacePanelProps {
     files: ArtifactFile[];
@@ -32,7 +34,7 @@ interface WorkspacePanelProps {
 }
 
 const iconBtn =
-    'flex h-7 w-7 items-center justify-center rounded-lg text-[#8C8C8C] transition-colors hover:bg-gray-100';
+    'flex h-7 w-7 items-center justify-center rounded-lg text-text-3 transition-colors hover:bg-gray-100';
 
 export function WorkspacePanel({
     files,
@@ -52,27 +54,24 @@ export function WorkspacePanel({
             key={file.file_id || file.file_url}
             role="button"
             tabIndex={0}
-            className="group flex cursor-pointer items-center gap-2.5 rounded-lg px-1 py-2 hover:bg-[#F7F7F7]"
+            className="group/row flex cursor-pointer items-center gap-1 rounded-lg py-2 pl-1 pr-2 hover:bg-[#F7F7F7]"
             onClick={() => onPreview(file)}
             onKeyDown={(e) => e.key === 'Enter' && onPreview(file)}
         >
             {/* File-type icon hidden for now; keep for an easy future re-enable. */}
-            {/* eslint-disable-next-line @typescript-eslint/no-explicit-any -- FileIcon accepts more types than its union */}
+            { }
             {/* <FileIcon type={getFileExtension(file.file_name) as any} className="size-5 min-w-5" /> */}
-            <span className="min-w-0 flex-1 truncate text-sm text-[#212121] group-hover:text-blue-500">
+            {/* min-w-0 without flex-1 so the action stays next to the NAME, not
+                pushed to the panel edge; the name truncates only when it must. */}
+            <span className="min-w-0 truncate text-sm text-text-1 group-hover/row:text-blue-500">
                 {file.file_name}
             </span>
+            <NewTabHint file={file} />
+            {/* Downloading a listed file no longer requires opening it first —
+                which HTML reports never allowed, since they leave for a new tab. */}
+            <SaveAsButton file={file} versionId={versionId} />
         </div>
     );
-
-    const handleDownload = async () => {
-        if (!previewFile) return;
-        try {
-            await downloadArtifactFile(previewFile, versionId);
-        } catch (e) {
-            console.error('artifact download failed:', e);
-        }
-    };
 
     return (
         <div
@@ -80,7 +79,7 @@ export function WorkspacePanel({
                 'flex h-full min-h-0 w-full flex-col overflow-hidden bg-[#FBFBFB]',
                 // Fullscreen overlays the whole route viewport flush to the edges;
                 // the card chrome (radius/border) only applies to the docked panel.
-                !fullscreen && 'rounded-lg border border-[#ECECEC]',
+                !fullscreen && 'rounded-lg border border-border-base',
             )}
         >
             {previewFile ? (
@@ -91,14 +90,15 @@ export function WorkspacePanel({
                             <Outlined.ArrowLeft className="size-4" />
                         </button>
                         <span
-                            className="min-w-0 flex-1 truncate text-sm text-[#212121]"
+                            className="min-w-0 flex-1 truncate text-sm text-text-1"
                             title={previewFile.file_name}
                         >
                             {previewFile.file_name || localize('com_linsight_preview_file')}
                         </span>
-                        <button type="button" aria-label={localize('com_linsight_download_to_view')} className={iconBtn} onClick={handleDownload}>
-                            <Outlined.Download className="size-4" />
-                        </button>
+                        {/* Same action as the file rows, so a markdown deliverable
+                            offers md / PDF / Docx here too instead of only the raw
+                            source — the two surfaces are one click apart. */}
+                        <SaveAsButton file={previewFile} versionId={versionId} variant="toolbar" />
                         {!hideFullscreenToggle && (
                             <button
                                 type="button"
@@ -119,14 +119,19 @@ export function WorkspacePanel({
                     </div>
                     {/* preview body — scrollbar-os: respect OS scrollbar setting */}
                     <div className="min-h-0 flex-1 overflow-y-auto scrollbar-os">
-                        <PreviewBody file={previewFile} versionId={versionId} fileList={files} />
+                        <PreviewBody
+                            file={previewFile}
+                            versionId={versionId}
+                            fileList={files}
+                            onArtifactPreview={onPreview}
+                        />
                     </div>
                 </>
             ) : (
                 <>
                     {/* list header */}
                     <div className="flex h-12 shrink-0 items-center justify-between px-4">
-                        <span className="text-sm font-medium text-[#212121]">{localize('com_linsight_workspace')}</span>
+                        <span className="text-sm font-medium text-text-1">{localize('com_linsight_workspace')}</span>
                         <button type="button" aria-label={localize('com_ui_close')} className={iconBtn} onClick={onClose}>
                             <Outlined.Close className="size-4" />
                         </button>
@@ -138,7 +143,7 @@ export function WorkspacePanel({
                         ) : (
                             <div className="flex h-full flex-col items-center justify-center text-center">
                                 <EmptyStateIllustration className="mb-4 size-[120px]" />
-                                <p className="text-[14px] font-normal text-[#999999]">{localize('com_linsight_workspace_empty')}</p>
+                                <p className="text-[14px] font-normal text-text-3">{localize('com_linsight_workspace_empty')}</p>
                             </div>
                         )}
                     </div>

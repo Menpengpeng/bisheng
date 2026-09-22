@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { FileDB, FileItem, TaskDB } from "../../types/api/finetune";
 import axios from "../request";
 
@@ -157,6 +158,11 @@ export const deleteLLmServer = async (server_id: string) => {
 // 模型上下线
 export const changeLLmServerStatus = async (model_id: string, online: number) => {
     return await axios.post(`/api/v1/llm/online`, { model_id, online })
+}
+
+// 手动验证模型可用性：对模型发起一次真实调用，返回刷新后的状态
+export const verifyLLmModelStatus = async (model_id: number): Promise<any> => {
+    return await axios.post(`/api/v1/llm/verify`, { model_id })
 }
 
 // 获取模型详情

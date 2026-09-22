@@ -85,6 +85,19 @@ _QUOTA_SIGNATURES: tuple[str, ...] = (
     "insufficient balance",
     "余额不足",
     "欠费",
+    # one-api / new-api style relay gateways (what kimi-k3 sits behind here). The
+    # gateway PRE-DEDUCTS an estimated cost before forwarding, so the body is
+    # "token quota is not enough, token remain quota: $0.073168, need quota:
+    # $0.173140" with HTTP 403 — money wording, but none of the strings above, and
+    # a 403 rather than the 429 this bucket was written around. It therefore fell
+    # through to the auth branch and told the user to "检查模型配置" when the only
+    # remedy was topping up (114, 2026-08-14). Both signals are specific to the
+    # pre-deduction path, so they cannot collide with TPM/TPS throttling wording.
+    #
+    # Note the amount is per-REQUEST: the same balance serves a fresh session fine
+    # and 403s a long-context one, because the estimate scales with input size.
+    "pre_consume_token_quota_failed",
+    "token quota is not enough",
 )
 
 # Transient throttling — RPM (requests/min), TPM (tokens/min) and burst-rate
@@ -112,7 +125,35 @@ _RATE_LIMIT_SIGNATURES: tuple[str, ...] = (
     "配额",
     "too many requests",
     "请求过于频繁",
+    "请求频率过高",  # PaddleOCR / Baidu AI Studio throttle wording (errorCode 12002)
     "限流",
+)
+
+# Transient TRANSPORT failures a provider reports from ITS OWN upstream fetch,
+# wrapped in an otherwise non-transient status. When an endpoint fetches something
+# on our behalf — staging a data-URI image into object storage, a sandbox pulling a
+# file, a RAG fetcher — its I/O error surfaces as a 4xx even though the REQUEST was
+# fine; only their fetch of it failed. Retrying is exactly right, and a plain 400
+# otherwise DEGRADEs, which on the main graph means the whole run dies.
+#
+# Measured on 180 (2026-08-09, session 649ba617): a deck screenshot handed to the
+# model came back as
+#   400 {"code":"DOWNLOAD_FAILED", ... "read tcp 10.0.2.60:46976->10.86.10.104:6000:
+#        read: connection reset by peer"}
+# — both endpoints inside the vendor's own network — and killed a 21-minute run
+# with zero retries.
+#
+# These are Go/POSIX transport phrases, not vendor error codes, so this stays
+# vendor-agnostic like the other flat signature sets. DELIBERATELY transport-only:
+# a fetch that failed with 404 / bad URL / unsupported format is a genuine client
+# error and MUST keep degrading rather than burn three backoffs on a sure failure.
+_TRANSIENT_TRANSPORT_SIGNATURES: tuple[str, ...] = (
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "i/o timeout",
+    "unexpected eof",
+    "no route to host",
 )
 
 # Content-moderation / safety-guardrail codes across mainstream vendors:
@@ -230,6 +271,16 @@ def _is_rate_limit(exc: BaseException) -> bool:
     return any(sig in text for sig in _RATE_LIMIT_SIGNATURES)
 
 
+def _is_transient_transport(exc: BaseException) -> bool:
+    """A transport-level failure the PROVIDER hit on its own upstream fetch.
+
+    Checked only after the FAIL_FAST branches, so a quota/auth error carrying such
+    wording in a nested message can never be turned into a retry.
+    """
+    text = _exc_text(exc)
+    return any(sig in text for sig in _TRANSIENT_TRANSPORT_SIGNATURES)
+
+
 def _is_task_aborted(exc: BaseException) -> bool:
     """The task was aborted by a framework/loop guard, not a provider error.
 
@@ -299,6 +350,8 @@ def classify_behavior(exc: BaseException) -> Behavior:
         return Behavior.RETRYABLE
     if isinstance(exc, (TimeoutError, ConnectionError)):
         return Behavior.RETRYABLE
+    if _is_transient_transport(exc):  # provider's own upstream fetch blew up mid-flight
+        return Behavior.RETRYABLE
 
     # 3) DEGRADABLE — default bucket: content filter, plain 400, anything else.
     return Behavior.DEGRADABLE
@@ -349,6 +402,10 @@ def label_error(exc: BaseException) -> ErrorType:
         return ErrorType.NETWORK_TIMEOUT
     status = _status_code(exc)
     if isinstance(exc, openai.InternalServerError) or (status is not None and 500 <= status < 600):
+        return ErrorType.SERVICE_UNAVAILABLE
+    # Retries exhausted on the provider's own upstream fetch: "service busy" is the
+    # honest story for the user, not the generic unknown card.
+    if _is_transient_transport(exc):
         return ErrorType.SERVICE_UNAVAILABLE
     return ErrorType.UNKNOWN
 

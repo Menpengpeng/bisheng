@@ -1,4 +1,5 @@
 import react from '@vitejs/plugin-react';
+import { readFileSync } from 'node:fs';
 import * as http from 'node:http';
 import path from 'path';
 import { visualizer } from "rollup-plugin-visualizer";
@@ -10,12 +11,25 @@ import { VitePWA } from 'vite-plugin-pwa';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
 import { createHtmlPlugin } from 'vite-plugin-html';
 
+/**
+ * Build stamp shown on the crash screen: package version plus the minute the
+ * bundle was built, e.g. `v3.0.0-beta1 (20260807-2132)`. Local time on purpose —
+ * it is read by whoever built it, alongside a release log kept in the same zone.
+ */
+function buildVersion(): string {
+  const pkg = JSON.parse(readFileSync(path.join(__dirname, 'package.json'), 'utf-8'));
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  return `v${pkg.version} (${stamp})`;
+}
+
 const app_env = {
   BASE_URL: '/workspace',
   BISHENG_HOST: '/admin'
 }
 
-const minioPathRE = /^\/(?:workspace\/)?bisheng(?:\/|$)/;
+const minioPathRE = /^\/(?:workspace\/)?(?:bisheng|tmp-dir)(?:\/|$)/;
 
 // Emit one loud, actionable warning the first time MinIO answers a proxied
 // object request with 403. For presigned (SigV4) URLs to the public bucket a
@@ -54,7 +68,7 @@ function minioFileProxyPlugin(minioTarget: string): Plugin {
           return;
         }
 
-        const rewrittenUrl = requestUrl.replace(/^\/workspace(?=\/bisheng(?:\/|$))/, '');
+        const rewrittenUrl = requestUrl.replace(/^\/workspace(?=\/(?:bisheng|tmp-dir)(?:\/|$))/, '');
         const targetUrl = new URL(rewrittenUrl, minioTarget);
         const proxyReq = http.request(
           {
@@ -105,6 +119,9 @@ export default defineConfig(({ command, mode }) => {
   // SignatureDoesNotMatch (e.g. set http://localhost:9000 when sharepoint=localhost:9000).
   const minioTarget = env.VITE_DEV_MINIO_TARGET || 'http://127.0.0.1:9000';
   const apiTarget = env.VITE_DEV_API_TARGET || 'http://127.0.0.1:7860';
+  // Per-request proxy logging is opt-in (VITE_PROXY_LOG=1): on by default it prints
+  // dozens of lines per page load and buries the warnings that matter.
+  const proxyLog = env.VITE_PROXY_LOG === '1';
 
   return {
     base: app_env.BASE_URL || '/',
@@ -114,6 +131,10 @@ export default defineConfig(({ command, mode }) => {
       // which sets VITE_ENABLE_VCONSOLE=true). A plain `npm run build` never
       // bundles the debug console — do not hardcode this back to 'true'.
       __VCONSOLE_ENABLED__: JSON.stringify(env.VITE_ENABLE_VCONSOLE === 'true'),
+      // Stamped at build time so a crash report names the exact build it came
+      // from. /api/v1/env carries a hardcoded version and cannot be trusted for
+      // this; the package version plus the build minute can.
+      __APP_VERSION__: JSON.stringify(buildVersion()),
     },
     server: {
       host: '0.0.0.0',
@@ -135,9 +156,11 @@ export default defineConfig(({ command, mode }) => {
           secure: false,
           ws: true,
           configure: (proxy, options) => {
-            proxy.on('proxyReq', (proxyReq, req, res) => {
-              console.log('Proxying request to:', proxyReq.path);
-            });
+            if (proxyLog) {
+              proxy.on('proxyReq', (proxyReq, req, res) => {
+                console.log('Proxying request to:', proxyReq.path);
+              });
+            }
           },
           rewrite: (path) => {
             return path.replace(/^\/workspace/, '');
@@ -234,6 +257,13 @@ export default defineConfig(({ command, mode }) => {
           {
             src: 'node_modules/pdfjs-dist/build/pdf.worker.min.js',
             dest: './'
+          },
+          {
+            // Full CMap set for PDFs using CID-keyed, non-embedded CJK fonts
+            // (e.g. GBK-EUC-H from CEB-converted government docs) — without the
+            // matching .bcmap the text layer renders blank.
+            src: 'node_modules/pdfjs-dist/cmaps/*',
+            dest: 'cmaps/'
           }
         ]
       }),
@@ -244,6 +274,14 @@ export default defineConfig(({ command, mode }) => {
     ],
     publicDir: './public',
     build: {
+      // pnpm workspace: deps live in ../node_modules (outside this vite root),
+      // which defeats vite-plugin-node-polyfills' node_modules exemption — its
+      // injected ESM imports land inside CJS deps (react, react-dom) and break
+      // rollup's named-export detection. Let the commonjs plugin transform
+      // mixed ESM/CJS modules so named exports survive the injection.
+      commonjsOptions: {
+        transformMixedEsModules: true,
+      },
       sourcemap: process.env.NODE_ENV === 'development',
       outDir: './build',
       minify: 'terser',
@@ -424,6 +462,10 @@ export default defineConfig(({ command, mode }) => {
         $fonts: path.resolve(__dirname, 'public/fonts'),
         // SUL-licensed nodebox is unused (only static/react-ts templates); stub it out of the bundle.
         '@codesandbox/nodebox': path.resolve(__dirname, 'stubs/nodebox-stub.ts'),
+        // node-only dynamic imports (see stubs/empty-module.ts) — the polyfill
+        // plugin's `fs` alias mangles the /promises subpath under pnpm layout.
+        'node:fs/promises': path.resolve(__dirname, 'stubs/empty-module.ts'),
+        'fs/promises': path.resolve(__dirname, 'stubs/empty-module.ts'),
       },
     },
   };

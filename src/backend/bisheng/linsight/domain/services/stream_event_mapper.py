@@ -28,6 +28,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from loguru import logger
 
@@ -79,6 +80,16 @@ def _stable_task_id(svid: str, content: str) -> str:
     return hashlib.md5(f"{svid}:{content}".encode()).hexdigest()[:8]
 
 
+# Todo statuses that count as delivered. A todo dropped from the plan AFTER it was
+# completed stays completed — pruning the plan does not un-deliver work.
+_TODO_DONE_STATUSES = frozenset({"completed", "done"})
+
+# Status carried by the TaskEnd emitted for a todo the model pruned. Matches
+# ``ExecuteTaskStatusEnum.TERMINATED`` (imported as a literal to keep this pure
+# mapper free of the persistence layer); ``task_exec._handle_task_end`` maps it back.
+_TODO_DROPPED_STATUS = "terminated"
+
+
 def _truncate(text: str | None) -> tuple[str | None, bool]:
     if text is None:
         return None, False
@@ -100,7 +111,12 @@ class _TodoProjection:
 class _OpenCall:
     """Buffered tool-call *start* frame, keyed by call_id (design §3.4)."""
 
+    # Emitted/persisted id — globally unique for this svid, see ``StreamContext.tool_seq``.
     call_id: str
+    # The provider's own tool_call id. Every in-memory bookkeeping dict
+    # (``open_calls`` / ``orphan_ends`` / ``tool_arg_buffers``) stays keyed by THIS,
+    # because that is what comes back on ``ToolMessage.tool_call_id``.
+    raw_call_id: str
     task_id: str
     name: str
     params: Any
@@ -147,6 +163,29 @@ class StreamContext:
     thinking_call_ids: dict[str, str] = field(default_factory=dict)
     # monotonic counter giving each thinking segment a distinct, stable call_id
     thinking_seq: int = 0
+    # Per-mapper-instance discriminator mixed into every thinking call_id.
+    #
+    # ``thinking_seq`` restarts at 0 for every new mapper, and a mapper is built
+    # fresh per RUN of the same session version (first execute, ask_user resume,
+    # follow-up turn — all share one svid). Without this token the resumed run's
+    # first thinking segment reuses ``thinking:<svid>:1``, and the persistence
+    # layer treats a colliding call_id as the SAME segment: it concatenates the
+    # new text onto the first run's and rewrites the row IN PLACE. That is what
+    # welded reasoning from different runs into one block, spliced new text into
+    # the middle of old text, and left history ordered against its own timestamps.
+    run_token: str = field(default_factory=lambda: uuid4().hex[:8])
+    # monotonic counter giving each TOOL call a distinct, stable call_id.
+    #
+    # A provider only has to make ``tool_calls[].id`` unique WITHIN one response —
+    # the OpenAI contract is just "the id a ToolMessage refers back to", never a
+    # cross-request guarantee. tokenrouter/kimi-k3 mints ``<tool_name>:<index>``
+    # and restarts the index at 0 every turn, so ``bisheng_code_interpreter:0``
+    # came back 156 times in one run. ``add_execution_task_step`` upserts by
+    # call_id across the WHOLE history, so all 156 collapsed onto one row and the
+    # step flow showed "运行代码 1 次". Mixed with ``run_token`` for the same reason
+    # thinking ids are (see above): a mapper is per-RUN, so the counter alone would
+    # collide again after an ask_user resume.
+    tool_seq: int = 0
     # terminal收口 dedup: first terminal wins, later ones dropped (§3.7)
     terminated: bool = False
 
@@ -299,6 +338,7 @@ class StreamEventMapper:
         used_old_idx: set[int] = set()
         new_projection: list[_TodoProjection] = []
         newly_generated: list[_TodoProjection] = []
+        renamed: list[_TodoProjection] = []
         status_events: list[BaseEvent] = []
 
         for pos, item in enumerate(new_todos):
@@ -322,6 +362,12 @@ class StreamEventMapper:
             if matched is not None:
                 proj = _TodoProjection(task_id=matched.task_id, content=content, status=status)
                 new_projection.append(proj)
+                if matched.content != content:
+                    # Level-2 alignment reused an existing row id while the model
+                    # REWROTE the wording. Re-announce it so the DB row's task_data
+                    # (and therefore the panel after a refresh) follows the current
+                    # plan instead of keeping the very first draft's title.
+                    renamed.append(proj)
                 status_events.extend(self._status_transition(matched.status, status, proj))
             else:
                 # Level 3: brand new
@@ -334,15 +380,33 @@ class StreamEventMapper:
                 newly_generated.append(proj)
                 status_events.extend(self._status_transition(None, status, proj))
 
-        # Tasks that vanished from the new list are marked TERMINATED (not
-        # deleted) — projection drop is enough at the mapper layer. The todo
-        # projection still drives TaskPanel signals (GenerateSubTask / TaskStart /
-        # TaskEnd); it no longer needs an in_progress cursor because steps are no
-        # longer attributed to a todo (B2 段流重构 2026-06).
+        # Todos that vanished from the new snapshot: the model pruned them from its
+        # plan. Emit a terminal event so the DB row converges instead of sitting at
+        # NOT_STARTED/IN_PROGRESS forever — measured on 180, a COMPLETED session left
+        # 1 IN_PROGRESS + 2 NOT_STARTED behind and the panel was stuck at "4/7".
+        # Rows that already reached a done state are left alone: they were delivered,
+        # dropping them from the plan afterwards does not un-deliver them.
+        terminated_events: list[BaseEvent] = [
+            TaskEnd(
+                task_id=o.task_id,
+                name=o.content,
+                status=_TODO_DROPPED_STATUS,
+                answer="",
+                # Non-empty data on purpose: _handle_task_end only refreshes
+                # ``task_data`` when the event carries some, so this also repairs the
+                # row's title on the way out.
+                data={"id": o.task_id, "task_id": o.task_id, "name": o.content, "status": _TODO_DROPPED_STATUS},
+            )
+            for i, o in enumerate(old)
+            if i not in used_old_idx and o.status not in _TODO_DONE_STATUSES
+        ]
+        # The todo projection drives TaskPanel signals (GenerateSubTask / TaskStart /
+        # TaskEnd); it needs no in_progress cursor because steps are no longer
+        # attributed to a todo (B2 段流重构 2026-06).
         self.ctx.todos = new_projection
 
         events: list[BaseEvent] = []
-        if newly_generated:
+        if newly_generated or renamed:
             events.append(
                 GenerateSubTask(
                     task_id=self.ctx.svid,
@@ -353,11 +417,12 @@ class StreamEventMapper:
                             "name": p.content,
                             "status": p.status,
                         }
-                        for p in newly_generated
+                        for p in (*newly_generated, *renamed)
                     ],
                 )
             )
         events.extend(status_events)
+        events.extend(terminated_events)
         return events
 
     def _status_transition(self, old_status: str | None, new_status: str, proj: _TodoProjection) -> list[BaseEvent]:
@@ -398,7 +463,15 @@ class StreamEventMapper:
 
         # Thinking stream: reasoning_content (DeepSeek-R1) or thinking blocks.
         thinking = self._extract_thinking(message)
-        if thinking:
+        # A whitespace-only delta is the model's own line break and MUST survive:
+        # dropping it split the segment (``normalize`` closes a segment on any
+        # non-thinking chunk, and a dropped chunk emitted nothing to keep it open),
+        # and the frontend re-joins segments with "" — so the newline was gone for
+        # good. "13. 未来展望" + "14. 封底" then read as one sentence whose "14. "
+        # looked like a terminator, which is how the narration surfaced the bare
+        # fragment "未来展望14.". Only forward it while a segment is already OPEN,
+        # so leading whitespace never mints an empty thinking row of its own.
+        if thinking and (thinking.strip() or self._has_open_thinking(ns)):
             return [*enriched, self._build_thinking_step(thinking, ns)]
 
         # Tool-call start frames live on AIMessage.tool_calls.
@@ -440,14 +513,14 @@ class StreamEventMapper:
                 continue
             self.ctx.tool_arg_buffers[cid] = self.ctx.tool_arg_buffers.get(cid, "") + (tcc.get("args") or "")
 
-    def _parse_arg_buffer(self, call_id: str) -> dict[str, Any] | None:
+    def _parse_arg_buffer(self, raw_call_id: str) -> dict[str, Any] | None:
         """Parse a call's reassembled arg buffer once it is a complete JSON object.
 
         Returns ``None`` while the buffer is still partial (mid-stream JSON does
         not parse) — strict ``json.loads`` succeeds only when the object closes,
         so this fires exactly once per call, when its args finish streaming.
         """
-        raw = self.ctx.tool_arg_buffers.get(call_id)
+        raw = self.ctx.tool_arg_buffers.get(raw_call_id)
         if not raw:
             return None
         try:
@@ -466,7 +539,9 @@ class StreamEventMapper:
         """
         if open_call.step_type != "subagent" or open_call.delegate_goal:
             return False
-        args = self._parse_arg_buffer(open_call.call_id)
+        # RAW id: ``tool_arg_buffers`` is filled by _accumulate_tool_args from the
+        # provider's own chunk ids, so the minted call_id would never hit.
+        args = self._parse_arg_buffer(open_call.raw_call_id)
         if not args:
             return False
         goal = args.get("description") or args.get("instruction") or ""
@@ -509,9 +584,16 @@ class StreamEventMapper:
         # segment boundary (段流重构 2026-06).
         task_id = self.ctx.svid
         for tc in tool_calls:
-            call_id = tc.get("id") or tc.get("call_id")
-            if not call_id:
+            raw_call_id = tc.get("id") or tc.get("call_id")
+            if not raw_call_id:
                 continue
+            # Mint the id we emit and persist. The provider's id is only unique
+            # within one response (see StreamContext.tool_seq), and the persistence
+            # layer upserts by call_id across the whole history — so a colliding id
+            # silently overwrites an earlier, unrelated call. Keeping the raw id as
+            # the prefix leaves the row greppable ("which tool, which turn").
+            self.ctx.tool_seq += 1
+            call_id = f"{raw_call_id}#{self.ctx.run_token}:{self.ctx.tool_seq}"
             name = tc.get("name", "")
             args = tc.get("args")
             step_type = self._infer_step_type(name, ns)
@@ -543,6 +625,7 @@ class StreamEventMapper:
 
             open_call = _OpenCall(
                 call_id=call_id,
+                raw_call_id=raw_call_id,
                 task_id=task_id,
                 name=name,
                 params=args,
@@ -551,7 +634,21 @@ class StreamEventMapper:
                 namespace=ns,
                 delegate_goal=delegate_goal,
             )
-            self.ctx.open_calls[call_id] = open_call
+            # An earlier call with the SAME provider id is still open — it never got
+            # an end frame (HITL park, recursion cut, budget refusal) and is now
+            # being displaced. Its half-written arg buffer would otherwise keep
+            # accumulating under this call's deltas: usually that just fails
+            # json.loads and the delegation goal degrades to empty, but a leftover
+            # that happens to CLOSE against this call's first fragment parses fine
+            # and hands us the previous call's goal. Drop it here — this is the one
+            # moment we can tell "stale" from "mid-stream", because a normally
+            # finished call was popped by its end frame. Deltas that follow refill
+            # the buffer from scratch.
+            if raw_call_id in self.ctx.open_calls:
+                self.ctx.tool_arg_buffers.pop(raw_call_id, None)
+            # Keyed by the RAW id: the end frame arrives as ToolMessage.tool_call_id,
+            # which carries the provider's value, not ours.
+            self.ctx.open_calls[raw_call_id] = open_call
 
             if ns:
                 extra_info["namespace"] = ns
@@ -571,26 +668,32 @@ class StreamEventMapper:
             )
 
             # An orphan end may already be buffered for this call_id (§3.7).
-            buffered = self.ctx.orphan_ends.pop(call_id, None)
+            buffered = self.ctx.orphan_ends.pop(raw_call_id, None)
             if buffered is not None:
                 events.append(self._build_end_step(open_call, buffered))
         return events
 
-    def _handle_tool_end(self, message: Any, call_id: str, ns: str | None) -> list[BaseEvent]:
+    def _handle_tool_end(self, message: Any, raw_call_id: str, ns: str | None) -> list[BaseEvent]:
+        """Close the open call ``ToolMessage.tool_call_id`` points at.
+
+        ``raw_call_id`` is the PROVIDER's id — every dict touched here is keyed by
+        it. The emitted frame's id comes from ``open_call.call_id`` (the minted,
+        globally-unique one), so start and end still merge into a single history row.
+        """
         output = self._message_text(message)
         payload = {"output": output}
 
-        open_call = self.ctx.open_calls.pop(call_id, None)
+        open_call = self.ctx.open_calls.pop(raw_call_id, None)
         if open_call is None:
             # End arrived before start — buffer it (§3.7 reordering).
-            self.ctx.orphan_ends[call_id] = payload
+            self.ctx.orphan_ends[raw_call_id] = payload
             return []
         # Last-chance goal/params fill: if _reconcile_open_delegations never ran
         # for this call (e.g. the args finished streaming in the same chunk that
         # also carried the tool result), recover them from the buffer so the end
         # frame still carries the delegation goal. The buffer is then disposable.
         self._enrich_delegation_from_buffer(open_call)
-        self.ctx.tool_arg_buffers.pop(call_id, None)
+        self.ctx.tool_arg_buffers.pop(raw_call_id, None)
         return [self._build_end_step(open_call, payload)]
 
     def _build_end_step(self, open_call: _OpenCall, payload: dict[str, Any]) -> ExecStep:
@@ -626,11 +729,13 @@ class StreamEventMapper:
         # ``normalize`` resets that namespace's segment once a non-thinking chunk
         # closes it, so a thinking block resuming after a tool call gets a fresh
         # row, and parallel subagents never share an id (no interleaved garble).
+        # ``run_token`` keeps the id unique across RUNS of the same svid as well —
+        # see StreamContext.run_token for why a collision there is destructive.
         key = ns or ""
         call_id = self.ctx.thinking_call_ids.get(key)
         if call_id is None:
             self.ctx.thinking_seq += 1
-            call_id = f"thinking:{task_id}:{self.ctx.thinking_seq}"
+            call_id = f"thinking:{task_id}:{self.ctx.run_token}:{self.ctx.thinking_seq}"
             self.ctx.thinking_call_ids[key] = call_id
         return ExecStep(
             task_id=task_id,
@@ -681,6 +786,10 @@ class StreamEventMapper:
             return "knowledge"
         return "tool"
 
+    def _has_open_thinking(self, ns: str | None) -> bool:
+        """Is a thinking segment currently accumulating for this namespace?"""
+        return (ns or "") in self.ctx.thinking_call_ids
+
     @staticmethod
     def _extract_thinking(message: Any) -> str | None:
         # DeepSeek-R1 style
@@ -693,9 +802,12 @@ class StreamEventMapper:
             # reasoning stream (a reasoning-parser boundary artifact); strip the
             # markers while keeping the reasoning, so they don't leak as bare
             # tags into the narration. A marker-only chunk (e.g. a lone "<think>",
-            # or a stream-truncated "<think") reduces to whitespace -> emit nothing.
+            # or a stream-truncated "<think") reduces to EMPTY -> emit nothing.
+            # Whitespace is NOT empty: a "\n" delta is a real line break in the
+            # model's reasoning and is forwarded (the caller decides whether a
+            # segment is open to receive it).
             reasoning = strip_reasoning_tags(reasoning)
-            return reasoning if reasoning.strip() else None
+            return reasoning or None
         # Anthropic thinking blocks in content list
         content = getattr(message, "content", None)
         if isinstance(content, list):
@@ -707,7 +819,7 @@ class StreamEventMapper:
             chunks = [c for c in chunks if c]
             if chunks:
                 joined = strip_reasoning_tags("".join(chunks))
-                return joined if joined.strip() else None
+                return joined or None
         return None
 
     @staticmethod

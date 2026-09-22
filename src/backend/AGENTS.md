@@ -28,6 +28,7 @@ Error codes (MMMEE) & module numbers → constitution **C5**. Pagination: `PageD
 - **Never use printf `%s` / `%r` / `%d` with loguru.** It does not interpolate them — the placeholder is printed literally and the args are silently dropped (this is a real bug, not a style nit: it has burned dry-run scripts).
 - f-strings (`logger.info(f"...")`) are also safe and still common in the tree; acceptable, but prefer `{}` for new logs.
 - Never downgrade `logger.exception(...)` (auto-attaches the traceback) to `logger.error`.
+- **Never pass `exc_info=` to loguru** — it has no such parameter, and *any* kwarg makes loguru run `str.format()` on the message. A message embedding a provider error (`Error code: 429 - {'error': {...}}`) then raises `KeyError` from inside `Logger._log`, before any handler. Want a traceback? `logger.exception(msg)` for ERROR, `logger.opt(exception=True).warning(msg)` for other levels. Guarded by `test/common/test_loguru_exc_info_guard.py`. Files using stdlib `logging.getLogger` are exempt — there `exc_info=` is correct and `core/logger.py`'s `InterceptHandler` forwards it properly.
 
 ---
 
@@ -148,6 +149,7 @@ uv run alembic revision --autogenerate -m "msg"   # autogen reflects MySQL only;
 - **The ruff PostToolUse hook deletes not-yet-used imports.** Every written `.py` gets `ruff check --fix`; an import added in one edit whose usage lands only in a later edit is removed as unused (F401) in between. Land import + usage in the same edit, or write the usage first.
 - **Celery Beat × multi-tenant.** A Beat schedule fires once; the task body iterates all active tenants — call `set_current_tenant_id()` per iteration, and wrap the cross-tenant enumeration query itself in `bypass_tenant_filter()` (`core/context/tenant.py`), otherwise queries fail on missing tenant context.
 - **DB config changes take up to 100s.** DB-layer config is cached in Redis with a 100s TTL — don't chase "config not applied" inside that window.
+- **A single-host compose hides multi-node bugs (constitution C8).** `backend` and `backend_worker` bind-mount the *same* `/app/data`, and the Linsight worker runs *inside* the worker container — so cross-process file sharing appears to work locally and breaks the moment the two land on different hosts. Before persisting anything, ask: which process writes, which reads, and would they still agree on separate machines? Same trap for startup work: `main.py`'s lifespan runs in the API process only; a Celery or Linsight worker that needs it must register it too (precedent: `02cbb921a`).
 
 ---
 

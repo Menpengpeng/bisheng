@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { ReactFlowJsonObject } from "@xyflow/react";
 import { FlowStyleType, FlowType, FlowVersionItem } from "../../types/flow";
 import axios from "../request";
@@ -169,7 +170,7 @@ export async function readFlowsFromDatabase(page: number = 1, pageSize: number =
 }
 
 /* app list — F027 cursor-based pagination.
- *   request:  { cursor?, pageSize, keyword, tag_id, type, managed, status, permissionId }
+ *   request:  { cursor?, pageSize, keyword, tag_id, type, managed, status, action }
  *   response: { data, page_size, has_more, next_cursor }
  *   The legacy `page_num` / `total` fields are gone (spec AC-02).
  */
@@ -182,7 +183,7 @@ export async function getAppsApi(
         type,
         managed,
         status,
-        permissionId = 'use_app',
+        action = 'use',
     }: {
         cursor?: string | null;
         pageSize?: number;
@@ -191,7 +192,7 @@ export async function getAppsApi(
         type?: 'assistant' | 'skill' | 'flow';
         managed?: any;
         status?: number;
-        permissionId?: string;
+        action?: 'visible' | 'use';
     },
 ): Promise<{ data: any[]; page_size: number; has_more: boolean; next_cursor: string | null }> {
     const tagIdStr = tag_id === -1 ? '' : `&tag_id=${tag_id}`
@@ -203,7 +204,7 @@ export async function getAppsApi(
     const statusStr = (status === 1 || status === 2) ? `&status=${status}` : ''
     const cursorStr = cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''
     const res = await axios.get(
-        `/api/v1/workflow/list?page_size=${pageSize}&name=${keyword ?? ''}${tagIdStr}${flowType}${managedStr}${statusStr}&permission_id=${permissionId}${cursorStr}`,
+        `/api/v1/workflow/list?page_size=${pageSize}&name=${keyword ?? ''}${tagIdStr}${flowType}${managedStr}${statusStr}&action=${action}${cursorStr}`,
     )
     const envelope = res as any as { data: any[]; page_size: number; has_more: boolean; next_cursor: string | null }
     const newData = envelope.data.map((item: any) => {

@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { Outlined } from 'bisheng-icons';
 import { useEffect, useState } from 'react';
 import { useSetRecoilState } from 'recoil';
@@ -9,10 +10,11 @@ import { cn } from '~/utils';
 import {
   getCitationDocumentFileType,
   getCitationDocumentName,
-  getCitationDocumentUrl,
   getCitationItemBBoxes,
+  isMediaCitation,
   isRagCitation,
-  resolveCitationDocumentUrl,
+  resolveCitationDocumentUrls,
+  resolveCitationDownloadUrl,
   toAbsolutePreviewUrl,
   type CitationPdfBBox,
 } from './citationUtils';
@@ -65,13 +67,20 @@ export function CitationDocumentPreviewContent({
   const itemId = preview?.itemId;
   const locateChunk = preview?.locateChunk;
   const fileName = detail ? getCitationDocumentName(detail) : '';
-  const rawFileUrl = detail ? getCitationDocumentUrl(detail) : '';
-  const [resolvedRawFileUrl, setResolvedRawFileUrl] = useState(rawFileUrl);
+  const isMedia = isMediaCitation(detail);
+  const [resolvedUrls, setResolvedUrls] = useState<{ originalUrl: string; previewUrl: string }>({
+    originalUrl: '',
+    previewUrl: '',
+  });
   const [isResolvingFileUrl, setIsResolvingFileUrl] = useState(false);
-  const fileType = canRenderPreview
-    ? resolveFileType(detail as ChatCitation, resolvedRawFileUrl || rawFileUrl)
-    : '';
-  const fileUrl = toAbsolutePreviewUrl(resolvedRawFileUrl || rawFileUrl);
+  // A clip renders from the original file (the player) with its transcript
+  // alongside; everything else renders from the derived preview.
+  const rawViewerUrl = isMedia
+    ? resolvedUrls.originalUrl || resolvedUrls.previewUrl
+    : resolvedUrls.previewUrl || resolvedUrls.originalUrl;
+  const fileType = canRenderPreview ? resolveFileType(detail as ChatCitation, rawViewerUrl) : '';
+  const fileUrl = toAbsolutePreviewUrl(rawViewerUrl);
+  const transcriptUrl = isMedia ? toAbsolutePreviewUrl(resolvedUrls.previewUrl) : '';
   const shouldLocateChunk = !!locateChunk && fileType === 'pdf';
   const bboxes: CitationPdfBBox[] = shouldLocateChunk
     ? getCitationItemBBoxes(detail as ChatCitation, itemId)
@@ -80,7 +89,7 @@ export function CitationDocumentPreviewContent({
 
   useEffect(() => {
     let active = true;
-    setResolvedRawFileUrl(rawFileUrl);
+    setResolvedUrls({ originalUrl: '', previewUrl: '' });
 
     if (!canRenderPreview || !detail) {
       setIsResolvingFileUrl(false);
@@ -89,24 +98,17 @@ export function CitationDocumentPreviewContent({
       };
     }
 
-    if (rawFileUrl) {
-      setIsResolvingFileUrl(false);
-      return () => {
-        active = false;
-      };
-    }
-
     setIsResolvingFileUrl(true);
-    void resolveCitationDocumentUrl(detail as ChatCitation).then((nextUrl) => {
+    void resolveCitationDocumentUrls(detail as ChatCitation).then((nextUrls) => {
       if (!active) return;
-      setResolvedRawFileUrl(nextUrl || '');
+      setResolvedUrls(nextUrls);
       setIsResolvingFileUrl(false);
     });
 
     return () => {
       active = false;
     };
-  }, [canRenderPreview, detail, rawFileUrl]);
+  }, [canRenderPreview, detail]);
 
   if (!canRenderPreview) {
     return null;
@@ -119,16 +121,17 @@ export function CitationDocumentPreviewContent({
           fileName={fileName}
           fileType={fileType}
           fileUrl={fileUrl}
+          transcriptUrl={transcriptUrl}
           highlightBboxes={bboxes}
           targetBBox={targetBBox}
           compactMode={compactMode}
         />
       ) : isResolvingFileUrl ? (
-        <div className="flex h-full items-center justify-center text-[14px] text-[#86909C]">
+        <div className="flex h-full items-center justify-center text-[14px] text-text-3">
           正在加载文件预览...
         </div>
       ) : (
-        <div className="flex h-full items-center justify-center text-[14px] text-[#86909C]">
+        <div className="flex h-full items-center justify-center text-[14px] text-text-3">
           暂无可预览文件地址
         </div>
       )}
@@ -148,7 +151,9 @@ export default function CitationDocumentPreviewDrawer({
   const setChatMobileNavHidden = useSetRecoilState(store.chatMobileNavHiddenState);
   const detail = preview?.detail ?? null;
   const fileName = getCitationDocumentName(detail);
-  const [resolvedRawFileUrl, setResolvedRawFileUrl] = useState(() => getCitationDocumentUrl(detail));
+  // Download always hands back the file the user uploaded, never the derived
+  // preview — otherwise a clip downloads as its transcript under an .mp4 name.
+  const [resolvedRawFileUrl, setResolvedRawFileUrl] = useState('');
   const fileUrl = toAbsolutePreviewUrl(resolvedRawFileUrl);
   const canRenderPreview = !!preview && isRagCitation(preview.detail);
 
@@ -196,14 +201,7 @@ export default function CitationDocumentPreviewDrawer({
 
   useEffect(() => {
     let active = true;
-    const nextRawFileUrl = getCitationDocumentUrl(detail);
-    setResolvedRawFileUrl(nextRawFileUrl);
-
-    if (nextRawFileUrl) {
-      return () => {
-        active = false;
-      };
-    }
+    setResolvedRawFileUrl('');
 
     if (!detail || !isRagCitation(detail)) {
       return () => {
@@ -211,7 +209,7 @@ export default function CitationDocumentPreviewDrawer({
       };
     }
 
-    void resolveCitationDocumentUrl(detail).then((nextUrl) => {
+    void resolveCitationDownloadUrl(detail).then((nextUrl) => {
       if (!active) return;
       setResolvedRawFileUrl(nextUrl || '');
     });
@@ -226,7 +224,7 @@ export default function CitationDocumentPreviewDrawer({
   }
 
   const handleDownload = async () => {
-    const nextFileUrl = toAbsolutePreviewUrl(resolvedRawFileUrl || await resolveCitationDocumentUrl(detail));
+    const nextFileUrl = toAbsolutePreviewUrl(resolvedRawFileUrl || await resolveCitationDownloadUrl(detail));
     setResolvedRawFileUrl((current) => current || nextFileUrl);
     if (!nextFileUrl) return;
     const link = document.createElement('a');
@@ -244,7 +242,7 @@ export default function CitationDocumentPreviewDrawer({
         'fixed flex flex-col bg-white',
         isFullBleedMobile && 'z-[120] inset-0 overflow-hidden overscroll-contain touch-pan-y',
         !isFullBleedMobile &&
-        'z-[121] inset-y-0 right-0 w-[min(520px,calc(100vw-24px))] border-l border-[#E5E6EB] shadow-[0_8px_28px_rgba(0,0,0,0.16)]',
+        'z-[121] inset-y-0 right-0 w-[min(520px,calc(100vw-24px))] border-l border-border-base shadow-[0_8px_28px_rgba(0,0,0,0.16)]',
       )}
       aria-label="文档预览"
       onClick={(event) => event.stopPropagation()}
@@ -252,7 +250,7 @@ export default function CitationDocumentPreviewDrawer({
     >
       <div
         className={cn(
-          'flex shrink-0 items-center justify-between border-b border-[#F2F3F5]',
+          'flex shrink-0 items-center justify-between border-b border-fill-2',
           // Symmetric vertical padding so icon/title/actions sit centered in the bar; safe-area only on top.
           isFullBleedMobile &&
             'px-4 pb-4 pt-[calc(env(safe-area-inset-top,0px)+16px)]',
@@ -263,7 +261,7 @@ export default function CitationDocumentPreviewDrawer({
           {(!isNarrowLayout || isFullBleedMobile) && <Outlined.File className="size-4 shrink-0 text-blue-500" />}
           <h2
             className={cn(
-              'min-w-0 truncate font-semibold text-[#1D2129]',
+              'min-w-0 truncate font-semibold text-text-1',
               isNarrowLayout ? 'text-[14px] leading-5' : 'text-[16px] leading-6',
             )}
             title={fileName}
@@ -276,10 +274,10 @@ export default function CitationDocumentPreviewDrawer({
               onClick={handleDownload}
               disabled={!fileUrl}
               className={cn(
-                'shrink-0 items-center justify-center text-[#86909C] hover:bg-[#F2F3F5] hover:text-blue-500 disabled:cursor-not-allowed disabled:text-[#C9CDD4]',
+                'shrink-0 items-center justify-center text-text-3 hover:bg-fill-2 hover:text-blue-500 disabled:cursor-not-allowed disabled:text-text-4',
                 isFullBleedMobile
                   ? 'inline-flex size-8 rounded-md'
-                  : 'inline-flex size-6 rounded-[6px]',
+                  : 'inline-flex size-6 rounded-md',
               )}
               aria-label={localize("com_knowledge.download_file")}
             >
@@ -291,10 +289,10 @@ export default function CitationDocumentPreviewDrawer({
           type="button"
           onClick={onClose}
           className={cn(
-            'items-center justify-center text-[#A9AEB8] hover:bg-[#F2F3F5] hover:text-[#4E5969]',
+            'items-center justify-center text-[#A9AEB8] hover:bg-fill-2 hover:text-text-2',
             isFullBleedMobile
               ? 'inline-flex size-8 rounded-md'
-              : 'inline-flex size-6 rounded-[6px]',
+              : 'inline-flex size-6 rounded-md',
           )}
           aria-label="关闭文档预览"
         >

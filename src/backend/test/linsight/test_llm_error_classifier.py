@@ -133,6 +133,55 @@ def test_quota_label():
     assert label_error(exc) is ErrorType.QUOTA_EXHAUSTED
 
 
+def _relay_pre_consume_403():
+    """The verbatim 403 a one-api/new-api style relay returns when its PRE-DEDUCTED
+    cost estimate exceeds the remaining balance (114, 2026-08-14, kimi-k3)."""
+    return make_exc(
+        openai.PermissionDeniedError,
+        message=(
+            "Error code: 403 - {'error': {'message': 'token quota is not enough, "
+            "token remain quota: $0.073168, need quota: $0.173140 "
+            "(request id: 20260814123904962529180kpTepsN4)', 'type': 'api_error', "
+            "'param': '', 'code': 'pre_consume_token_quota_failed'}, 'id': 123}"
+        ),
+        code="pre_consume_token_quota_failed",
+        status_code=403,
+    )
+
+
+def test_relay_pre_consume_403_is_quota_not_auth():
+    """Regression: this used to fall through to the auth branch, so the user was
+    told "凭证无效或没有权限 / 检查模型配置" when the only remedy was topping up.
+
+    It is money wording but arrives as 403 (not the 429 this bucket was written
+    around) and matches none of the arrears/balance strings, which is exactly how
+    it slipped past.
+    """
+    assert label_error(_relay_pre_consume_403()) is ErrorType.QUOTA_EXHAUSTED
+
+
+def test_relay_pre_consume_403_still_fails_fast():
+    """Behaviour must not change: retrying a balance shortfall is pointless."""
+    assert classify_behavior(_relay_pre_consume_403()) is Behavior.FAIL_FAST
+
+
+def test_relay_quota_signal_survives_in_body_only():
+    """Some relays put the code only in the body — _exc_text folds body values in."""
+    exc = make_exc(
+        openai.PermissionDeniedError,
+        message="request failed",
+        body={"error": {"code": "pre_consume_token_quota_failed"}},
+        status_code=403,
+    )
+    assert label_error(exc) is ErrorType.QUOTA_EXHAUSTED
+
+
+def test_plain_403_is_still_auth_error():
+    """The narrow signals must not swallow genuine credential/permission failures."""
+    exc = make_exc(openai.PermissionDeniedError, message="invalid api key", status_code=403)
+    assert label_error(exc) is ErrorType.AUTH_ERROR
+
+
 def test_network_and_service_labels():
     assert label_error(make_exc(openai.APITimeoutError, message="t")) is ErrorType.NETWORK_TIMEOUT
     assert label_error(make_exc(openai.InternalServerError, status_code=500)) is ErrorType.SERVICE_UNAVAILABLE
@@ -273,3 +322,109 @@ def test_classify_for_event_accepts_bare_string():
     assert result.error_type == ErrorType.CONTENT_FILTER.value
     assert result.error_code == 11090
     assert result.detail.startswith("Task execution failed")
+
+
+# --------------------------------------------------------------------------- #
+# Transient upstream-fetch failures wrapped in a 400
+#
+# Session 649ba617 (180 POC, 2026-08-09): a deck screenshot handed to the model
+# came back as a 400 whose body said the PROVIDER's own fetch of the staged image
+# was reset mid-flight — both endpoints inside the vendor's network. Plain 400s
+# DEGRADE, and DEGRADABLE on the main graph re-raises, so one transport blip
+# killed a 21-minute run with zero retries.
+# --------------------------------------------------------------------------- #
+
+_DOWNLOAD_RESET_BODY = {
+    "message": (
+        '{"error":{"code":"DOWNLOAD_FAILED","message":"failed to download image, err: '
+        'Get \\"http://ds-restful-api-bj-prod.oss-cn-beijing.aliyuncs.com/restful/data-uri/null/'
+        'd7f119b9/f7f86073?Expires=1786436767\\": read tcp 10.0.2.60:46976->10.86.10.104:6000: '
+        'read: connection reset by peer"}}'
+    ),
+    "type": "UploadFailed",
+    "code": "UploadFailed",
+}
+
+
+def test_provider_upstream_reset_is_retryable():
+    """The exact production payload."""
+    exc = make_exc(
+        openai.BadRequestError,
+        message=_DOWNLOAD_RESET_BODY["message"],
+        code="UploadFailed",
+        body=_DOWNLOAD_RESET_BODY,
+        status_code=400,
+    )
+    assert classify_behavior(exc) is Behavior.RETRYABLE
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "failed to download image, err: read: connection reset by peer",
+        "upstream fetch: write: broken pipe",
+        "dial tcp 10.0.0.1:6000: i/o timeout",
+        "unexpected EOF while reading the staged object",
+        "dial tcp 10.0.0.1:6000: connect: connection refused",
+        "no route to host",
+    ],
+)
+def test_transport_phrases_are_retryable(message):
+    exc = make_exc(openai.BadRequestError, message=message, status_code=400)
+    assert classify_behavior(exc) is Behavior.RETRYABLE
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "failed to download image, err: 404 Not Found",
+        "failed to download image: unsupported image format",
+        "invalid_request_error: image url is not accessible",
+        "malformed request",
+    ],
+)
+def test_permanent_fetch_failures_still_degrade(message):
+    """Transport-only on purpose: a 404 / bad URL / bad format will fail every
+    retry, so it must keep degrading instead of burning three backoffs."""
+    exc = make_exc(openai.BadRequestError, message=message, status_code=400)
+    assert classify_behavior(exc) is Behavior.DEGRADABLE
+
+
+def test_fail_fast_still_wins_over_a_transport_phrase():
+    """Ordering guard: the FAIL_FAST branches run first, so an arrears/auth error
+    that happens to mention a reset connection is never turned into a retry."""
+    arrears = make_exc(
+        openai.BadRequestError,
+        message="欠费 stopped the request; connection reset by peer",
+        status_code=400,
+    )
+    assert classify_behavior(arrears) is Behavior.FAIL_FAST
+
+    auth = make_exc(
+        openai.AuthenticationError,
+        message="invalid api key (connection reset by peer)",
+        status_code=401,
+    )
+    assert classify_behavior(auth) is Behavior.FAIL_FAST
+
+
+def test_content_filter_is_not_hijacked_by_a_transport_phrase():
+    """Content moderation must keep degrading — retrying it is pointless."""
+    exc = make_exc(
+        openai.BadRequestError,
+        message="Output data may contain inappropriate content",
+        code="data_inspection_failed",
+        status_code=400,
+    )
+    assert classify_behavior(exc) is Behavior.DEGRADABLE
+
+
+def test_upstream_reset_labels_as_service_unavailable():
+    """If retries do run out, the user gets "service busy", not the unknown card."""
+    exc = make_exc(
+        openai.BadRequestError,
+        message=_DOWNLOAD_RESET_BODY["message"],
+        body=_DOWNLOAD_RESET_BODY,
+        status_code=400,
+    )
+    assert label_error(exc) is ErrorType.SERVICE_UNAVAILABLE

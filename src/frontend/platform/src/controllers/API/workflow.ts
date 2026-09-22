@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { WorkFlow } from "@/types/flow";
 import axios from "../request";
 
@@ -144,6 +145,17 @@ export const runWorkflowNodeApi = async ({ node_input, data, workflow_id }): Pro
             id: data.id,
             data,
         }
+    });
+}
+
+/**
+ * 手动保存报告模板
+ * 只是让文档服务把当前编辑内容立刻落盘，实际写入仍由文档服务回调后端完成
+ */
+export const saveWorkflowReportTemplate = async (versionKey: string, flowId: string): Promise<any> => {
+    return await axios.post(`/api/v1/workflow/report/save`, {
+        version_key: versionKey,
+        workflow_id: flowId
     });
 }
 

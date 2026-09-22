@@ -29,11 +29,25 @@ function coerceErrorDetail(value: unknown): string {
     return String(value);
 }
 
+// Errors that make the whole conversation unusable — the assistant is gone or not live, so
+// no retry can succeed and the input stays locked. Everything else (model auth failures, tool
+// errors, timeouts) is a per-turn runtime failure: report it in a toast and let the user retry.
+const BLOCKING_ERROR_CODES = new Set([
+    10400, // assistant does not exist
+    10420, // assistant has been deleted
+    10421, // assistant is not online
+]);
+
+export function isBlockingChatError(payload: ChatErrorPayload | null | undefined): boolean {
+    const statusCode = Number(payload?.status_code);
+    return Number.isInteger(statusCode) && BLOCKING_ERROR_CODES.has(statusCode);
+}
+
 export function resolveChatErrorMessage(
     payload: ChatErrorPayload | null | undefined,
     translate: Translate,
 ): string {
-    const fallbackMessage = payload?.status_message || "error";
+    const fallbackMessage = payload?.status_message || String(translate("api_errors:fallback") ?? "");
     const statusCode = payload?.status_code;
 
     const interpolationParams =
@@ -41,7 +55,7 @@ export function resolveChatErrorMessage(
     const translatedMessage =
         statusCode === undefined || statusCode === null || statusCode === ""
             ? fallbackMessage
-            : translate(`errors.${statusCode}`, {
+            : translate(`api_errors:${statusCode}`, {
                 ...interpolationParams,
                 defaultValue: fallbackMessage,
             });

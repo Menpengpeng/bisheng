@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { lazy, useEffect } from "react";
 import { Navigate, createBrowserRouter } from "react-router-dom";
 import MainLayout from "../layout/MainLayout";
@@ -17,15 +18,8 @@ const Apps = lazy(() => import("@/pages/BuildPage/apps"));
 const EditAssistantPage = lazy(() => import("@/pages/BuildPage/assistant/editAssistant"));
 const WorkBenchPage = lazy(() => import("@/pages/BuildPage/bench/DialogueWork"));
 const FlowPage = lazy(() => import("@/pages/BuildPage/flow"));
-const SkillPage = lazy(() => import("@/pages/BuildPage/skills/editSkill"));
-const L2Edit = lazy(() => import("@/pages/BuildPage/skills/l2Edit"));
 const SkillToolsPage = lazy(() => import("@/pages/BuildPage/tools"));
-const SkillChatPage = lazy(() => import("@/pages/ChatAppPage"));
-const ChatAssitantShare = lazy(() => import("@/pages/ChatAppPage/chatAssitantShare"));
-const ChatShare = lazy(() => import("@/pages/ChatAppPage/chatShare"));
-const ChatPro = lazy(() => import("@/pages/ChatAppPage/chatWebview"));
 const DataSetPage = lazy(() => import("@/pages/DataSetPage"));
-const DiffFlowPage = lazy(() => import("@/pages/DiffFlowPage"));
 const EvaluatingPage = lazy(() => import("@/pages/EvaluationPage"));
 const EvaluatingCreate = lazy(() => import("@/pages/EvaluationPage/EvaluationCreate"));
 const KnowledgePage = lazy(() => import("@/pages/KnowledgePage"));
@@ -82,21 +76,16 @@ const privateRouter = [
     children: [
       // 开发环境登录后曾跳转 /admin，但业务路由无该 path，会落入 * → 404；统一进管理端后再由 userContext 纠偏
       { path: "admin", element: <Navigate to="/label" replace /> },
-      // { path: "", element: <SkillChatPage />, },
       { path: "filelib", element: <KnowledgePage />, permission: 'knowledge', },
       { path: "filelib/:id", element: <FilesPage />, permission: 'knowledge', },
       { path: "filelib/upload/:id", element: <FilesUpload />, permission: 'knowledge', },
       { path: "filelib/adjust/:fileId", element: <AdjustFilesUpload />, permission: 'knowledge', },
       { path: "filelib/qalib/:id", element: <QasPage />, permission: 'knowledge', },
       { path: "build/apps", element: <Apps />, permission: 'build', },
-      // { path: "build/assist", element: <SkillAssisPage />, permission: 'build', },
-      // { path: "build/skills", element: <SkillsPage />, permission: 'build', },
       // @ts-ignore
       { path: "build/tools", element: <SkillToolsPage />, permission: 'build', },
       { path: "build/client", element: <WorkBenchPage />, permission: 'workstation' },
       { path: "build", element: <Navigate to="apps" replace /> },
-      { path: "build/skill", element: <L2Edit />, permission: 'build', },
-      { path: "build/skill/:id/:vid", element: <L2Edit />, permission: 'build', },
       { path: "build/temps/:type", element: <Templates />, permission: 'create_app', },
       { path: "model/management", element: <Management />, permission: 'model' },
       { path: "model/finetune", element: <Finetune />, permission: 'model' },
@@ -106,13 +95,13 @@ const privateRouter = [
       { path: "log", element: <LogPage />, permission: "log" },
       { path: "log/chatlog/:fid/:cid/:type", element: <AppChatDetail />, permission: "log" },
       { path: "log/chatlog/:cid", element: <DailyChatDetail />, permission: "log" },
-      { path: "evaluation", element: <EvaluatingPage /> },
-      { path: "evaluation/create", element: <EvaluatingCreate /> },
-      { path: "dataset", element: <DataSetPage /> },
+      { path: "evaluation", element: <EvaluatingPage />, permission: 'evaluation' },
+      { path: "evaluation/create", element: <EvaluatingCreate />, permission: 'evaluation' },
+      { path: "dataset", element: <DataSetPage />, permission: 'dataset' },
       { path: "label", element: <LabelPage />, permission: 'mark_task' },
       { path: "label/:id", element: <TaskApps />, permission: 'mark_task' },
       { path: "label/chat/:id/:fid/:cid/:type", element: <TaskAppChats />, permission: 'mark_task' },
-      { path: "dashboard", element: <Dashboard /> },
+      { path: "dashboard", element: <Dashboard />, permission: 'board' },
       { path: "tenant", element: <TenantPage />, permission: 'sys' },
       { path: "department", element: <Navigate to="/sys" replace /> },
       { path: "menu-pending", element: <MenuPermissionPlaceholder /> },
@@ -121,13 +110,6 @@ const privateRouter = [
   { path: "dashboard/:id", element: <EditorPage />, errorElement: <RouteErrorBoundary />, permission: 'board', },
   { path: "dashboard/share/:boardId", element: <SharePage />, errorElement: <RouteErrorBoundary /> },
   { path: "model/doc", element: <Doc />, errorElement: <RouteErrorBoundary /> },
-  {
-    path: "/skill/:id/",
-    errorElement: <RouteErrorBoundary />,
-    children: [
-      { path: "", element: <SkillPage /> }
-    ]
-  },
   {
     path: "/flow/:id/",
     errorElement: <RouteErrorBoundary />,
@@ -150,11 +132,9 @@ const privateRouter = [
   // Standalone chat pages — redirect to client app (/workspace)
   { path: "/chat/assistant/auth/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
   { path: "/chat/flow/auth/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
-  { path: "/chat", element: <SkillChatPage />, errorElement: <RouteErrorBoundary /> },
   { path: "/chat/flow/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
   { path: "/chat/assistant/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
   { path: "/report/:id/", element: <Report />, errorElement: <RouteErrorBoundary /> },
-  { path: "/diff/:id/:vid/:cid", element: <DiffFlowPage />, errorElement: <RouteErrorBoundary /> },
   { path: "/reset", element: <ResetPwdPage />, errorElement: <RouteErrorBoundary /> },
   // Backdoor login: also exposed inside privateRouter so an authenticated user
   // navigating here (e.g. to switch accounts) does not fall into the * -> /404 trap.
@@ -175,7 +155,6 @@ function hasRoutePermission(permissions: string[], key: string) {
 /**
  * Convert the backend web_menu value into route permissions.
  *
- * - Department admins receive a create_app fallback when the backend omits it.
  * - Child tenant admins receive every admin route except tenant management. Their backend web_menu
  *   still comes from a regular role, while business APIs retain tenant and resource authorization.
  */
@@ -198,9 +177,6 @@ export function resolveRoutePermissions(user: {
   is_child_admin?: boolean | null
 }): string[] {
   let perms = user.web_menu ?? []
-  if (user.is_department_admin && !perms.includes("create_app")) {
-    perms = [...perms, "create_app"]
-  }
   if (user.is_child_admin) {
     const missing = CHILD_ADMIN_ROUTE_PERMISSIONS.filter((permission) => !perms.includes(permission))
     if (missing.length) perms = [...perms, ...missing]
@@ -208,31 +184,49 @@ export function resolveRoutePermissions(user: {
   return perms
 }
 
+const ADMIN_LANDING_ROUTES = [
+  { key: "board", path: "/dashboard" },
+  { key: "build", path: "/build/apps" },
+  { key: "knowledge", path: "/filelib" },
+  { key: "dataset", path: "/dataset" },
+  { key: "model", path: "/model/management" },
+  { key: "evaluation", path: "/evaluation" },
+  { key: "mark_task", path: "/label" },
+  { key: "sys", path: "/sys" },
+] as const
+
+export function resolveAdminLandingPath(permissions: string[], menuApprovalMode: boolean): string {
+  const target = ADMIN_LANDING_ROUTES.find((item) => permissions.includes(item.key))
+  if (target) return target.path
+  return menuApprovalMode ? "/menu-pending?menu=board" : "/menu-pending"
+}
+
 export const getPrivateRouter = (
   permissions: string[],
   opts?: { menuApprovalMode?: boolean },
 ) => {
-  const filterMenuItem = (_privateRouter) => {
-    const result = _privateRouter.reduce((res, cur) => {
-      // 递归
-      if (cur.children?.length) {
-        cur.children = filterMenuItem(cur.children)
-      }
+  // Builds a fresh route tree; `privateRouter` itself is never touched. It used
+  // to write the filtered children back into the shared table, and those copies
+  // had already lost their `permission` key — so from the second build on (the
+  // router is rebuilt whenever `user` changes) nested routes were no longer
+  // filtered at all, while top-level ones still were. That asymmetry let a user
+  // reach a list page they should not see and then hit /404 on its top-level
+  // editor route.
+  const filterMenuItem = (routes) =>
+    routes.reduce((res, cur) => {
+      const { permission, children, ...other } = cur
+      const next = children?.length ? { ...other, children: filterMenuItem(children) } : { ...other }
 
-      const { permission, ...other } = cur
       if (permission && !hasRoutePermission(permissions, permission)) {
         if (opts?.menuApprovalMode) {
-          res.push({ ...other, element: <MenuPermissionPlaceholder /> })
+          res.push({ ...next, element: <MenuPermissionPlaceholder /> })
         }
         return res
       }
 
-      res.push(other)
+      res.push(next)
       return res
     }, [])
-
-    return result
-  }
 
   return createBrowserRouter(permissions ? filterMenuItem(privateRouter) : [],
     baseConfig)

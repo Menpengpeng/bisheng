@@ -1,5 +1,5 @@
 import { formatStrTime } from "~/utils"
-import ChatFile from "./ChatFile"
+import { AppChatFileList } from "./AppChatFileList"
 
 export default function MessageFile({ data, title, logo }) {
 
@@ -16,7 +16,7 @@ export default function MessageFile({ data, title, logo }) {
                     {logo}
                     <div>
                         <p className="select-none font-semibold text-base mb-2">{title}</p>
-                        <ChatFile fileName={data.files[0]?.file_name} filePath={data.files[0]?.file_url} />
+                        <AppChatFileList files={data.files} />
                     </div>
                 </div>
             </div>

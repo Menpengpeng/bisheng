@@ -1,17 +1,19 @@
 import { Checkbox } from "~/components/ui/Checkbox";
-import { getResourceGrantUsers, searchUsers } from "~/api/permission";
+import { searchUsers } from "~/api/permission";
 import type { GrantUser, ResourceType, SelectedSubject } from "~/api/permission";
 import { User as UserIcon, Search } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocalize } from "~/hooks";
 
-interface SubjectSearchUserProps {
+export interface SubjectSearchUserProps {
   value: SelectedSubject[];
   onChange: (v: SelectedSubject[]) => void;
   resourceType?: ResourceType;
   resourceId?: string;
   disabledIds?: number[];
-  grantUsersApi?: typeof getResourceGrantUsers;
+  /** subjectId -> the permission model(s) that subject already holds here. */
+  grantedLabels?: Record<string, string>;
+  usersApi?: typeof searchUsers;
 }
 
 type UserRow = GrantUser;
@@ -24,7 +26,8 @@ export function SubjectSearchUser({
   resourceType,
   resourceId,
   disabledIds = [],
-  grantUsersApi,
+  grantedLabels = {},
+  usersApi,
 }: SubjectSearchUserProps) {
   const localize = useLocalize();
   const [keyword, setKeyword] = useState("");
@@ -53,18 +56,10 @@ export function SubjectSearchUser({
       pageNum: number,
       signal: AbortSignal,
     ): Promise<UserRow[]> => {
-      if (resourceType && resourceId) {
-        const getGrantUsers = grantUsersApi ?? getResourceGrantUsers;
-        const rows = await getGrantUsers(
-          resourceType,
-          resourceId,
-          { keyword: name, page: pageNum, page_size: PAGE_SIZE },
-          { signal },
-        );
-        if (signal.aborted) return [];
-        return Array.isArray(rows) ? rows : [];
-      }
-      const res = await searchUsers(
+      if (!resourceType || !resourceId) return [];
+      const res = await (usersApi ?? searchUsers)(
+        resourceType,
+        resourceId,
         name,
         { page: pageNum, pageSize: PAGE_SIZE },
         { signal },
@@ -72,7 +67,7 @@ export function SubjectSearchUser({
       if (signal.aborted) return [];
       return res.data || [];
     },
-    [grantUsersApi, resourceId, resourceType],
+    [resourceId, resourceType, usersApi],
   );
 
   const resetAndLoad = useCallback(
@@ -197,18 +192,18 @@ export function SubjectSearchUser({
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
       <div className="relative shrink-0">
-        <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-[#999999]" />
+        <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-text-3" />
         <input
           type="text"
           placeholder={localize("com_permission.search_user")}
           value={keyword}
           onChange={handleInput}
-          className="h-8 w-full rounded-[6px] border border-[#EBECF0] bg-white pl-9 pr-3 text-[14px] text-[#212121] outline-none transition-colors placeholder:text-[#999999] focus:border-[#C9CDD4]"
+          className="h-8 w-full rounded-md border border-border-base bg-white pl-9 pr-3 text-[14px] text-text-1 outline-none transition-colors placeholder:text-text-3 focus:border-border-deep"
         />
       </div>
       <div
         ref={scrollRef}
-        className="scrollbar-os min-h-0 flex-1 overflow-y-auto rounded-[6px] border border-[#EBECF0]"
+        className="scrollbar-os min-h-0 flex-1 overflow-y-auto rounded-md border border-border-base"
       >
         {loading && (
           <div className="py-4 text-center text-sm text-gray-500">
@@ -223,6 +218,7 @@ export function SubjectSearchUser({
         {!loading &&
           results.map((user) => {
             const isDisabled = disabledIdSet.has(user.user_id);
+            const grantedLabel = grantedLabels[String(user.user_id)];
             // User id (external_id) renders right after the username; the dedicated
             // column shows only the org/department path.
             const departmentPath = user.primary_department_path ?? "";
@@ -239,7 +235,9 @@ export function SubjectSearchUser({
               >
                 <Checkbox
                   className="border-[#D9D9D9] data-[state=checked]:border-primary data-[state=indeterminate]:border-primary"
-                  checked={selectedIds.has(user.user_id)}
+                  // Already-granted rows read as checked: the picker shows who holds
+                  // the resource, so an empty box next to the badge reads as a bug.
+                  checked={selectedIds.has(user.user_id) || isDisabled}
                   disabled={isDisabled}
                 />
                 {/* Name column: username + user id (external_id) after it; the next
@@ -250,19 +248,23 @@ export function SubjectSearchUser({
                   {showUserId && (
                     <>
                       <span className="h-3 w-px shrink-0 bg-[#D9D9D9]" aria-hidden />
-                      <span className="shrink-0 truncate text-xs text-[#999999]" title={user.external_id ?? undefined}>{user.external_id}</span>
+                      <span className="shrink-0 truncate text-xs text-text-3" title={user.external_id ?? undefined}>{user.external_id}</span>
                     </>
                   )}
                   {/* "Already granted" badge sits right after the name/id; it stays at
                       full width while the username truncates, so it never crowds the
                       department column on the right. */}
-                  {isDisabled && (
+                  {(grantedLabel || isDisabled) && (
                     <span className="shrink-0 rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-500">
-                      {localize("com_permission.already_granted")}
+                      {grantedLabel
+                        ? localize("com_permission.already_granted_as", {
+                            model: grantedLabel,
+                          })
+                        : localize("com_permission.already_granted")}
                     </span>
                   )}
                 </div>
-                <span className="max-w-[45%] shrink-0 truncate text-xs text-[#999999]" title={departmentPath}>{departmentPath}</span>
+                <span className="max-w-[45%] shrink-0 truncate text-xs text-text-3" title={departmentPath}>{departmentPath}</span>
               </div>
             );
           })}

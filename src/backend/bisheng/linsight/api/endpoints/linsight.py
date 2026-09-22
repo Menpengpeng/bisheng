@@ -15,6 +15,7 @@ from bisheng.api.services.invite_code.invite_code import InviteCodeService
 from bisheng.api.v1.schemas import UnifiedResponseModel, resp_200
 from bisheng.common.constants.enums.telemetry import ApplicationTypeEnum, BaseTelemetryTypeEnum
 from bisheng.common.dependencies.user_deps import UserPayload
+from bisheng.common.errcode import BaseErrorCode
 from bisheng.common.errcode.http_error import NotFoundError, UnAuthorizedError
 from bisheng.common.errcode.linsight import (
     FileUploadError,
@@ -29,6 +30,7 @@ from bisheng.common.schemas.telemetry.event_data_schema import ApplicationAliveE
 from bisheng.common.services import telemetry_service
 from bisheng.common.services.config_service import settings
 from bisheng.core.cache.redis_manager import get_redis_client
+from bisheng.core.context.tenant import bypass_tenant_filter_if
 from bisheng.core.logger import trace_id_var
 from bisheng.core.storage.minio.minio_manager import get_minio_storage
 from bisheng.database.models.session import MessageSessionDao
@@ -84,6 +86,10 @@ async def upload_file(
             "file_name": upload_result.get("original_filename"),
             "parsing_status": upload_result.get("parsing_status"),
         }
+    except BaseErrorCode as e:
+        # Typed business errors (e.g. the per-file size ceiling) keep their own
+        # code so the client can tell "too large" apart from a generic failure.
+        return e.return_resp_instance()
     except Exception as e:
         logger.error(f"Upload Failed: {e!s}")
         return FileUploadError.return_resp()
@@ -132,18 +138,24 @@ async def linsight_file_download(
     login_user: UserPayload = Depends(UserPayload.get_login_user),
     share_link: Union["ShareLink", None] = Depends(header_share_token_parser),
 ) -> UnifiedResponseModel:
-    session_version_model = await LinsightSessionVersionDao.get_by_id(session_version_id)
+    with bypass_tenant_filter_if(share_link is not None):
+        session_version_model = await LinsightSessionVersionDao.get_by_id(session_version_id)
     if not session_version_model:
         raise NotFoundError()
 
     # judge permission
     if session_version_model.user_id != login_user.user_id and not login_user.is_admin():
-        # Access by sharing a link
-        if (
-            share_link is None
-            or share_link.meta_data is None
-            or share_link.meta_data.get("versionId") != session_version_id
-        ):
+        # Access by sharing a link. Both share shapes grant, same as
+        # session-version-list / execute-task-detail: a workbench_chat share
+        # carries resource_id = the session and no versionId, and its recipient
+        # must still be able to open the task's output files.
+        shared_to_session = share_link is not None and share_link.resource_id == session_version_model.session_id
+        shared_to_version = (
+            share_link is not None
+            and share_link.meta_data is not None
+            and share_link.meta_data.get("versionId") == session_version_id
+        )
+        if not (shared_to_session or shared_to_version):
             raise UnAuthorizedError()
 
     minio_client = await get_minio_storage()
@@ -190,8 +202,13 @@ async def submit_linsight_workbench(
 
             response_data = {
                 "message_session": message_session_model.model_dump(),
-                "linsight_session_version": linsight_session_version_model.model_dump(),
+                "linsight_session_version": linsight_session_version_model.public_dump(),
             }
+        except BaseErrorCode as e:
+            # Typed business errors (folder-upload limits, …) keep their own code so
+            # the client can show the right copy instead of a generic submit failure.
+            yield e.to_sse_event_instance()
+            return
         except Exception as e:
             yield LinsightQuestionError(exception=e).to_sse_event_instance()
             return
@@ -236,20 +253,24 @@ async def start_execute(
     if session_version_model.status in [
         SessionVersionStatusEnum.COMPLETED,
         SessionVersionStatusEnum.TERMINATED,
-        SessionVersionStatusEnum.IN_PROGRESS,
     ]:
-        # The Inspiration session version has been completed or is being executed and cannot be executed again
+        # A finished session must not be re-run.
         return LinsightSessionVersionRunningError.return_resp()
+
+    if session_version_model.status == SessionVersionStatusEnum.IN_PROGRESS:
+        # Already running — report success rather than an error. Submit now
+        # enqueues server-side, so by the time the client's start-execute lands
+        # the worker has often already picked the session up. Answering with an
+        # error there made the frontend's `.catch` mark a perfectly healthy task
+        # as failed (taskError + Stoped). "Is it running?" is what the caller
+        # actually wants to know, and the answer is yes.
+        logger.info(f"start-execute: session {linsight_session_version_id} already running; treating as no-op")
+        return resp_200(data=True, message="Ideas execution task is already running")
 
     await MessageSessionDao.touch_session(session_version_model.session_id)
 
-    from bisheng.linsight.worker import LinsightQueue
-
     try:
-        redis_client = await get_redis_client()
-        queue = LinsightQueue("queue", namespace="linsight", redis=redis_client)
-
-        await queue.put(data=linsight_session_version_id)
+        await linsight_execute_utils.enqueue_session_for_execution(session_version_model)
 
     except Exception as e:
         logger.error(f"Failed to start the Ideas task: {e!s}")
@@ -320,7 +341,13 @@ async def continue_conversation(
 
         redis_client = await get_redis_client()
         queue = LinsightQueue("queue", namespace="linsight", redis=redis_client)
-        await queue.put(data=encode_queue_item(session_version_id, continue_question=question))
+        await queue.put(
+            data=encode_queue_item(
+                session_version_id,
+                continue_question=question,
+                tenant_id=session_version_model.tenant_id,
+            )
+        )
     except Exception as e:
         logger.error(f"Failed to continue the Ideas conversation: {e!s}")
         # Roll back the status flip so the conversation isn't stuck IN_PROGRESS.
@@ -402,7 +429,14 @@ async def user_input(
 
         redis_client = await get_redis_client()
         queue = LinsightQueue("queue", namespace="linsight", redis=redis_client)
-        await queue.put_head(encode_queue_item(session_version_id, resume=True, user_input=input_content))
+        await queue.put_head(
+            encode_queue_item(
+                session_version_id,
+                resume=True,
+                user_input=input_content,
+                tenant_id=session_version_model.tenant_id,
+            )
+        )
 
     return resp_200(data=True, message="User input submitted")
 
@@ -506,7 +540,8 @@ async def get_linsight_session_version_list(
     :return:
     """
 
-    linsight_session_version_models = await LinsightWorkbenchImpl.get_linsight_session_version_list(session_id)
+    with bypass_tenant_filter_if(share_link is not None):
+        linsight_session_version_models = await LinsightWorkbenchImpl.get_linsight_session_version_list(session_id)
 
     if linsight_session_version_models and login_user.user_id != linsight_session_version_models[0].user_id:
         # Access by sharing a link. Two share shapes are valid:
@@ -542,8 +577,11 @@ async def get_linsight_session_version_list(
     # version's linked task message_id + liked so the standalone linsight page can
     # rate through the shared /liked endpoint and re-highlight on reload (same as
     # the in-conversation task turn).
-    version_dumps = [model.model_dump() for model in linsight_session_version_models]
-    feedback_map = await linsight_execute_utils.get_task_feedback_by_version(session_id)
+    version_dumps = [model.public_dump() for model in linsight_session_version_models]
+    # ChatMessage is tenant-aware too — without the same widening, a cross-tenant
+    # share recipient silently loses the like/dislike state.
+    with bypass_tenant_filter_if(share_link is not None):
+        feedback_map = await linsight_execute_utils.get_task_feedback_by_version(session_id)
     for dump in version_dumps:
         info = feedback_map.get(dump.get("id"))
         dump["message_id"] = info["message_id"] if info else None
@@ -566,12 +604,13 @@ async def get_execute_task_detail(
     :return:
     """
 
-    execute_task_models = await LinsightWorkbenchImpl.get_execute_task_detail(session_version_id)
+    with bypass_tenant_filter_if(share_link is not None):
+        execute_task_models = await LinsightWorkbenchImpl.get_execute_task_detail(session_version_id)
 
-    if not execute_task_models:
-        return resp_200([])
+        if not execute_task_models:
+            return resp_200([])
 
-    linsight_session_version_model = await LinsightSessionVersionDao.get_by_id(session_version_id)
+        linsight_session_version_model = await LinsightSessionVersionDao.get_by_id(session_version_id)
 
     if login_user.user_id != linsight_session_version_model.user_id:
         # Access by sharing a link. workbench_chat share: resource_id is this

@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { generateUUID } from "~/utils";
 import request from "./request";
 
@@ -148,6 +149,7 @@ export async function getChatHistoryApi({ flowId, chatId, flowType, id, shareTok
             const _category = _isSend ? 'question' : category
             const _files = (files ? JSON.parse(files) : []).map(file => {
                 return {
+                    ...file,
                     file_name: file.file_name || file.name,
                     file_url: file.file_url || file.path,
                 }
@@ -229,26 +231,51 @@ export async function getSourceChunksApi(chatId: string, messageId: number, keys
 }
 
 
+import { normalizeMinioObjectPath } from '~/utils/mediaAttachmentUtils';
+
+/**
+ * Refresh a MinIO presigned URL for a workstation chat attachment.
+ */
+export async function getWorkstationFileShareUrlApi(filepath: string): Promise<string> {
+    const res: { data?: { url?: string } } = await request.get('/api/v1/workstation/files/share-url', {
+        params: { filepath: normalizeMinioObjectPath(filepath) },
+    });
+    return res?.data?.url ?? '';
+}
+
 /**
  * 聊天窗上传文件
  */
-export async function uploadChatFile(v, file: File, onProgress, uploadMode?: 'linsight' | 'workstation'): Promise<any> {
+export async function uploadChatFile(
+    v,
+    file: File | Blob,
+    onProgress,
+    uploadMode?: 'linsight' | 'workstation',
+    fileName?: string,
+    /** Aborts the request when the user removes the attachment mid-upload. */
+    signal?: AbortSignal,
+): Promise<any> {
+    const resolvedName = fileName ?? (file instanceof File ? file.name : 'upload');
     const formData = new FormData();
-    formData.append("file", file);
+    formData.append("file", file, resolvedName);
     if (uploadMode) {
         formData.append("endpoint", "custom");
         formData.append("file_id", generateUUID(32));
-        formData.append("file_name", file.name);
+        formData.append("file_name", resolvedName);
     }
     const urlMap = {
         linsight: '/api/v1/linsight/workbench/upload-file',
-        workstation: '/api/v1/workstation/files',
+        // Daily chat used to have its own endpoint, which stored files under
+        // their raw filename — two users uploading "1.png" overwrote each other.
+        // The shared endpoint already names objects by uuid.
+        workstation: '/api/v1/knowledge/upload',
     };
     const url = uploadMode ? urlMap[uploadMode] : '/api/v1/knowledge/upload';
     return await request.post(url, formData, {
         headers: {
             "Content-Type": "multipart/form-data"
         },
+        signal,
         onUploadProgress: (progressEvent) => {
             // Calculate progress percentage
             if (progressEvent.total) {
@@ -258,7 +285,6 @@ export async function uploadChatFile(v, file: File, onProgress, uploadMode?: 'li
         }
     });
 }
-
 
 export async function postBuildInit(data: {
     flow: any
@@ -374,14 +400,18 @@ export async function unpinUsedAppApi(flowId: string) {
         data: { flow_id: flowId }
     });
 }
-export async function getUncategorized(page: number = 1, pageSize: number = 8, keyword?: string) {
-    return await request.get('/api/v1/workstation/app/uncategorized', {
+/** F027 cursor waterfall. Pass the previous response's `nextCursor` to load more;
+ * omit for the first page. Returns { list, hasMore, nextCursor }. */
+export async function getUncategorized(cursor: string | null = null, pageSize: number = 8, keyword?: string) {
+    const res = await request.get('/api/v1/workstation/app/uncategorized', {
         params: {
-            page,
+            cursor: cursor || undefined,
             limit: pageSize,
-            keyword
+            keyword: keyword || undefined
         }
-    })
+    }) as { data?: { data?: unknown[]; has_more?: boolean; next_cursor?: string | null } }
+    const env = res?.data || {}
+    return { list: env.data || [], hasMore: !!env.has_more, nextCursor: env.next_cursor || null }
 }
 
 export async function getAppsApi({ page = 1, pageSize = 8, keyword, tag_id = -1, type }) {
@@ -400,18 +430,30 @@ export async function getAppsApi({ page = 1, pageSize = 8, keyword, tag_id = -1,
 }
 
 
-export const getChatOnlineApi = async (page, keyword, tag_id, disableLimit = 8, permissionId = 'view_app') => {
-    const params = {
-        page,
-        keyword,
-        limit: disableLimit,
-        permission_id: permissionId
+/** F027 cursor waterfall. Pass the previous response's `nextCursor` to load more;
+ * omit for the first page. Returns { list, hasMore, nextCursor }. */
+export const getChatOnlineApi = async (
+    cursor: string | null,
+    keyword: string,
+    tag_id: number,
+    pageSize = 8,
+    action: 'visible' | 'use' = 'visible'
+) => {
+    const params: Record<string, unknown> = {
+        cursor: cursor || undefined,
+        keyword: keyword || undefined,
+        limit: pageSize,
+        action
     }
     if (tag_id !== -1 && tag_id != null) {
         params.tag_id = tag_id
     }
 
-    return await request.get(`/api/v1/chat/online`, { params })
+    const res = await request.get(`/api/v1/chat/online`, { params }) as {
+        data?: { data?: unknown[]; has_more?: boolean; next_cursor?: string | null }
+    }
+    const env = res?.data || {}
+    return { list: env.data || [], hasMore: !!env.has_more, nextCursor: env.next_cursor || null }
 }
 
 // Get recommended apps configured by admin
@@ -445,8 +487,16 @@ export async function getAppConversationsApi(flowId: string, page: number = 1, l
  */
 export async function getAllAccessibleAppsApi(params: {
     keyword?: string;
-    page?: number;
+    cursor?: string | null;
     limit?: number;
 }) {
-    return await request.get('/api/v1/chat/online', { params })
+    const res = await request.get('/api/v1/chat/online', {
+        params: {
+            keyword: params.keyword || undefined,
+            cursor: params.cursor || undefined,
+            limit: params.limit
+        }
+    }) as { data?: { data?: unknown[]; has_more?: boolean; next_cursor?: string | null } }
+    const env = res?.data || {}
+    return { list: env.data || [], hasMore: !!env.has_more, nextCursor: env.next_cursor || null }
 }

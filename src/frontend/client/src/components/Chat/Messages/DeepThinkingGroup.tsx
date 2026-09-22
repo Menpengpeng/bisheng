@@ -1,9 +1,19 @@
 /**
  * DeepThinkingGroup — outer collapsible wrapper around a contiguous run of
- * thinking + tool_call events. Header reads "已深度思考（用时 N 秒）" once
- * the run is closed by a following text block (or stream end), or
- * "正在深度思考（已用 N 秒）..." while still open. Collapsing the wrapper
- * hides everything inside, including any inner ThinkingContent state.
+ * thinking + tool_call events. Header reads "已深度思考" once the run is closed
+ * by a following text block (or stream end), or "正在深度思考…" while still
+ * open. Collapsing the wrapper hides everything inside, including any inner
+ * ThinkingContent state.
+ *
+ * **No duration (2026-08-13).** The header used to end in "（用时 N 秒）", driven
+ * by a 100ms ticker. A live counter promises the number matters, and for model
+ * reasoning it does not — it only measures how long you have waited, with no
+ * denominator to reason against, at a precision that implies the work should
+ * have been quick. On a long run it made the product look broken rather than
+ * busy. Liveness is carried by the streaming glyph and the reasoning text.
+ * Removed here in lockstep with task mode's GroupHeaderLabel, which the two
+ * surfaces are deliberately isomorphic with — see Linsight/Execution/
+ * GroupHeaderLabel.tsx for the full reasoning.
  */
 import { Outlined } from "bisheng-icons";
 import {
@@ -17,13 +27,14 @@ import {
     type MouseEvent,
 } from "react";
 import type { AgentEvent } from "~/api/chatApi";
-import { cn, formatSeconds } from "~/utils";
+import { useLocalize } from "~/hooks";
+import { cn } from "~/utils";
 import ThinkingContent from "./ThinkingContent";
 import ToolCallDisplay from "./ToolCallDisplay";
 
 const BUTTON_STYLES = {
-    base: "group flex w-fit items-center gap-1 text-sm font-medium leading-[22px] text-[#212121]",
-    icon: "shrink-0 transform-gpu text-[#999999] transition-transform duration-200",
+    base: "group flex w-fit items-center gap-1 text-sm font-medium leading-[22px] text-text-1",
+    icon: "shrink-0 transform-gpu text-text-3 transition-transform duration-200",
 } as const;
 
 export interface DeepThinkingGroupProps {
@@ -33,45 +44,9 @@ export interface DeepThinkingGroupProps {
     isStreaming: boolean;
 }
 
-/** Pick the earliest started_at across events; fall back to undefined. */
-function groupStart(events: AgentEvent[]): number | undefined {
-    let earliest: number | undefined;
-    for (const ev of events) {
-        if (ev.type === "thinking" || ev.type === "tool_call") {
-            if (ev.started_at != null && (earliest == null || ev.started_at < earliest)) {
-                earliest = ev.started_at;
-            }
-        }
-    }
-    return earliest;
-}
-
-/** Pick the latest ended_at across events. */
-function groupEnd(events: AgentEvent[]): number | undefined {
-    let latest: number | undefined;
-    for (const ev of events) {
-        if (ev.type === "thinking" || ev.type === "tool_call") {
-            if (ev.ended_at != null && (latest == null || ev.ended_at > latest)) {
-                latest = ev.ended_at;
-            }
-        }
-    }
-    return latest;
-}
-
-/** Fallback: sum duration_ms when wall-clock fields aren't on legacy rows. */
-function durationFallback(events: AgentEvent[]): number {
-    let sum = 0;
-    for (const ev of events) {
-        if (ev.type === "thinking" || ev.type === "tool_call") {
-            sum += ev.duration_ms ?? 0;
-        }
-    }
-    return sum;
-}
-
 const DeepThinkingGroup: FC<DeepThinkingGroupProps> = memo(
     ({ events, isStreaming }) => {
+        const localize = useLocalize();
         // Open while the run is live so the user can watch it; closed for
         // already-finished groups (history rows mount with isStreaming false).
         const [isExpanded, setIsExpanded] = useState(isStreaming);
@@ -88,69 +63,50 @@ const DeepThinkingGroup: FC<DeepThinkingGroupProps> = memo(
             wasStreamingRef.current = isStreaming;
         }, [isStreaming]);
 
-        const start = groupStart(events);
-        const end = groupEnd(events);
-
-        // Live-tick while streaming so the header counter advances every 100ms.
-        const [tick, setTick] = useState(0);
-        useEffect(() => {
-            if (!isStreaming) return;
-            const id = window.setInterval(() => setTick((t) => t + 1), 100);
-            return () => window.clearInterval(id);
-        }, [isStreaming]);
-
-        const elapsedMs = (() => {
-            if (start == null) return durationFallback(events);
-            // For closed groups with no end_at, fall back to the per-event sum
-            // so the label doesn't creep upward against Date.now().
-            if (!isStreaming && end == null) return durationFallback(events);
-            const stop = isStreaming ? Date.now() : end!;
-            return Math.max(0, stop - start);
-        })();
-        // `tick` is read here so the IIFE re-runs on every interval render.
-        void tick;
-
-        const label = (() => {
-            // Hide the duration entirely when it's 0 — happens on legacy
-            // history rows (no started_at/ended_at/duration_ms) and the
-            // brief moment before any tick lands.
-            const showDuration = elapsedMs > 0;
-            if (isStreaming) {
-                return showDuration
-                    ? `正在深度思考（已用 ${formatSeconds(elapsedMs)} 秒）...`
-                    : `正在深度思考...`;
-            }
-            return showDuration
-                ? `已深度思考（用时 ${formatSeconds(elapsedMs)} 秒）`
-                : `已深度思考`;
-        })();
+        // Shared with task mode on purpose: the two 深度思考 surfaces are
+        // explicitly isomorphic, so one key pair keeps their wording from
+        // drifting apart. (The `_compact` name is historical — it was the
+        // duration-free variant back when a duration variant existed.)
+        const label = localize(
+            isStreaming ? "com_linsight_deep_thinking_running_compact" : "com_linsight_deep_thinking_done_compact",
+        );
 
         const handleClick = useCallback((e: MouseEvent<HTMLButtonElement>) => {
             e.preventDefault();
             setIsExpanded((prev) => !prev);
         }, []);
 
-        // Pull thinking content (concat) for the inner ThinkingContent block.
-        const reasoning = useMemo(
-            () =>
-                events
-                    .filter(
-                        (e): e is Extract<AgentEvent, { type: "thinking" }> =>
-                            e.type === "thinking",
-                    )
-                    .map((e) => e.content)
-                    .join("\n\n"),
-            [events],
-        );
-
-        const toolCalls = useMemo(
-            () =>
-                events.filter(
-                    (e): e is Extract<AgentEvent, { type: "tool_call" }> =>
-                        e.type === "tool_call",
-                ),
-            [events],
-        );
+        // Walk the events in arrival order, folding only ADJACENT thinking
+        // fragments into one passage. The wire and the DB already interleave
+        // thinking and tool calls truthfully (the backend closes the open
+        // thinking segment before every tool call), so the render must not
+        // regroup them: reasoning that happened after a search belongs below
+        // that search, not merged into the block above it. Mirrors task mode's
+        // DeepStepGroup.buildSegments.
+        const segments = useMemo(() => {
+            type Segment =
+                | { kind: "thinking"; key: string; content: string }
+                | { kind: "tool"; key: string; toolCall: Extract<AgentEvent, { type: "tool_call" }> };
+            const out: Segment[] = [];
+            events.forEach((ev, i) => {
+                if (ev.type === "thinking") {
+                    // A just-opened live segment has no text yet — skip it so the
+                    // connector chain never points at a row that renders nothing.
+                    if (!ev.content) return;
+                    const last = out[out.length - 1];
+                    if (last?.kind === "thinking") {
+                        // Adjacent rounds are distinct closed passages (unlike task
+                        // mode's per-frame chunks), so a paragraph break is right.
+                        last.content += `\n\n${ev.content}`;
+                    } else {
+                        out.push({ kind: "thinking", key: `think-${i}`, content: ev.content });
+                    }
+                } else if (ev.type === "tool_call") {
+                    out.push({ kind: "tool", key: ev.tool_call_id || `tc-${i}`, toolCall: ev });
+                }
+            });
+            return out;
+        }, [events]);
 
         return (
             <div className="flex w-full min-w-0 flex-col gap-3">
@@ -170,17 +126,23 @@ const DeepThinkingGroup: FC<DeepThinkingGroupProps> = memo(
                     style={{ gridTemplateRows: isExpanded ? "1fr" : "0fr" }}
                 >
                     <div className="overflow-hidden flex flex-col gap-2">
-                        <ThinkingContent
-                            reasoning={reasoning}
-                            showConnector={!!reasoning && toolCalls.length > 0}
-                        />
-                        {toolCalls.map((tc, i) => (
-                            <ToolCallDisplay
-                                key={tc.tool_call_id || `tc-${i}`}
-                                toolCall={tc}
-                                showConnector={i < toolCalls.length - 1}
-                            />
-                        ))}
+                        {segments.map((seg, i) => {
+                            // Connector runs to the next row, whatever kind it is.
+                            const hasNext = i < segments.length - 1;
+                            return seg.kind === "thinking" ? (
+                                <ThinkingContent
+                                    key={seg.key}
+                                    reasoning={seg.content}
+                                    showConnector={hasNext}
+                                />
+                            ) : (
+                                <ToolCallDisplay
+                                    key={seg.key}
+                                    toolCall={seg.toolCall}
+                                    showConnector={hasNext}
+                                />
+                            );
+                        })}
                     </div>
                 </div>
             </div>

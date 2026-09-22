@@ -19,16 +19,18 @@ const appFlowOriginKey = (flowId: string) => `app-flow-origin:${flowId}`;
 const appLastOriginKey = 'app-last-origin';
 
 export default function ExplorePlaza() {
-    const [activeTabId, setActiveTabId] = useState<number | string>(-1)
+    // Null until the navigation has its tags and can say which tab is the
+    // default; fetching before that would show one tab's apps and then swap.
+    const [activeTabId, setActiveTabId] = useState<number | string | null>(null)
     const [searchQuery, setSearchQuery] = useState("")
     const [agents, setAgents] = useState<any[]>([])
     const [loading, setLoading] = useState(false)
     const [loadingMore, setLoadingMore] = useState(false)
     const [refreshTrigger, setRefreshTrigger] = useState(0)
 
-    // --- 新增滚动加载相关状态 ---
-    const [page, setPage] = useState(1);
+    // --- 游标瀑布流加载状态 ---
     const [hasMore, setHasMore] = useState(true);
+    const cursorRef = useRef<string | null>(null);
     const loaderRef = useRef<HTMLDivElement>(null);
     const loadMoreLockRef = useRef(false);
     const pageSize = 20;
@@ -49,17 +51,17 @@ export default function ExplorePlaza() {
         return 1;
     }, [isAtLeast768, isAtLeast1024]);
 
-    // Modify Fetch Function
-    const fetchAgents = useCallback(async (query: string, categoryId: number | string, currentPage: number, isAppend: boolean) => {
+    // Fetch one cursor page. `cursor === null` starts a fresh list (first page).
+    const fetchAgents = useCallback(async (query: string, categoryId: number | string, cursor: string | null, isAppend: boolean) => {
         if (loading || loadingMore) return;
         if (isAppend) setLoadingMore(true);
         else setLoading(true);
         try {
             const result = categoryId === 'uncategorized'
-                ? await getUncategorized(currentPage, pageSize, query)
-                : await getChatOnlineApi(currentPage, query, categoryId === -1 ? undefined : (categoryId as number), pageSize);
+                ? await getUncategorized(cursor, pageSize, query)
+                : await getChatOnlineApi(cursor, query, categoryId as number, pageSize);
 
-            const pageData = (result as any).data || [];
+            const pageData = result.list || [];
 
             const formattedResults = pageData.map((item: any) => ({
                 ...item,
@@ -69,7 +71,8 @@ export default function ExplorePlaza() {
             }));
 
             setAgents(prev => isAppend ? [...prev, ...formattedResults] : formattedResults);
-            setHasMore(pageData.length >= pageSize);
+            cursorRef.current = result.nextCursor;
+            setHasMore(!!result.hasMore);
         } catch (error) {
             console.error("Failed to fetch agents:", error);
             if (!isAppend) setAgents([]);
@@ -80,17 +83,12 @@ export default function ExplorePlaza() {
     }, [loading, loadingMore]);
 
     useEffect(() => {
-        setPage(1);
+        if (activeTabId === null) return;
+        cursorRef.current = null;
         setHasMore(true);
         loadMoreLockRef.current = false;
-        fetchAgents(searchQuery, activeTabId, 1, false);
+        fetchAgents(searchQuery, activeTabId, null, false);
     }, [searchQuery, activeTabId, refreshTrigger]);
-
-    useEffect(() => {
-        if (page > 1) {
-            fetchAgents(searchQuery, activeTabId, page, true);
-        }
-    }, [page]);
 
     useEffect(() => {
         if (!loadingMore) {
@@ -106,10 +104,11 @@ export default function ExplorePlaza() {
                 !loading &&
                 !loadingMore &&
                 hasMore &&
+                activeTabId !== null &&
                 !loadMoreLockRef.current
             ) {
                 loadMoreLockRef.current = true;
-                setPage(prev => prev + 1);
+                fetchAgents(searchQuery, activeTabId, cursorRef.current, true);
             }
         }, { threshold: 0, rootMargin: '400px 0px' });
 
@@ -118,7 +117,13 @@ export default function ExplorePlaza() {
         }
 
         return () => observer.disconnect();
-    }, [loading, loadingMore, hasMore]);
+    }, [loading, loadingMore, hasMore, searchQuery, activeTabId, fetchAgents]);
+
+    // The spinner also covers the wait for the navigation's tags, which decide
+    // the default tab. `loading` itself must stay false until a request is
+    // actually in flight — fetchAgents treats it as a re-entry guard and would
+    // skip the very first fetch, leaving the spinner up for good.
+    const showLoading = loading || activeTabId === null;
 
     const handleCardClick = (agent: any) => {
         const flowId = agent.id
@@ -190,7 +195,7 @@ export default function ExplorePlaza() {
                     <Button
                         variant="ghost"
                         onClick={() => navigate('/apps')}
-                        className="h-8 w-8 rounded-md border border-[#E5E6EB] bg-white p-0 text-[#4E5969] fine-pointer:hover:bg-[#F7F8FA] fine-pointer:hover:text-blue-500"
+                        className="h-8 w-8 rounded-md border border-border-base bg-white p-0 text-text-2 fine-pointer:hover:bg-fill-1 fine-pointer:hover:text-blue-500"
                     >
                         <ArrowLeft className="size-3.5" />
                     </Button>
@@ -199,7 +204,7 @@ export default function ExplorePlaza() {
                     <h1 className="mb-1 font-['PingFang_SC'] text-[26px] font-semibold text-blue-500">
                         {bannerTitle}
                     </h1>
-                    <p className="mb-3 max-w-[640px] font-['PingFang_SC'] text-[13px] leading-[22px] text-[#86909C]">
+                    <p className="mb-3 max-w-[640px] font-['PingFang_SC'] text-[13px] leading-[22px] text-text-3">
                         {bannerDescription}
                     </p>
                 </div>
@@ -239,31 +244,31 @@ export default function ExplorePlaza() {
                         'flex w-full flex-col items-center',
                         // Empty/loading: fill the region and place content via flex spacers at a
                         // region-relative height (not viewport vh): ~40% on mobile, ~45% on PC.
-                        (loading || agents.length === 0) ? 'flex-1' : 'py-10',
+                        (showLoading || agents.length === 0) ? 'flex-1' : 'py-10',
                     )}
                 >
-                    {(loading || agents.length === 0) && <div className="flex-[8] md:flex-[9]" aria-hidden />}
-                    {loading ? (
+                    {(showLoading || agents.length === 0) && <div className="flex-[8] md:flex-[9]" aria-hidden />}
+                    {showLoading ? (
                         <div className="flex flex-col items-center gap-3 text-blue-500">
                             <LoadingIcon className="size-20 text-primary" />
-                            <span className="text-sm font-['PingFang_SC'] text-[#999999]">{localize('com_app_explore_loading_more')}</span>
+                            <span className="text-sm font-['PingFang_SC'] text-text-3">{localize('com_app_explore_loading_more')}</span>
                         </div>
                     ) : loadingMore ? (
                         <div className="flex items-center gap-2 text-blue-500">
                             <LoadingIcon className="size-6 text-primary" />
-                            <span className="text-sm font-['PingFang_SC'] text-[#999999]">{localize('com_app_explore_loading_more')}</span>
+                            <span className="text-sm font-['PingFang_SC'] text-text-3">{localize('com_app_explore_loading_more')}</span>
                         </div>
                     ) : null}
                     {!hasMore && agents.length > 0 && (
                         <p className="text-[#a9aeb8] text-[12px] font-['PingFang_SC'] mt-4">{localize('com_app_explore_end_of_list')}</p>
                     )}
-                    {!loading && agents.length === 0 && (
+                    {!showLoading && agents.length === 0 && (
                         <div className="flex flex-col items-center">
                             <EmptyStateIllustration className="size-[120px] mb-4" />
                             <p className="text-[#a9aeb8] text-[14px] font-['PingFang_SC']">{localize('com_app_explore_no_agents')}</p>
                         </div>
                     )}
-                    {(loading || agents.length === 0) && <div className="flex-[12] md:flex-[11]" aria-hidden />}
+                    {(showLoading || agents.length === 0) && <div className="flex-[12] md:flex-[11]" aria-hidden />}
                 </div>
                 </div>
             </main>

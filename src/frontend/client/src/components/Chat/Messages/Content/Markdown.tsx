@@ -46,6 +46,7 @@ import {
 } from './citationUtils';
 import type { CitationReferencesDesktopPayload } from './CitationReferencesDrawer';
 import CitationDocumentPreviewDrawer, { type CitationDocumentPreviewState } from './CitationDocumentPreviewDrawer';
+import { isDeliverableLinkHref } from '~/components/Linsight/Artifacts/artifactUtils';
 import { CitationSourceIcon } from './CitationSourceIcon';
 import MermaidBlock from './Mermaid'
 import Echarts from './Echarts'
@@ -225,6 +226,59 @@ export const a: React.ElementType = memo(({ href, children }: TAnchorProps) => {
   );
 });
 
+type ArtifactLinkResolver = (href: string) => unknown | undefined;
+
+type ArtifactLinkAnchorProps = TAnchorProps & {
+  resolveArtifactLink: ArtifactLinkResolver;
+  onArtifactPreview: (file: unknown) => void;
+};
+
+/** Linsight deliverable preview: map markdown file links to workspace artifacts. */
+const ArtifactLinkAnchor = memo(({
+  href,
+  children,
+  resolveArtifactLink,
+  onArtifactPreview,
+}: ArtifactLinkAnchorProps) => {
+  const localize = useLocalize();
+  const matched = useMemo(() => resolveArtifactLink(href), [href, resolveArtifactLink]);
+  const isPhantom = !matched && typeof href === 'string' && isDeliverableLinkHref(href);
+  // Once per link rather than per render (the component is memo'd but still
+  // re-renders with its parent): support needs to tell "the model claimed a file
+  // it never wrote" from "our resolver failed to match a real one".
+  useEffect(() => {
+    if (isPhantom) {
+      console.warn('[Linsight] deliverable link matches no artifact of this run:', href);
+    }
+  }, [isPhantom, href]);
+
+  if (matched) {
+    return (
+      <button
+        type="button"
+        className="text-blue-600 underline transition-colors hover:text-blue-700"
+        onClick={() => onArtifactPreview(matched)}
+      >
+        {children}
+      </button>
+    );
+  }
+  // The model named a deliverable this run never produced. Don't navigate (the
+  // relative output/ path is not a route), and don't keep it blue either — a blue
+  // span that does nothing reads as a broken app rather than as a model that
+  // overstated itself. Muted + an explicit badge, the same treatment an
+  // unresolvable image ref gets below.
+  if (isPhantom) {
+    return (
+      <span className="text-gray-400" title={localize('com_linsight_deliverable_not_generated_hint')}>
+        {children}
+        <span className="ml-1 text-xs">{localize('com_linsight_deliverable_not_generated')}</span>
+      </span>
+    );
+  }
+  return React.createElement(a, { href, children });
+});
+
 type TParagraphProps = {
   children: React.ReactNode;
 };
@@ -263,7 +317,7 @@ function CitationPreviewCard({
 }) {
   if (isLoading) {
     return (
-      <div className="flex min-h-[120px] w-[320px] max-w-[calc(100vw-32px)] items-center justify-center rounded-lg bg-white text-sm text-[#86909C] shadow-[0_4px_19px_rgba(34,34,34,0.07)]">
+      <div className="flex min-h-[120px] w-[320px] max-w-[calc(100vw-32px)] items-center justify-center rounded-lg bg-white text-sm text-text-3 shadow-[0_4px_19px_rgba(34,34,34,0.07)]">
         <Outlined.Loading className="mr-2 size-4 animate-spin" />
         加载溯源详情...
       </div>
@@ -274,7 +328,7 @@ function CitationPreviewCard({
   // longer exists). Product decision: show "no permission", not "no source detail".
   if (notPermitted) {
     return (
-      <div className="w-[320px] max-w-[calc(100vw-32px)] rounded-lg bg-white p-4 text-sm text-[#86909C] shadow-[0_4px_19px_rgba(34,34,34,0.07)]">
+      <div className="w-[320px] max-w-[calc(100vw-32px)] rounded-lg bg-white p-4 text-sm text-text-3 shadow-[0_4px_19px_rgba(34,34,34,0.07)]">
         暂无权限
       </div>
     );
@@ -282,20 +336,20 @@ function CitationPreviewCard({
 
   if (error || !preview) {
     return (
-      <div className="w-[320px] max-w-[calc(100vw-32px)] rounded-lg bg-white p-4 text-sm text-[#86909C] shadow-[0_4px_19px_rgba(34,34,34,0.07)]">
+      <div className="w-[320px] max-w-[calc(100vw-32px)] rounded-lg bg-white p-4 text-sm text-text-3 shadow-[0_4px_19px_rgba(34,34,34,0.07)]">
         暂无溯源详情
       </div>
     );
   }
 
   const isWeb = preview.type === 'web';
-  const cardClassName = 'group relative cursor-pointer w-[320px] max-w-[calc(100vw-32px)] overflow-hidden rounded-lg bg-white text-[#1D2129] shadow-[0_4px_19px_rgba(34,34,34,0.07)]';
-  const titleClassName = 'min-w-0 flex-1 truncate text-[14px] font-medium leading-5 text-[#1D2129]';
+  const cardClassName = 'group relative cursor-pointer w-[320px] max-w-[calc(100vw-32px)] overflow-hidden rounded-lg bg-white text-text-1 shadow-[0_4px_19px_rgba(34,34,34,0.07)]';
+  const titleClassName = 'min-w-0 flex-1 truncate text-[14px] font-medium leading-5 text-text-1';
   const titleContainerClassName = 'bg-white p-3';
   // Web link titles hover to a fixed blue (matches the web hover arrow #1B61E6),
   // not the blue⇄green brand theme — they're generic external links, not a brand action.
   const interactiveTitleClassName = `${titleClassName} transition-colors duration-200 group-hover:text-[#1B61E6]`;
-  const ragTitleClassName = 'min-w-0 truncate text-[14px] font-medium leading-[22px] text-[#1D2129]';
+  const ragTitleClassName = 'min-w-0 truncate text-[14px] font-medium leading-[22px] text-text-1';
   const formatSourceMeta = (value?: string) => {
     if (!value) {
       return '';
@@ -387,7 +441,7 @@ function CitationPreviewCard({
           {ragTitleParts.name || preview.title}
         </span>
         {ragTitleParts.extension && (
-          <span className={`${onOpenDocumentPreview ? 'shrink-0 text-[14px] font-medium leading-[22px] text-[#1D2129] transition-colors duration-200 group-hover:text-blue-600' : 'shrink-0 text-[14px] font-medium leading-[22px] text-[#1D2129]'}`}>
+          <span className={`${onOpenDocumentPreview ? 'shrink-0 text-[14px] font-medium leading-[22px] text-text-1 transition-colors duration-200 group-hover:text-blue-600' : 'shrink-0 text-[14px] font-medium leading-[22px] text-text-1'}`}>
             {ragTitleParts.extension}
           </span>
         )}
@@ -401,12 +455,12 @@ function CitationPreviewCard({
         {renderWebTitle()}
       </div>
       <div className="px-4 pb-0">
-        <div className="border-l-2 border-[#E5E6EB] pl-3 text-[12px] leading-6 text-[#4E5969]">
+        <div className="border-l-2 border-border-base pl-3 text-[12px] leading-6 text-text-2">
           <div className="line-clamp-4 whitespace-pre-wrap break-words">
             {preview.snippet || '暂无内容摘要'}
           </div>
         </div>
-        <div className="mt-3 min-h-6 text-[#999999]">
+        <div className="mt-3 min-h-6 text-text-3">
           <div className="flex min-w-0 items-center gap-2 pb-0">
             <CitationSourceIcon detail={detail} preview={preview} type={preview.type} ragIconVariant="knowledge" />
             <span className="w-[90px] min-w-0 truncate text-[12px] font-medium leading-5">{preview.sourceName}</span>
@@ -421,12 +475,12 @@ function CitationPreviewCard({
     <>
       {renderRagTitle()}
       <div className="px-4 pb-0">
-        <div className="border-l-2 border-[#E5E6EB] pl-3 text-[12px] leading-6 text-[#4E5969]">
+        <div className="border-l-2 border-border-base pl-3 text-[12px] leading-6 text-text-2">
           <div className="line-clamp-4 whitespace-pre-wrap break-words">
             {ragSnippetText || '暂无内容摘要'}
           </div>
         </div>
-        <div className="mt-3 min-h-6 text-[#999999]">
+        <div className="mt-3 min-h-6 text-text-3">
           <div className="flex min-w-0 items-center gap-2 pb-0">
             <CitationSourceIcon detail={detail} preview={preview} type={preview.type} ragIconVariant="knowledge" clipAsCircle={false} />
             <span className="w-[90px] min-w-0 truncate text-[12px] font-medium leading-5">{preview.sourceName}</span>
@@ -778,6 +832,8 @@ const Markdown = memo(({
   messageId,
   onOpenCitationPanel,
   resolveImageSrc,
+  resolveArtifactLink,
+  onArtifactPreview,
 }: TContentProps & {
   webContent: any;
   /**
@@ -787,6 +843,10 @@ const Markdown = memo(({
    * default <img> (chat bubbles — unchanged).
    */
   resolveImageSrc?: (src: string) => Promise<string | null>;
+  /** Map markdown file links (e.g. output/report.md) to a workspace artifact. */
+  resolveArtifactLink?: ArtifactLinkResolver;
+  /** Open the matched artifact in the Linsight preview panel. */
+  onArtifactPreview?: (file: unknown) => void;
 }) => {
   const LaTeXParsing = useRecoilValue<boolean>(store.LaTeXParsing);
   const isMobileLayout = usePrefersMobileLayout();
@@ -1054,7 +1114,17 @@ const Markdown = memo(({
           components={
             {
               code,
-              a,
+              a: resolveArtifactLink && onArtifactPreview
+                ? ({ href, children }: TAnchorProps) => (
+                    <ArtifactLinkAnchor
+                      href={href}
+                      resolveArtifactLink={resolveArtifactLink}
+                      onArtifactPreview={onArtifactPreview}
+                    >
+                      {children}
+                    </ArtifactLinkAnchor>
+                  )
+                : a,
               p,
               artifact: Artifact,
               // Resolve relative image refs (Linsight deliverable preview) only when

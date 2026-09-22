@@ -7,11 +7,12 @@ import { useRecoilState } from 'recoil';
 import { getRecommendedAppsApi } from '~/api/apps';
 import { writeAppChatOrigin, writeAppChatReturnTo } from '~/pages/appChat/appChatOrigin';
 import AiChatInput from '~/components/Chat/AiChatInput';
+import { resolveTaskModeOnNavigation } from '~/components/Chat/resolveTaskMode';
 import AiChatMessages from '~/components/Chat/AiChatMessages';
 import { PinnedTaskPanel } from '~/components/Linsight/Execution/PinnedTaskPanel';
 import { WorkspacePanel } from '~/components/Linsight/Artifacts/WorkspacePanel';
 import { useWorkspacePanel } from '~/components/Linsight/Artifacts/useWorkspacePanel';
-import { type ArtifactFile, toUploadedArtifacts } from '~/components/Linsight/Artifacts/artifactUtils';
+import { collectConversationWorkspaceFiles } from '~/components/Linsight/Artifacts/artifactUtils';
 import { useLinsightManager } from '~/hooks/useLinsightManager';
 import { userStopLinsightEvent } from '~/api/linsight';
 import { SopStatus, taskModeState } from '~/store/linsight';
@@ -184,6 +185,7 @@ const ChatView = ({ id = '', index = 0, shareToken = '' }: { id?: string, index?
     title: chatTitle,
     isLoading,
     isStreaming,
+    isParsingMedia,
     sendMessage,
     stopGenerating,
     regenerate,
@@ -250,39 +252,16 @@ const ChatView = ({ id = '', index = 0, shareToken = '' }: { id?: string, index?
 
   // F035: distinguishes the post-submit URL self-rewrite (same conversation
   // just got its real id — keep the composing mode) from a genuine navigation
-  // to a different existing conversation (drop task mode). Set right before the
-  // self-rewrite navigate below, consumed by the reset effect it triggers.
+  // to a different existing conversation (derive the mode from its history).
+  // Set right before the self-rewrite navigate below, consumed by the mode
+  // effect once the rewritten URL has landed.
   const keepTaskModeOnRewriteRef = useRef(false);
-
-  // F035: sync the local task-mode toggle to navigation. ChatView is NOT
-  // remounted across `/c/:id` param changes (same route element), so the
-  // useState initializer above only runs on first mount. This effect picks up
-  // subsequent navigations:
-  //  - sidebar "新建任务" lands on /c/new with state.taskMode=true → enter task mode.
-  //  - the first submit on /c/new self-rewrites the URL to the real id; that is
-  //    the SAME conversation, so the user's chosen mode is preserved (they can
-  //    keep composing task turns, or toggle off manually).
-  //  - any OTHER navigation to an existing conversation (id !== 'new') leaves
-  //    task mode (you switched to viewing a daily chat, not composing a task).
-  // location.key changes on every navigation so re-entering /c/new with the
-  // same state still re-triggers.
-  useEffect(() => {
-    if (conversationId !== 'new') {
-      // Post-submit self-rewrite: keep whatever mode the user is composing in.
-      if (keepTaskModeOnRewriteRef.current) {
-        keepTaskModeOnRewriteRef.current = false;
-        return;
-      }
-      setTaskMode(false);
-      return;
-    }
-    // On /c/new the mode is driven solely by the nav state: "新建任务" carries
-    // state.taskMode=true, "新建对话" carries none. Set explicitly both ways so
-    // switching from task → chat (or chat → task) actually flips the toggle
-    // instead of leaving a stale mode behind.
-    setTaskMode(!!(location.state as any)?.taskMode);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.key, conversationId]);
+  // Set when the user flips the toggle by hand. A manual choice has to survive
+  // the navigations that happen WITHIN one conversation (see the mode effect
+  // below, which otherwise re-derives the mode from the loaded history on every
+  // navigation); it is cleared as soon as the conversation itself changes.
+  const userToggledRef = useRef(false);
+  const lastConversationIdRef = useRef<string | undefined>(conversationId);
 
   // Sync URL: ONLY when we were on /new and the hook just assigned a real ID.
   // Do NOT navigate if the user is clicking around in the sidebar (that changes
@@ -366,7 +345,7 @@ const ChatView = ({ id = '', index = 0, shareToken = '' }: { id?: string, index?
     // task workspace). Skills are still resolved separately.
     if (taskMode && canUseTaskMode) {
       const trimmed = text.trim();
-      if (!trimmed && !(files || []).length) return;
+      if (!trimmed) return;
       sendMessage(trimmed, files, { taskMode: true });
       setInputText('');
       return;
@@ -384,22 +363,104 @@ const ChatView = ({ id = '', index = 0, shareToken = '' }: { id?: string, index?
   // 12221-40080) for the conversation's latest task turn — it tracks that turn's
   // execution detail from the linsight store rather than scrolling away in the
   // message stream.
-  const latestTaskVersionId = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i] as any;
-      if (m?.category === 'task' && m?.linsightSessionVersionId) {
-        return m.linsightSessionVersionId as string;
+  const taskVersionIds = useMemo(() => {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const message of messages) {
+      const m = message as any;
+      const versionId = m?.category === 'task' ? m?.linsightSessionVersionId : '';
+      if (versionId && !seen.has(versionId)) {
+        seen.add(versionId);
+        ids.push(versionId);
       }
     }
-    return '';
+    return ids;
   }, [messages]);
+  const latestTaskVersionId = taskVersionIds[taskVersionIds.length - 1] || '';
+
+  // F035: a conversation that already holds a task turn IS a task-mode
+  // conversation. Guard on the message's own conversationId so the stale
+  // previous-conversation message list that lingers for one commit during a
+  // navigation transition can't misfire (loaded rows carry chat_id, the
+  // optimistic promote carries the real chat_id — both equal conversationId
+  // once we're settled on this conversation).
+  const isTaskConversation = useMemo(
+    () =>
+      messages.some(
+        (m: any) =>
+          m?.category === 'task' &&
+          m?.linsightSessionVersionId &&
+          m?.conversationId === conversationId,
+      ),
+    [messages, conversationId],
+  );
+
+  // F035: sync the task-mode toggle to navigation. ChatView is NOT remounted
+  // across `/c/:id` param changes (same route element), so the atom's initial
+  // value only applies on first mount. This effect picks up subsequent
+  // navigations:
+  //  - sidebar "新建任务" lands on /c/new with state.taskMode=true → enter task mode.
+  //  - the first submit on /c/new self-rewrites the URL to the real id; that is
+  //    the SAME conversation, so the user's chosen mode is preserved (they can
+  //    keep composing task turns, or toggle off manually).
+  //  - any OTHER navigation to an existing conversation (id !== 'new') DERIVES
+  //    the mode from that conversation's own history (isTaskConversation), so a
+  //    stale mode from another tab can't leak in AND a task conversation keeps
+  //    its mode.
+  // Deriving and resetting MUST stay in one effect. They used to be two: the
+  // reset (`setTaskMode(false)`) ran on every location.key change, while the
+  // restore's deps — [conversationId, isTaskConversation, canUseTaskMode] — are
+  // all constant within a visit, so it could never fire a second time. A single
+  // in-conversation navigation (e.g. the sidebar 首页 link, whose target IS the
+  // current pathname) therefore parked the toggle on off for good, and
+  // `taskMode || taskRunning` below kept the button lit until the running task
+  // ended — so the drop was invisible and the NEXT turn silently went daily.
+  // Placed after isTaskConversation on purpose: it is in the dep array.
+  useEffect(() => {
+    // A manual toggle only binds to the conversation it was made in.
+    if (lastConversationIdRef.current !== conversationId) {
+      lastConversationIdRef.current = conversationId;
+      userToggledRef.current = false;
+    }
+    // Only consumable once we are ON the rewritten URL. This effect is declared
+    // AFTER the effect that raises the flag (it has to be — isTaskConversation is
+    // in its dep array), so within the commit that raises it we would otherwise
+    // eat the flag while still on /c/new and then derive `false` on the real
+    // landing, knocking the user out of the mode they just submitted in.
+    const isSelfRewrite = conversationId !== 'new' && keepTaskModeOnRewriteRef.current;
+    if (isSelfRewrite) {
+      keepTaskModeOnRewriteRef.current = false;
+    }
+
+    const next = resolveTaskModeOnNavigation({
+      conversationId,
+      isTaskConversation,
+      canUseTaskMode,
+      navTaskMode: (location.state as { taskMode?: boolean } | null)?.taskMode,
+      isSelfRewrite,
+      userToggled: userToggledRef.current,
+    });
+    if (next !== null) {
+      setTaskMode(next);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.key, conversationId, isTaskConversation, canUseTaskMode]);
+
+  // Flipping the toggle by hand pins the mode for the rest of this conversation
+  // — without the flag, the effect above would re-derive it from the history on
+  // the next navigation and undo the user's choice.
+  const handleToggleTaskMode = useCallback(() => {
+    userToggledRef.current = true;
+    setTaskMode((v) => !v);
+  }, [setTaskMode]);
 
   // F035: workspace drawer for the chat-embedded task mode. Lifted to ChatView
   // (the task turn renders inline per message, but the entry button lives in the
-  // shared header) and bound to the LATEST task turn. Shows uploaded sources +
-  // generated deliverables. The drawer only opens on the header button — no
-  // auto-expand (the entry icon appearing is enough).
-  const { getLinsight, updateLinsight } = useLinsightManager();
+  // shared header). Execution state remains bound to the LATEST task turn, while
+  // the file list accumulates formal artifacts from every task turn because the
+  // workspace itself belongs to the conversation. The drawer only opens on the
+  // header button — no auto-expand (the entry icon appearing is enough).
+  const { getLinsight, updateLinsight, linsightMap } = useLinsightManager();
   const taskArtifacts = useWorkspacePanel(latestTaskVersionId);
 
   // F035: enter/exit animation for the fullscreen workspace overlay. The overlay
@@ -504,10 +565,8 @@ const ChatView = ({ id = '', index = 0, shareToken = '' }: { id?: string, index?
 
   const taskLinsight = latestTaskVersionId ? getLinsight(latestTaskVersionId) : null;
   const taskWorkspaceFiles = useMemo(() => {
-    const uploaded = toUploadedArtifacts(taskLinsight?.files as any[]);
-    const generated = (taskLinsight?.file_list as ArtifactFile[]) || [];
-    return [...uploaded, ...generated];
-  }, [taskLinsight?.files, taskLinsight?.file_list]);
+    return collectConversationWorkspaceFiles(taskVersionIds.map((versionId) => linsightMap.get(versionId)));
+  }, [taskVersionIds, linsightMap]);
 
   // F035: while the latest task round is in a non-terminal state (generating /
   // running / queued), the input stays editable but the send button is disabled
@@ -656,13 +715,14 @@ const ChatView = ({ id = '', index = 0, shareToken = '' }: { id?: string, index?
                               disabled={!bsConfig?.models?.length || !!shareToken}
                               sendDisabled={taskRunning}
                               isStreaming={isStreaming}
+                              isParsingMedia={isParsingMedia}
                               // Parked awaiting the user → not "running": drop the Stop
                               // button (sendDisabled still blocks a new round until the
                               // current one resolves). The user replies via the
                               // ClarifyCard in the stream above, not this input.
                               taskRunning={taskRunning && !awaitingUserInput}
                               features={{ taskModeEntry: canUseTaskMode, taskMode: (taskMode || taskRunning) && canUseTaskMode }}
-                              onToggleTaskMode={() => setTaskMode((v) => !v)}
+                              onToggleTaskMode={handleToggleTaskMode}
                               placeholder={awaitingUserInput
                                 ? t('com_linsight_awaiting_reply')
                                 : taskMode
@@ -832,8 +892,9 @@ const ChatView = ({ id = '', index = 0, shareToken = '' }: { id?: string, index?
                             disabled={!bsConfig?.models?.length || !!shareToken}
                             sendDisabled={taskRunning}
                             isStreaming={isStreaming}
+                            isParsingMedia={isParsingMedia}
                             features={{ taskModeEntry: canUseTaskMode, taskMode: taskMode && canUseTaskMode }}
-                            onToggleTaskMode={() => setTaskMode((v) => !v)}
+                            onToggleTaskMode={handleToggleTaskMode}
                             placeholder={taskMode
                               ? ((bsConfig as any)?.linsightConfig?.input_placeholder || t('com_linsight_input_placeholder'))
                               : undefined}
@@ -1009,7 +1070,7 @@ const DailyFeaturedApps = ({ t }: { t: (k: string) => string }) => {
             {displayApps.map((appItem) => (
               <Card
                 key={appItem.id}
-                className="group flex flex-col py-0 rounded-[8px] shadow-[0_2px_4px_rgba(0,0,0,0.02)] border border-[#E5E6EB] overflow-hidden cursor-pointer hover:border-blue-500 hover:shadow-[0_4px_14px_rgb(var(--brand-500)/0.12)] transition-all duration-300 h-[142px] hover:-translate-y-1"
+                className="group flex flex-col py-0 rounded-lg shadow-[0_2px_4px_rgba(0,0,0,0.02)] border border-[#E5E6EB] overflow-hidden cursor-pointer hover:border-blue-500 hover:shadow-[0_4px_14px_rgb(var(--brand-500)/0.12)] transition-all duration-300 h-[142px] hover:-translate-y-1"
                 style={{ background: 'linear-gradient(135deg, rgb(var(--brand-500)/0.04) 0%, #fff 50%, rgb(var(--brand-500)/0.04) 100%)' }}
                 onClick={() => handleCardClick(appItem)}
               >
@@ -1019,7 +1080,7 @@ const DailyFeaturedApps = ({ t }: { t: (k: string) => string }) => {
                       id={appItem.name}
                       url={appItem.logo}
                       flowType={appItem.flow_type || appItem.type}
-                      className={`size-[32px] min-w-[32px] !rounded-[8px]`}
+                      className={`size-[32px] min-w-[32px] !rounded-lg`}
                       iconClassName="w-5 h-5"
                     />
                     <div className="text-[15px] font-medium text-[#1D2129] line-clamp-1 break-all">{appItem.name}</div>
@@ -1031,13 +1092,13 @@ const DailyFeaturedApps = ({ t }: { t: (k: string) => string }) => {
                       {appItem.tags && appItem.tags.map((tag: any) => (
                         <div
                           key={tag.id || tag.name || tag}
-                          className="bg-[#F2F3F5] text-[#4E5969] text-[12px] px-2 py-[2px] rounded-[4px] font-normal whitespace-nowrap"
+                          className="bg-[#F2F3F5] text-[#4E5969] text-[12px] px-2 py-[2px] rounded-sm font-normal whitespace-nowrap"
                         >
                           {tag.name || tag}
                         </div>
                       ))}
                     </div>
-                    <div className="absolute inset-x-0 bottom-0 top-1 flex items-center justify-center bg-blue-500 rounded-[6px] text-white text-[13px] font-medium opacity-0 fine-pointer:group-hover:opacity-100 transform translate-y-2 fine-pointer:group-hover:translate-y-0 transition-all duration-300 coarse-pointer:opacity-100 coarse-pointer:translate-y-0">
+                    <div className="absolute inset-x-0 bottom-0 top-1 flex items-center justify-center bg-blue-500 rounded-md text-white text-[13px] font-medium opacity-0 fine-pointer:group-hover:opacity-100 transform translate-y-2 fine-pointer:group-hover:translate-y-0 transition-all duration-300 coarse-pointer:opacity-100 coarse-pointer:translate-y-0">
                       开始对话
                     </div>
                   </div>

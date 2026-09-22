@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 /**
  * SSE hook for v2.5 Agent-mode chat streaming.
  *
@@ -21,6 +22,7 @@ import { SSE } from "sse.js";
 import type { AgentEvent, ChatMessage, ContentPart } from "~/api/chatApi";
 import { getSSEUrl } from "~/api/chatApi";
 import { translateApiErrorMessage } from "~/api/request";
+import { useLocalize } from "~/hooks";
 
 /**
  * Structured update emitted as agent SSE events stream in. Consumers merge
@@ -54,8 +56,14 @@ export interface SSESubmission {
     onAgentUpdate?: (patch: AgentPatch) => void;
     onFinal: (data: any) => void;
     /** `errorCode` is the backend status_code from the SSE error envelope (e.g.
-        12046 = LLM rate limit), used downstream to pick calm-retry vs red-error UI. */
-    onError: (error: string, errorCode?: number) => void;
+        12046 = LLM rate limit), used downstream to pick calm-retry vs red-error UI.
+        `meta` carries the envelope's classified `error_type` and the raw upstream
+        text, which the error card renders as its copy + "view details" body. */
+    onError: (
+        error: string,
+        errorCode?: number,
+        meta?: { errorType?: string; errorDetail?: string },
+    ) => void;
     onStart: () => void;
     onEnd: () => void;
     /**
@@ -67,10 +75,13 @@ export interface SSESubmission {
      * daily conversation, no /linsight navigation.
      */
     onTaskHandoff?: (data: { session_version_id: string; chat_id: string }) => void;
+    /** Daily chat: server finished parse-time cover extraction for attachments. */
+    onQuestionFilesUpdate?: (data: { messageId?: string; files: any[] }) => void;
 }
 
 export default function useAiChatSSE(submission: SSESubmission | null) {
     const sseRef = useRef<any>(null);
+    const localize = useLocalize();
 
     useEffect(() => {
         if (!submission) return;
@@ -86,6 +97,7 @@ export default function useAiChatSSE(submission: SSESubmission | null) {
             onStart,
             onEnd,
             onTaskHandoff,
+            onQuestionFilesUpdate,
         } = submission;
 
         // ---- Agent-mode accumulators ---------------------------------------
@@ -316,8 +328,20 @@ export default function useAiChatSSE(submission: SSESubmission | null) {
                         return;
                     }
 
-                    if (category === "processing" || category === "question") {
-                        // Noise events — nothing to render here.
+                    if (category === "processing") {
+                        return;
+                    }
+
+                    if (category === "question" && type === "update" && Array.isArray(message?.files)) {
+                        onQuestionFilesUpdate?.({
+                            messageId: message_id != null ? String(message_id) : undefined,
+                            files: message.files,
+                        });
+                        return;
+                    }
+
+                    if (category === "question") {
+                        // Initial question/over events carry no post-parse metadata.
                         return;
                     }
 
@@ -396,9 +420,24 @@ export default function useAiChatSSE(submission: SSESubmission | null) {
                 // back to legacy plain-text shapes, then a generic message.
                 const resolved = translateApiErrorMessage(data);
                 const code = typeof data?.status_code === "number" ? data.status_code : undefined;
-                onError(resolved || data?.text || data?.message || "Stream error", code);
+                // `data.data` carries the backend's classification alongside the
+                // localized copy: without it the bubble could only ever say
+                // "服务器错误" and the upstream reason (which file, which service,
+                // what it actually said) was dropped on the floor.
+                const payload = data?.data ?? {};
+                onError(resolved || data?.text || data?.message || localize("workstation.chat.connection_lost"), code, {
+                    errorType: typeof payload.error_type === "string" ? payload.error_type : undefined,
+                    errorDetail:
+                        typeof payload.detail === "string"
+                            ? payload.detail
+                            : typeof payload.exception === "string"
+                                ? payload.exception
+                                : undefined,
+                });
             } catch {
-                onError("Connection error");
+                // Non-JSON payload — the stream dropped rather than the backend
+                // reporting a typed failure (gateway/proxy timeout, worker restart).
+                onError(localize("workstation.chat.connection_lost"));
             }
             safeEnd();
         });

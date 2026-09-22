@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import MultiSelect from "@/components/bs-ui/select/multi";
 import { Tabs, TabsList, TabsTrigger } from "@/components/bs-ui/tabs";
 import { readFileLibDatabase } from "@/controllers/API";
@@ -72,7 +73,7 @@ export default function KnowledgeSelect({
     const cursorRef = useRef<string | null>(null)
     const typeRef = useRef(type === 'qa' ? 1 : 0)
     const reload = (cursor: string | null, name: string) => {
-        readFileLibDatabase({ cursor, pageSize: 60, name, type: typeRef.current, permissionId: 'use_kb' }).then(res => {
+        readFileLibDatabase({ cursor, pageSize: 60, name, type: typeRef.current, action: 'use' }).then(res => {
             cursorRef.current = res.next_cursor
             originOptionsRef.current = res.data
             const opts = res.data.map(el => ({ label: el.name, value: el.id, type: KnowledgeType.FILE }))

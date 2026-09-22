@@ -57,6 +57,7 @@ _TENANT_AWARE_MODEL_MODULES = (
     "bisheng.workstation.domain.models.tenant_workstation_config",
     "bisheng.org_sync.domain.models.org_sync",
     "bisheng.approval.domain.models.approval_request",
+    "bisheng.citation.domain.models.message_citation",
     # Previously *not* on any auto-imported chain — silent tenant-id leaks.
     "bisheng.database.models.failed_tuple",
     "bisheng.database.models.flow_version",
@@ -81,10 +82,18 @@ _TENANT_AWARE_MODEL_MODULES = (
     "bisheng.channel.domain.models.channel",
     "bisheng.channel.domain.models.article_read_record",
     "bisheng.channel.domain.models.channel_info_source",
+    "bisheng.telemetry_search.domain.models.dashboard",
     "bisheng.linsight.domain.models.linsight_execute_task",
     "bisheng.linsight.domain.models.linsight_session_version",
     "bisheng.linsight.domain.models.linsight_sop",
     "bisheng.linsight.domain.models.linsight_skill",
+    # F048 imports the complete permission metadata graph. Catalog and model
+    # release tables are global; only tables that physically carry tenant_id
+    # are selected by _discover_tenant_aware_tables().
+    "bisheng.permission.domain.models.catalog",
+    "bisheng.permission.domain.models.grant",
+    "bisheng.permission.domain.models.projection",
+    "bisheng.permission.domain.models.migration",
     "bisheng.finetune.domain.models.sft_model",
     "bisheng.finetune.domain.models.server",
     "bisheng.finetune.domain.models.preset_train",

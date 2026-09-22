@@ -39,7 +39,7 @@ import { QueueCard } from './QueueCard';
 import { ExecutionLiveContext } from './executionLive';
 import { ExecutionTimeline } from './ExecutionTimeline';
 import { ResultPanel } from './ResultPanel';
-import { TaskErrorCard } from './TaskErrorCard';
+import { ChatErrorCard } from '~/components/ChatErrorCard';
 import { TaskStepRow, type ExecTask } from './TaskStepRow';
 import type { ExecStepEventData } from './stepUtils';
 import { findPendingUserInput, hasRenderableTimeline, isTaskRunning, isTaskStarted, splitSessionPseudoTask } from './stepUtils';
@@ -138,7 +138,14 @@ export function TaskTurnPanel({ versionId, liked, allowFeedback = true, conversa
         [sessionSteps.length, sessionSteps[sessionSteps.length - 1]?.status, sessionSteps[sessionSteps.length - 1]?.call_id],
     );
 
-    const planning = running && !queueing && !tasks.length && !pendingInput && !hasSessionTimeline;
+    // Attachment ingest was moved off the submit request into the worker, which
+    // claims the session (IN_PROGRESS ⇒ running) BEFORE parsing uploads/*. For a
+    // large batch that is minutes with no task, no step and no queue position —
+    // the panel had nothing to render and the run looked hung. Own that window
+    // explicitly: nothing is being planned yet, so the planning row must not
+    // claim it (the two are mutually exclusive by construction).
+    const preparing = running && noProgressYet && !queueing;
+    const planning = running && !queueing && !tasks.length && !pendingInput && !hasSessionTimeline && !preparing;
 
     const handleClarifySubmit = (taskId: string, ans: string) => {
         sendInput({ task_id: taskId || versionId, user_input: ans, files: [] });
@@ -171,15 +178,15 @@ export function TaskTurnPanel({ versionId, liked, allowFeedback = true, conversa
     if (!linsight) {
         if (loadFailed) {
             return (
-                <div className="text-[14px] leading-relaxed text-[#212121]">
+                <div className="text-[14px] leading-relaxed text-text-1">
                     {answer || localize('com_linsight_detail_load_failed')}
                 </div>
             );
         }
         return answer ? (
-            <div className="whitespace-pre-wrap text-[14px] leading-relaxed text-[#212121]">{answer}</div>
+            <div className="whitespace-pre-wrap text-[14px] leading-relaxed text-text-1">{answer}</div>
         ) : (
-            <div className="py-2 text-sm text-[#86909c]">{localize('com_linsight_loading')}</div>
+            <div className="py-2 text-sm text-text-3">{localize('com_linsight_loading')}</div>
         );
     }
 
@@ -202,6 +209,10 @@ export function TaskTurnPanel({ versionId, liked, allowFeedback = true, conversa
                 (时序内联) instead of being hoisted above the timeline. */}
             <ExecutionTimeline history={sessionSteps} />
 
+            {/* pre-output breathing row: the worker holds us but has emitted
+                nothing yet (deferred attachment ingest / run startup) */}
+            {preparing && <BreathingRow state="preparing" />}
+
             {/* planning breathing row */}
             {planning && <BreathingRow state="planning" />}
 
@@ -218,7 +229,7 @@ export function TaskTurnPanel({ versionId, liked, allowFeedback = true, conversa
 
             {/* error / terminated banners */}
             {linsight.taskError && (
-                <TaskErrorCard
+                <ChatErrorCard
                     errorType={linsight.taskErrorInfo?.error_type}
                     detail={linsight.taskErrorInfo?.detail}
                     fallbackMessage={linsight.taskError}

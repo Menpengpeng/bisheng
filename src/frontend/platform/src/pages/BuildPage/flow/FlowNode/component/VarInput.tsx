@@ -1,3 +1,4 @@
+// @ts-strict-ignore
 import { RbDragIcon } from "@/components/bs-icons/rbDrag";
 import { Button } from "@/components/bs-ui/button";
 import { Dialog, DialogContent, DialogTrigger } from "@/components/bs-ui/dialog";
@@ -245,7 +246,7 @@ export default function VarInput({
         e.preventDefault();
 
         // 1. Get the HTML content
-        let copiedHtml = e.clipboardData.getData('text/html');
+        const copiedHtml = e.clipboardData.getData('text/html');
         const copiedText = e.clipboardData.getData('text/plain');
 
         // If the clipboard doesn't contain HTML, directly insert the plain text and return
@@ -317,7 +318,9 @@ export default function VarInput({
     };
 
     // resize
-    const heightClass = mini ? 'max-h-64' : full ? 'min-h-64' : 'max-h-64 min-h-[80px]';
+    // The expanded (dialog) editor gets a viewport-relative box: tall enough to read a
+    // long prompt at a glance, capped so it never outgrows the dialog on short screens.
+    const heightClass = mini ? 'max-h-64' : full ? 'min-h-[70vh] max-h-[78vh]' : 'max-h-64 min-h-[80px]';
     const { height, handleMouseDown } = useResize(textareaRef, mini ? 40 : 80, 40);
 
     return (
@@ -364,7 +367,7 @@ export default function VarInput({
                             <DialogTrigger asChild>
                                 <Button className="text-muted-foreground absolute right-2 top-6 size-5" size="icon" variant="ghost"><Expand size={14} /></Button>
                             </DialogTrigger>
-                            <DialogContent className="lg:max-w-[620px] translate-x-[-50%]">
+                            <DialogContent className="max-w-[94vw] lg:max-w-[1280px] translate-x-[-50%]">
                                 {/* <DialogHeader>
                                 <DialogTitle className="flex items-center"></DialogTitle>
                             </DialogHeader> */}

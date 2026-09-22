@@ -1,7 +1,9 @@
+// @ts-strict-ignore
 /**
  * Direct API calls for the AI chat system.
  */
 import http from "~/api/request";
+import { normalizeHistoryMediaFiles } from "~/utils/mediaAttachmentUtils";
 
 // --- Endpoints ---
 const API = {
@@ -11,7 +13,12 @@ const API = {
     // branches pre-collapsed server-side).
     agentMessages: (conversationId: string) =>
         `/api/v1/workstation/messages/${conversationId}/agent`,
+    sessionInfo: (conversationId: string) =>
+        `/api/v1/chat/info?chat_id=${encodeURIComponent(conversationId)}`,
     sseChat: () => `/api/v1/workstation/chat/completions`,
+    // Links handed out at upload time expire; ask for a fresh one at render.
+    attachmentUrl: (conversationId: string, fileId: string) =>
+        `/api/v1/chat/${conversationId}/files/${fileId}/url`,
     abortChat: () => `/api/v1/workstation/chat/completions/abort`,
     deleteConversation: (id: string) => `/api/v1/chat/${id}`,
     bsConfig: () => `/api/v1/workstation/config`,
@@ -124,6 +131,16 @@ export interface ChatMessage {
         ServiceBusyNotice + Retry for transient codes (rate limit / busy) vs the red
         error bubble for terminal ones. */
     errorCode?: number;
+    /** Human-readable failure copy for an errored assistant row. Kept apart from
+        `text` so a stream that failed *after* emitting an answer keeps that answer
+        renderable — overwriting `text` would destroy it. */
+    errorText?: string;
+    /** stable failure classification from the backend (`data.error_type` on the SSE
+        error envelope) — picks the card's title/explanation/hint copy. */
+    errorType?: string;
+    /** raw upstream text (provider message, parser error, offending filename) kept
+        behind the card's "view details" disclosure. */
+    errorDetail?: string;
     unfinished?: boolean;
     isCreatedByUser?: boolean;
     createdAt?: string;
@@ -235,6 +252,25 @@ export async function getAgentMessages(
     return rows.map(mapAgentResponseItem);
 }
 
+/**
+ * Read a conversation's stored name.
+ *
+ * The history endpoints return messages only, so opening an existing
+ * conversation by URL (deep link or share link) left the header on the
+ * "New Chat" fallback while the sidebar showed the real name.
+ */
+export async function getSessionName(
+    conversationId: string,
+    shareToken?: string,
+): Promise<string> {
+    if (!conversationId || conversationId === "new") {
+        return "";
+    }
+    const headers = shareToken ? { 'share-token': shareToken } : undefined;
+    const res = await http.get(API.sessionInfo(conversationId), headers ? { headers } : undefined);
+    return res?.data?.name ?? "";
+}
+
 function mapAgentResponseItem(row: any): ChatMessage {
     const category: string = row.category;
     const raw = row.message;
@@ -247,13 +283,16 @@ function mapAgentResponseItem(row: any): ChatMessage {
         isCreatedByUser: !row.is_bot,
         createdAt: row.create_time,
         category,
-        files: Array.isArray(row.files) ? row.files : [],
+        files: normalizeHistoryMediaFiles(Array.isArray(row.files) ? row.files : []),
         citations: Array.isArray(row.citations) ? row.citations : null,
         liked: row.liked,
     };
 
     if (category === "question" && raw && typeof raw === "object") {
         base.text = raw.query ?? "";
+        if (!base.files?.length && Array.isArray(raw.files)) {
+            base.files = normalizeHistoryMediaFiles(raw.files);
+        }
         return base;
     }
 
@@ -566,7 +605,7 @@ export async function getFolderSessions(
     spaceId: string | number,
     folderId?: string | number
 ): Promise<FolderSession[]> {
-    const params: Record<string, any> = {};
+    const params: Record<string, unknown> = {};
     if (folderId != null && folderId !== "") params.folder_id = folderId;
     const res = await http.get(
         `/api/v1/knowledge/space/${spaceId}/chat/folder/session`,
@@ -583,7 +622,7 @@ export async function createFolderSession(
     spaceId: string | number,
     folderId?: number
 ): Promise<FolderSession> {
-    const body: Record<string, any> = {};
+    const body: Record<string, unknown> = {};
     if (folderId != null) body.folder_id = folderId;
     const res = await http.post(
         `/api/v1/knowledge/space/${spaceId}/chat/folder/session`,
@@ -598,7 +637,7 @@ export async function deleteFolderSession(
     chatId: string,
     folderId?: number
 ): Promise<void> {
-    const body: Record<string, any> = { chat_id: chatId };
+    const body: Record<string, unknown> = { chat_id: chatId };
     if (folderId != null) body.folder_id = folderId;
     await http.deleteWithOptions(
         `/api/v1/knowledge/space/${spaceId}/chat/folder/session`,
@@ -626,7 +665,7 @@ export async function getFolderChatHistory(
         pageSize?: number;
     }
 ): Promise<ChatMessage[]> {
-    const queryParams: Record<string, any> = {};
+    const queryParams: Record<string, unknown> = {};
     if (params.folderId != null && params.folderId !== "")
         queryParams.folder_id = params.folderId;
     if (params.chatId) queryParams.chat_id = params.chatId;
@@ -639,4 +678,28 @@ export async function getFolderChatHistory(
     const items: StreamHistoryItem[] = Array.isArray(res?.data) ? res.data : [];
     // Backend returns newest-first; reverse for chronological order
     return items.reverse().map(parseStreamHistoryItem);
+}
+
+/**
+ * Fresh link for one attachment of one conversation.
+ *
+ * The link stored on the message was signed at upload time and expires; the
+ * backend re-signs from the object it recorded for that conversation. Returns
+ * null when the file is no longer retrievable (cleared storage, or an upload
+ * from before attachments were kept), which the caller renders as such.
+ */
+export async function getAttachmentUrl(
+    conversationId: string,
+    fileId: string,
+): Promise<string | null> {
+    try {
+        // The wrapper unwraps `data` for some callers and not others, so accept both.
+        const res = await http.get<{ url?: string } | { data?: { url?: string } }>(
+            API.attachmentUrl(conversationId, fileId),
+        );
+        const payload = (res as { data?: { url?: string } })?.data ?? (res as { url?: string });
+        return payload?.url ?? null;
+    } catch {
+        return null;
+    }
 }

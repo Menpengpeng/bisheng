@@ -29,7 +29,7 @@ import { QueueCard } from './QueueCard';
 import { ExecutionTimeline } from './ExecutionTimeline';
 import { ResultPanel } from './ResultPanel';
 import { TaskPanel } from './TaskPanel';
-import { TaskErrorCard } from './TaskErrorCard';
+import { ChatErrorCard } from '~/components/ChatErrorCard';
 import { TaskStepRow, type ExecTask } from './TaskStepRow';
 import { ExecutionLiveContext } from './executionLive';
 import { findPendingUserInput, hasRenderableTimeline, isTaskRunning, isTaskStarted, splitSessionPseudoTask } from './stepUtils';
@@ -109,10 +109,18 @@ export function ExecutionFlow({ versionId, conversationId, isSharePage = false, 
         [sessionSteps.length, sessionSteps[sessionSteps.length - 1]?.status, sessionSteps[sessionSteps.length - 1]?.call_id],
     );
 
+    // preparing row: the worker has claimed the session (IN_PROGRESS ⇒ running,
+    // queue position gone) but has emitted nothing yet, because the attachment
+    // ingest moved off the submit request and now runs here — minutes on a large
+    // batch. Same window, same copy as TaskTurnPanel: both carriers must give the
+    // identical live signal. Nothing is being planned during it, so the planning
+    // row must not claim it (the two are mutually exclusive by construction).
+    const preparing = running && noProgressYet && !queueing;
     // planning row: running, todo list not generated yet, nothing else pending, and
     // the session timeline has no content yet (deep-thinking hasn't started — else
     // it would render concurrently with "正在深度思考").
-    const planning = running && !queueing && !pendingInput && !realTasks.length && !hasSessionTimeline;
+    const planning =
+        running && !queueing && !pendingInput && !realTasks.length && !hasSessionTimeline && !preparing;
     // generating row: todos exist but no task is actively streaming a spinner
     // right now — bridges the gaps before the first task, between tasks, AND the
     // final report-generation phase (status stays Running with no step events
@@ -168,7 +176,7 @@ export function ExecutionFlow({ versionId, conversationId, isSharePage = false, 
                     {/* user question bubble (active round) */}
                     {linsight?.question && (
                         <div className="mb-4 flex justify-end">
-                            <div className="max-w-[80%] whitespace-pre-wrap rounded-[12px] bg-[#F4F4F4] px-4 py-3 text-[14px] leading-relaxed text-[#212121]">
+                            <div className="max-w-[80%] whitespace-pre-wrap rounded-xl bg-[#F4F4F4] px-4 py-3 text-[14px] leading-relaxed text-[#212121]">
                                 {linsight.question}
                             </div>
                         </div>
@@ -190,6 +198,11 @@ export function ExecutionFlow({ versionId, conversationId, isSharePage = false, 
                                 planning-stage tools); an answered clarify renders as an
                                 inline IntentRow at its chronological position here. */}
                             <ExecutionTimeline history={sessionSteps} />
+
+                            {/* pre-output breathing row: the worker holds us but has
+                                emitted nothing yet (deferred attachment ingest / run
+                                startup) */}
+                            {preparing && <BreathingRow state="preparing" />}
 
                             {/* planning breathing row */}
                             {planning && <BreathingRow state="planning" />}
@@ -214,7 +227,7 @@ export function ExecutionFlow({ versionId, conversationId, isSharePage = false, 
 
                     {/* error / terminated banners */}
                     {linsight?.taskError && (
-                        <TaskErrorCard
+                        <ChatErrorCard
                             errorType={linsight.taskErrorInfo?.error_type}
                             detail={linsight.taskErrorInfo?.detail}
                             fallbackMessage={linsight.taskError}
@@ -299,6 +312,7 @@ export function ExecutionFlow({ versionId, conversationId, isSharePage = false, 
                 open={artifactsPanel.workspaceOpen}
                 onOpenChange={artifactsPanel.setWorkspaceOpen}
                 files={workspaceFiles}
+                versionId={versionId}
                 onPreview={(file) => artifactsPanel.openPreview(file, true)}
             />
             <FilePreviewPanel
@@ -308,6 +322,7 @@ export function ExecutionFlow({ versionId, conversationId, isSharePage = false, 
                 versionId={versionId}
                 fileList={workspaceFiles}
                 onBack={artifactsPanel.fromWorkspace ? artifactsPanel.backToWorkspace : undefined}
+                onArtifactPreview={(file) => artifactsPanel.openPreview(file, artifactsPanel.fromWorkspace)}
             />
         </div>
         </ExecutionLiveContext.Provider>

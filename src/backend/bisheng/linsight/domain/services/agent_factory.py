@@ -33,6 +33,10 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import interrupt
 
 from bisheng.common.services.config_service import settings
+from bisheng.linsight.domain.services.binary_content_guard import (
+    CODE_INTERPRETER_TOOL,
+    build_binary_guards,
+)
 from bisheng.linsight.domain.services.resilience_middleware import build_resilience_middleware
 from bisheng.linsight.domain.services.tool_loop_middleware import build_tool_loop_breaker_middleware
 from bisheng.llm.domain.services import LLMService
@@ -113,16 +117,17 @@ _LINSIGHT_SYSTEM_PROMPT_TEMPLATE_ZH = """你是深度研究任务智能体，负
 1. 【规划】调用 write_todos 写出有编号的待办清单（通常 3-6 项，含一个“产出交付物”收尾项）。
 
 2. 【执行】按清单逐项推进，选用合适工具：
-__KB_EXEC_LINE__
+__SKILL_EXEC_LINE____KB_EXEC_LINE__
    - 对“独立、需多轮检索/阅读、产出可蒸馏为一段摘要”的子任务，可用 task 委派给 "general-purpose" 子代理做隔离调研（它在独立上下文检索/阅读，只把蒸馏后的有出处摘要回传给你）；同一时刻并行委派不超过 2~3 个。
 __KB_DELEGATE_LINE__   更新待办时只翻转 status（pending/in_progress/completed），不改写已有文案，以保证任务标识稳定。
 
 3. 【产出交付物】按用户在澄清时选择的输出格式产出，markdown 是唯一规范源：
-   - 3a（始终）：write_file 写 output/<name>.md（结构化 markdown，其它格式由它派生）。图表/图片一律用 markdown 图片语法 `![说明](相对路径)` 引用（如 `![季节性走势](output/charts/x.png)`）；不要在 markdown 里写 `<div>`/`<img>`/`<table>` 等原始 HTML 标签——markdown 预览不渲染原始 HTML，会以纯文本泄漏。（HTML 交付物走 3b，不受此约束。）
+__SKILL_DELIVERABLE_LINE__   - 3a（始终）：write_file 写 output/<name>.md（结构化 markdown，其它格式由它派生）。图表/图片一律用 markdown 图片语法 `![说明](相对路径)` 引用（如 `![季节性走势](output/charts/x.png)`）；不要在 markdown 里写 `<div>`/`<img>`/`<table>` 等原始 HTML 标签——markdown 预览不渲染原始 HTML，会以纯文本泄漏。（HTML 交付物走 3b，不受此约束。）
    - 3b（仅当选了 html）：write_file 写 output/<name>.html（完整自包含 HTML，内联样式，无外部脚本/CDN）。
    - 3c（仅当选了 docx）：export_docx(source_path="output/<name>.md")，必须在 3a 之后。
    - 3d（仅当选了 pdf）：export_pdf(source_path="output/<name>.md")，必须在 3a 之后。
    最终交付物的撰写与拼装必须由你（主智能体）亲自完成，不得委派给子代理；中间产物写 scratch/。
+   **禁止**在未调用 write_file 写入 output/ 的情况下，在回复中声称「已保存为 xxx.md / 已写入 xxx」——用户界面只会展示真实写入 output/ 的交付物；口头提及的文件名无法被预览或下载。
 
 4. 【收尾】用 1-2 句话概括交付物的核心内容或结论（例如“已梳理出近一年的市场变化并给出三条关键建议”）；不要复述文件名、工作区路径（如 output/…）或“已完成”之类的状态字样——完成状态与可下载的文件由界面单独呈现，正文里无需重复。
 
@@ -152,15 +157,25 @@ __KB_DELEGATE_LINE__   更新待办时只翻转 status（pending/in_progress/com
 
 - ask_user(reason, questions)：第 0 步澄清；整个会话最多调用一次。
 - write_todos(todos)：维护有编号的待办清单；只翻转 status，不改写已有文案。
-__KB_TOOL_LINE__- write_file / read_file / edit_file / ls：工作区文件工具；交付物写 output/，中间产物写 scratch/。
+__KB_TOOL_LINE__- write_file / read_file / edit_file / ls / glob / grep：工作区文件工具；交付物写 output/，中间产物写 scratch/（工具回显的 /output/x 与 output/x 是同一个文件）。read_file 支持 offset/limit 分块读取大文件；grep 可在整个工作区按关键字定位内容。
 - export_docx(source_path, dest_path)：把 output/ 下的 markdown 转 Word(.docx)，必须在对应 .md 写好之后。
 - export_pdf(source_path, dest_path)：把 output/ 下的 markdown 转 PDF，必须在对应 .md 写好之后。
 - task(description, subagent_type="general-purpose")：把独立、可隔离、较重的调研子任务委派给子代理。description 必须自包含——子代理看不到你的对话历史与上下文，只能读到 description，因此完成该子任务所需的全部背景、目标、约束与必要标识都要写进去；不得委派最终交付物撰写，也不得委派“问用户/澄清”。
 
-# 风格
+# 超大工具结果
+
+某次工具结果过大时，系统会把它存入 /large_tool_results/<tool_call_id>，只在回复里保留开头片段。
+这表示**结果已经产生并保存好了**，不是执行失败、也不是输出被弄丢了。此时：
+
+- 用 read_file 读那个路径把内容取回来；文件很大就配合 offset/limit 分页读（该文件常常没有换行，会按字符分页，offset 数的是页不是行）。
+- 不知道确切路径时，用 grep 在 /large_tool_results/ 下按关键字定位。
+- **绝对不要重跑产生它的那次调用**：参数没变，结果一定一样，重跑只会再产生一份同样的大结果。
+
+__PATH_NAMESPACE_LINE__# 风格
 
 - 简洁，工具调用之间不加多余解释性文字。
 - 不要凭空编造事实；交付内容应基于检索到的资料/依据。
+- 凡需要在回复中引用可下载/可预览的交付物，必须先 write_file 写入 output/；不得仅口头描述文件名。
 """
 
 # search_knowledge_base is the ONLY tool whose presence is conditional on the
@@ -227,7 +242,11 @@ class _LanguageTailMiddleware(AgentMiddleware):
         return await handler(self._append(request))
 
 
-def _build_linsight_system_prompt(has_knowledge_base: bool) -> str:
+def _build_linsight_system_prompt(
+    has_knowledge_base: bool,
+    skills_present: bool = False,
+    has_code_interpreter: bool = False,
+) -> str:
     """Resolve the main system prompt, toggling search_knowledge_base mentions.
 
     When no KB / knowledge space is selected the tool is NOT injected (the empty
@@ -235,11 +254,35 @@ def _build_linsight_system_prompt(has_knowledge_base: bool) -> str:
     the model to call a tool that isn't bound — exactly the
     ``knowledge_id: Field required`` failure. Keep the prompt and the tool list in
     lockstep: the search_knowledge_base lines appear IFF the tool is present.
+
+    ``skills_present`` follows the same lockstep rule for SkillsMiddleware: the
+    skill lines are injected IFF at least one bundle was materialized (so the
+    "Available Skills" section actually exists in the system message). They exist
+    because the deliverable workflow below is an ORDER ("markdown 是唯一规范源"
+    -> 3c export_docx) that outranks the middleware's progressive disclosure:
+    observed in production, the model wrote the md, then emitted read_file(
+    "/skills/docx/SKILL.md") and export_docx in the SAME parallel tool-call batch
+    — the skill body arrived after the deliverable was already produced, so the
+    selected skill had zero effect on it. These lines force the read to happen
+    before producing anything, and hand the skill priority over 3b-3d.
+
+    ``has_code_interpreter`` hardens the deliverable rule. With the skill read
+    early but the default path merely deprioritised, a run was still observed
+    taking ``write_file`` + ``export_docx`` (the cheap path) instead of the
+    skill's script route. When a code executor IS bound, the fallback exports are
+    therefore forbidden outright rather than "deprioritised" — a prohibition the
+    model cannot satisfy by doing the easy thing. Without an executor the skill's
+    route is unrunnable, so the ban would be a dead end: the softer wording (fall
+    back to 3b-3d) is kept for that case. Same lockstep discipline as everywhere
+    else in this prompt — never forbid the only tool a run actually has.
     """
     if has_knowledge_base:
         exec_line = (
             "   - 需要资料时用 search_knowledge_base 检索知识库/知识空间；"
-            "读写文件用 write_file / read_file / edit_file / ls。"
+            "读写文件用 write_file / read_file / edit_file / ls。\n"
+            "   - 用户上传的音视频（mp3/mp4 等）已由 ASR 转写为 uploads/*.md；"
+            "<uploaded_files> 中 path 为转写文本、name 为原始文件名。"
+            "read_file(path) 即可获取内容，勿推断为「扩展名标注有误」或「实际是文本文件」。"
         )
         tool_line = "- search_knowledge_base：在授权的知识库/知识空间语义检索。\n"
         # Delegation must restate the KB ids: a subagent's messages are replaced
@@ -258,14 +301,86 @@ def _build_linsight_system_prompt(has_knowledge_base: bool) -> str:
         exec_line = (
             "   - 读写文件用 write_file / read_file / edit_file / ls；若用户上传了文件，"
             "用 ls / read_file 在工作区中查阅。本次任务没有可检索的知识库/知识空间，"
-            "请基于已有资料与自身知识完成，不要调用任何知识库检索工具。"
+            "请基于已有资料与自身知识完成，不要调用任何知识库检索工具。\n"
+            "   - 用户上传的音视频（mp3/mp4 等）已由 ASR 转写为 uploads/*.md；"
+            "<uploaded_files> 中 path 为转写文本、name 为原始文件名。"
+            "read_file(path) 即可获取内容，勿推断为「扩展名标注有误」或「实际是文本文件」。"
         )
         tool_line = ""
         delegate_line = ""
+    if skills_present:
+        skill_exec_line = (
+            "   - 【技能优先】系统提示的 “Available Skills” 列出了本次可用的技能。动手前先对照每个技能的"
+            "描述判断是否与任务匹配；一旦匹配，**必须先** read_file 读完它的 SKILL.md，"
+            "**且必须传 limit=1000 一次读完**（默认 100 行、或自己改小成 200 都只能读到开头，"
+            "关键的生成步骤在后面），再按它的指引执行。"
+            "严禁一边产出一边读，更不要把“读 SKILL.md”和“产出交付物”放进同一轮并行工具调用"
+            "——技能内容返回时交付物已经生成，等于没读。\n"
+        )
+        if has_code_interpreter:
+            # Hard prohibition: the fallback exports are the cheap path the model
+            # keeps drifting back to, so remove them from the option set entirely
+            # (a code executor is bound, i.e. the skill's route IS runnable).
+            skill_deliverable_line = (
+                "   - 3z（优先级最高，覆盖下面的 3b-3d）：若上一步命中了与交付格式相关的技能"
+                "（如 docx / xlsx / pptx），交付物本体**必须**按该技能 SKILL.md 指定的做法生成——"
+                "用 bisheng_code_interpreter 执行技能给出的脚本/库（技能正文若用的语言本环境跑不了，"
+                "就用 Python 等价库实现同样的排版要求），把成品直接写进 output/。"
+                "此时**禁止**调用 export_docx / export_pdf 从 markdown 派生同一份交付物——"
+                "那条路径丢掉技能规定的全部排版细节，等于没用技能；"
+                "只有代码执行连续失败、确实产不出成品时，才允许退回 export_docx / export_pdf 兜底，"
+                "并在收尾里说明退化。3a 的 markdown 规范源仍然要写（界面预览依赖它）。\n"
+            )
+        else:
+            # No executor bound: the skill's route cannot run, so banning the
+            # exports would leave no way to produce the file at all.
+            skill_deliverable_line = (
+                "   - 3z（优先级最高）：若上一步命中了与交付格式相关的技能（如 docx / xlsx / pptx），"
+                "交付物内容与排版尽量遵循该技能 SKILL.md 的要求。"
+                "本次没有可用的代码执行工具，技能里需要执行脚本的做法无法落地，"
+                "因此交付物仍按下面的 3b-3d 生成。3a 的 markdown 规范源仍然要写。\n"
+            )
+    else:
+        skill_exec_line = ""
+        skill_deliverable_line = ""
+
+    # The two path namespaces only need explaining when a code interpreter is bound —
+    # that is the ONLY tool with a cwd. Gated on ``has_code_interpreter`` ALONE:
+    # this used to ride along inside ``skill_deliverable_line``, so a run that bound
+    # the executor but selected no skill (exactly the 180 session) never saw it and
+    # burned three model round-trips rediscovering the mapping. Keeping the
+    # ``has_code_interpreter`` gate preserves the prompt↔tool lockstep this module
+    # enforces everywhere else (a bound-tool name must never appear otherwise).
+    path_namespace_line = ""
+    if has_code_interpreter:
+        path_namespace_line = (
+            "# 工作区路径（同一份文件的两种写法）\n\n"
+            "- 文件工具（ls / read_file / write_file / edit_file / export_*）用**带前导斜杠**的工作区路径："
+            "/output/x.md、/scratch/x.png、/uploads/x.xlsx、/skills/<name>/SKILL.md；不带斜杠的相对写法等价。\n"
+            "- bisheng_code_interpreter 的**当前工作目录就是工作区根**，代码里一律用**去掉前导斜杠**的相对路径："
+            'open("skills/<name>/assets/t.html")、plt.savefig("output/chart.png")。'
+            '写成 open("/skills/…") / open("/output/…") 会落到容器根目录——读必然 FileNotFoundError，'
+            "写会被丢弃、进不了交付。\n"
+            "- 反向同理：**不要**把代码里看到的宿主机绝对路径（形如 /root/.cache/…/<8位任务号>/output/a.png）"
+            "传给 read_file / edit_file，去掉前缀只传 output/a.png。\n"
+            "- 执行器写完会把本轮产出同步到工作区，随后 ls / glob 一般就能看到它们。"
+            "但**判定成功的依据是执行结果本身**：只要 exitcode 0 且 file_list 里出现了目标文件，"
+            "就视为交付物已产出，继续下一步，不要反复 ls / glob 找它。\n"
+            "- 若日志被截断、你看不到 file_list：可以 ls output/ **核实一次**；"
+            "若结果提示「Tool result too large … /large_tool_results/…」，用 read_file 读那个路径取回内容"
+            "（必要时配合 offset/limit 分页，或用 grep 在 /large_tool_results/ 下定位关键字）。"
+            "**任何情况下都不要把同一段代码原样再跑一遍**——相同的输入只会得到相同的结果。\n"
+            "- 不要一次 print 巨量内容：超长日志会被截断（中间省略），需要完整数据时把它写进 "
+            "scratch/ 下的文件，再用 read_file 分块读取。\n\n"
+        )
+
     return (
         _LINSIGHT_SYSTEM_PROMPT_TEMPLATE_ZH.replace("__KB_EXEC_LINE__", exec_line)
         .replace("__KB_TOOL_LINE__", tool_line)
         .replace("__KB_DELEGATE_LINE__", delegate_line)
+        .replace("__SKILL_EXEC_LINE__", skill_exec_line)
+        .replace("__SKILL_DELIVERABLE_LINE__", skill_deliverable_line)
+        .replace("__PATH_NAMESPACE_LINE__", path_namespace_line)
     )
 
 
@@ -276,14 +391,17 @@ def _build_researcher_prompt(has_knowledge_base: bool) -> str:
     tool subset (_subagent_tools), which mirrors the main graph; advertise it only
     when it is actually available.
     """
+    media_line = " 音视频附件的 path 为 ASR 转写文本（.md），name 为原始上传名，并非扩展名错误。"
     if has_knowledge_base:
         research_line = (
             "- 优先使用 search_knowledge_base 检索知识库/知识空间，并用 read_file / ls 阅读工作区中已有的资料。"
+            f"{media_line}"
         )
     else:
         research_line = (
             "- 用 read_file / ls 阅读工作区中已有的资料；本次没有可检索的知识库/知识空间，"
             "不要调用任何知识库检索工具，基于已有资料与自身知识给出结论。"
+            f"{media_line}"
         )
     return _LINSIGHT_RESEARCHER_PROMPT_TEMPLATE_ZH.replace("__KB_RESEARCH_LINE__", research_line)
 
@@ -579,9 +697,10 @@ def _subagent_tools(tools: Sequence[BaseTool]) -> list[BaseTool]:
 
     The returned list MUST be passed as the subagent spec's explicit ``tools`` key
     so deepagents does NOT fall back to inheriting ``[*tools, ask_user]``
-    (graph.py:670 — an explicit ``tools`` means the subagent gets ONLY those). The
-    subagent still receives ls/read_file/write_file/edit_file + write_todos from
-    its own middleware stack (graph.py:618-627), sharing the main WorkspaceBackend.
+    (graph.py:694 in deepagents 0.6.12 — an explicit ``tools`` means the subagent
+    gets ONLY those). The subagent still receives ls/read_file/write_file/edit_file
+    + write_todos from its own middleware stack (graph.py:643-652), sharing the
+    main WorkspaceBackend.
     """
     return [t for t in tools if t.name not in _SUBAGENT_TOOL_DENY and t.name not in _KNOWN_HITL_TOOL_NAMES]
 
@@ -592,14 +711,15 @@ def _build_researcher_subagent(tools: Sequence[BaseTool]) -> dict:
     Design #1 §4.1 (MVP = one researcher) / §4.2 (decision 1: same-name override).
 
     - ``name="general-purpose"``: providing our own spec with this name SUPPRESSES
-      deepagents' auto-injected default general-purpose subagent (graph.py:693), so
-      the unsafe default GP — which would inherit ``[*tools, ask_user]`` — never
-      gets built. The model decides whether to delegate from ``description``, not
-      ``name``, so the honest description below is what actually steers it.
+      deepagents' auto-injected default general-purpose subagent (graph.py:717 in
+      deepagents 0.6.12), so the unsafe default GP — which would inherit
+      ``[*tools, ask_user]`` — never gets built. The model decides whether to
+      delegate from ``description``, not ``name``, so the honest description below
+      is what actually steers it.
     - ``tools=_subagent_tools(tools)``: explicit subset (blacklist). Explicit
       ``tools`` is REQUIRED so the subagent does not inherit ask_user (§4.3).
     - NO ``model`` key: the subagent inherits the parent's per-task tenant model
-      (graph.py:608 ``spec.get("model", model)``).
+      (graph.py:633 ``spec.get("model", model)``).
     - NO ``permissions`` / ``interrupt_on`` keys: this is the SAFETY BASIS
       (design §3.1). Without them the subagent stack carries no
       HumanInTheLoopMiddleware and no filesystem interrupts, so the subagent has
@@ -628,6 +748,7 @@ async def create_linsight_agent(
     backend=None,
     checkpointer=None,
     skills_present: bool = False,
+    turn_budget_sink: dict | None = None,
 ):
     """Build the deepagents-backed Linsight agent (design §2.1).
 
@@ -642,6 +763,9 @@ async def create_linsight_agent(
             FakeWorkspaceBackend is constructed (stub default).
         checkpointer: LangGraph checkpointer. When None an InMemorySaver is used
             (Wave1; real run injects PlainRedisCheckpointer, C5).
+        turn_budget_sink: mutable dict the MAIN graph's resilience middleware flags
+            when the run had to wrap up early on its turn budget, so the caller can
+            tell the user. Main graph only — a subagent landing early is internal.
 
     Returns:
         ``CompiledStateGraph`` to be driven by ``agent.astream(...)``.
@@ -649,7 +773,7 @@ async def create_linsight_agent(
     from deepagents import create_deep_agent
 
     svid = svid or session_model.id
-    model = await _resolve_model(session_model, model_id)
+    model, supports_vision = await _resolve_model(session_model, model_id)
 
     if backend is None:
         backend = _default_backend(svid, file_dir)
@@ -674,9 +798,16 @@ async def create_linsight_agent(
     # weak model that keeps calling write_file with a truncated/missing content
     # arg) — soft nudge then graceful salvage-and-abort, instead of spinning to
     # recursion_limit. One instance per graph, same as the resilience middleware.
+    # Binary guards: keep raw upload bytes out of the model conversation. The
+    # workspace deliberately carries ORIGINAL xlsx/docx/pdf next to their .md views
+    # (for the code interpreter), and deepagents' ``read_file`` would happily turn
+    # those into file/audio/video content blocks — a hard 400 on most endpoints, a
+    # client-side ValueError for video, and silent mojibake for docx/xlsx.
+    has_code_interpreter = any(getattr(t, "name", None) == CODE_INTERPRETER_TOOL for t in tools)
     middlewares: list = [
-        build_resilience_middleware(linsight_conf, is_subagent=False),
+        build_resilience_middleware(linsight_conf, is_subagent=False, budget_sink=turn_budget_sink),
         build_tool_loop_breaker_middleware(linsight_conf, is_subagent=False),
+        *build_binary_guards(has_code_interpreter, supports_vision=supports_vision),
     ]
 
     # F035 Track D — skills (RE-ENABLED 2026-06-24, Fork X). The run's allowed skill
@@ -689,10 +820,11 @@ async def create_linsight_agent(
     # ``skills=`` param (which would reuse the workspace backend) discovers nothing.
     # SkillsMiddleware registers NO file tools, so this second backend does NOT shadow
     # the workspace read_file/write_file (the 2026-06-16 disable concern does not hold
-    # in deepagents 0.6.8); the model reads the same /skills/<name>/SKILL.md paths back
-    # through the WorkspaceBackend. The copy is the whitelist gate — no per-run
+    # in deepagents 0.6.8; re-verified unchanged in 0.6.12); the model reads the same
+    # /skills/<name>/SKILL.md paths back through the WorkspaceBackend. The copy is the whitelist gate — no per-run
     # active_skills config is threaded.
-    if skills_present and file_dir:
+    skills_advertised = bool(skills_present and file_dir)
+    if skills_advertised:
         from deepagents.backends.filesystem import FilesystemBackend
         from deepagents.middleware.skills import SkillsMiddleware
 
@@ -720,7 +852,7 @@ async def create_linsight_agent(
     # can park-and-release for user input (F035 §4.6); deepagents ships no
     # built-in ask-human tool, so we inject our own.
     # design #1 §4.1/§4.2: a single MVP researcher subagent, named
-    # "general-purpose" to suppress deepagents' auto default GP (graph.py:693).
+    # "general-purpose" to suppress deepagents' auto default GP (graph.py:717).
     # ask_user is appended ONLY to the MAIN graph tools below; the subagent
     # receives _subagent_tools(tools), which never includes ask_user.
     #
@@ -744,6 +876,12 @@ async def create_linsight_agent(
         # Same tool-loop breaker on the subagent's own graph (its tool calls run in
         # a separate subgraph the main-graph middleware never wraps).
         build_tool_loop_breaker_middleware(linsight_conf, is_subagent=True),
+        # The researcher owns read_file too, and its subgraph is likewise outside
+        # the main-graph middleware — without its own pair of guards a subagent
+        # reading an original would fail the whole task. It sees the same code
+        # interpreter as the main graph (not in _SUBAGENT_TOOL_DENY), so the flag
+        # carries over; revisit if it is ever added to that deny list.
+        *build_binary_guards(has_code_interpreter, supports_vision=supports_vision),
         # Same tail language directive on the subagent's own stack (last -> after
         # its TodoList/Filesystem framework prompts), so the researcher also
         # reasons in the user's language.
@@ -755,10 +893,19 @@ async def create_linsight_agent(
     # model is never told to call a tool that isn't there (root cause of the
     # "knowledge_id: Field required" error when no KB is selected).
     has_kb = any(t.name == _KB_TOOL_NAME for t in tools)
+    # Same lockstep for skills: the skill-priority lines are advertised IFF
+    # SkillsMiddleware was actually attached above (``skills_advertised``), so the
+    # prompt never points at an "Available Skills" section that does not exist.
     return create_deep_agent(
         model=model,
         tools=[*tools, ask_user, *export_tools],
-        system_prompt=_build_linsight_system_prompt(has_kb),
+        system_prompt=_build_linsight_system_prompt(
+            has_kb,
+            skills_present=skills_advertised,
+            # Gates the hard "no export_docx/export_pdf" rule: only meaningful
+            # when the skill's script route can actually run in this session.
+            has_code_interpreter=has_code_interpreter,
+        ),
         middleware=middlewares,
         subagents=[researcher],
         backend=backend,
@@ -767,12 +914,21 @@ async def create_linsight_agent(
     )
 
 
-async def _resolve_model(session_model, model_id: str | None) -> BaseChatModel:
+async def _resolve_model(session_model, model_id: str | None) -> tuple[BaseChatModel, bool]:
     """Resolve the per-task model via LLMService (design §2.2 / §2.2.1).
 
     Priority: per-task ``model_id`` -> tenant Linsight default model. Tenant
     resolution + share fallback live inside ``get_bisheng_linsight_llm``
     (INV-T18: tenant_id is threaded explicitly in the Worker subprocess).
+
+    Returns ``(model, supports_vision)``. ``supports_vision`` is the admin-declared
+    ``WSModel.visual`` flag — the 视觉 column in 系统模型设置 → 工作台模型, which
+    daily chat already gates image attachments on. Linsight picks its model from
+    that SAME list (``models[]``, the id ``linsight_default_model_id`` selects
+    from), so the lookup is always resolvable; a model id that is somehow absent
+    reads as False, matching the field's own default. Returned from here rather
+    than fetched separately because ``workbench_conf`` is already in hand —
+    ``get_workbench_llm`` re-validates model refs and is not free to call twice.
     """
     workbench_conf = await LLMService.get_workbench_llm(tenant_id=session_model.tenant_id)
     linsight_conf = settings.get_linsight_conf()
@@ -788,11 +944,16 @@ async def _resolve_model(session_model, model_id: str | None) -> BaseChatModel:
                 "linsight_default_model_id is not configured"
             )
 
-    return await LLMService.get_bisheng_linsight_llm(
+    supports_vision = any(
+        str(entry.id) == str(resolved_id) and bool(entry.visual) for entry in (workbench_conf.models or [])
+    )
+
+    model = await LLMService.get_bisheng_linsight_llm(
         invoke_user_id=session_model.user_id,
         model_id=resolved_id,
         temperature=linsight_conf.default_temperature,
     )
+    return model, supports_vision
 
 
 def _default_backend(svid: str, file_dir: str | None):

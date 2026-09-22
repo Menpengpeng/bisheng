@@ -1,9 +1,10 @@
+// @ts-strict-ignore
 import { LoadingIcon } from "@/components/bs-icons/loading";
 import { Button } from "@/components/bs-ui/button";
 import StepProgress from "@/components/bs-ui/step";
 import { useToast } from "@/components/bs-ui/toast/use-toast";
 import { retryKnowledgeFileApi, subUploadLibFile } from "@/controllers/API";
-import { checkPermission } from "@/controllers/API/permission";
+import { checkResourceActionApi } from "@/controllers/API/permission";
 import { captureAndAlertRequestErrorHoc } from "@/controllers/request";
 import { ChevronLeft } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -73,7 +74,9 @@ export default function FilesUpload() {
         setHasEditPermission(false);
         return;
       }
-      const result = await captureAndAlertRequestErrorHoc(checkPermission('knowledge_library', String(knowledgeId), 'can_edit', 'edit_kb'));
+      const result = await captureAndAlertRequestErrorHoc(
+        checkResourceActionApi({ resource_type: 'knowledge_library', resource_id: String(knowledgeId), action: 'edit' })
+      );
       const allowed = !!result?.allowed;
       setHasEditPermission(allowed);
       setPermissionChecked(true);
@@ -387,7 +390,7 @@ export default function FilesUpload() {
 
               {/* Step 3: Original text comparison */}
               {currentStep === 3 && segmentRules && (
-                <div className="block"> {/* When step 3 is displayed, step 2 is hidden but not unmounted */}
+                <div className="block h-full pb-16"> {/* pb-16 clears the fixed prev/next footer; step 2 stays mounted but hidden */}
                   <PreviewResult
                     rules={segmentRules.rules}
                     resultFiles={resultFiles}

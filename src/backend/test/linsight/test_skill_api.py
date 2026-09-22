@@ -8,6 +8,7 @@ fields, multi-format upload, bundle file endpoint, built-in 404 semantics.
 
 import io
 import zipfile
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -20,6 +21,8 @@ from bisheng.common.errcode.base import BaseErrorCode
 from bisheng.linsight.api.endpoints import skill as skill_endpoints
 from bisheng.linsight.domain.services import skill_service as service_module
 from bisheng.linsight.domain.services.skill_service import SkillService
+from test.linsight.fixtures.fake_minio import FakeMinioStorage
+
 from bisheng.linsight.domain.services.skill_store import MAX_BUNDLE_SIZE, SkillStore
 from test.linsight.test_skill_service import FakeSkillDao
 
@@ -40,9 +43,16 @@ class MockEndUser:
 def client(tmp_path, monkeypatch):
     FakeSkillDao.reset()
     monkeypatch.setattr(service_module, "LinsightSkillDao", FakeSkillDao)
-    monkeypatch.setattr(service_module.PermissionService, "authorize", AsyncMock())
+    owner_projection = SimpleNamespace(authorize_created=AsyncMock())
     # Endpoint-level service factory pinned to the tmp store; tenant id pinned to 1.
-    monkeypatch.setattr(skill_endpoints, "SkillService", lambda: SkillService(store=SkillStore(root=tmp_path)))
+    monkeypatch.setattr(
+        skill_endpoints,
+        "SkillService",
+        lambda: SkillService(
+            store=SkillStore(root=tmp_path, minio=FakeMinioStorage()),
+            owner_projection=owner_projection,
+        ),
+    )
     monkeypatch.setattr(skill_endpoints, "_current_tenant_id", lambda: 1)
 
     app = FastAPI()
@@ -176,7 +186,20 @@ class TestErrorCodes:
 
     def test_zip_without_skill_md_11051(self, client):
         resp = client.post(BASE, files={"file": ("x.zip", _zip_bytes({"readme.md": b"r"}), "application/zip")})
-        assert resp.json()["status_code"] == 11051
+        body = resp.json()
+        assert body["status_code"] == 11051
+        # the per-cause detail must reach the client — the frontend renders it verbatim
+        assert "SKILL.md" in body["status_message"]
+
+    def test_uppercase_frontmatter_name_normalized(self, client):
+        # external skills commonly ship capitalized names — import must succeed
+        # and report the normalization instead of answering 11051.
+        md = b"---\nname: Presentations\ndescription: demo\n---\n\nbody"
+        resp = client.post(BASE, files={"file": ("p.md", md, "text/markdown")})
+        data = resp.json()["data"]
+        assert data["name"] == "presentations"
+        assert data["display_name"] == "Presentations"
+        assert data["normalized_from"] == "Presentations"
 
     def test_oversize_11052(self, client):
         big = b"x" * (MAX_BUNDLE_SIZE + 1)
