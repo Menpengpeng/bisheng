@@ -1,5 +1,10 @@
 import json
+from typing import TYPE_CHECKING
+
 from loguru import logger
+
+if TYPE_CHECKING:
+    from bisheng.api.v1.schema.chat_schema import ChatMessageHistoryResponse
 
 from bisheng.api.services.audit_log import AuditLogService
 from bisheng.api.services.workflow import WorkFlowService

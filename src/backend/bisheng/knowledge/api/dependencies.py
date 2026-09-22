@@ -1,6 +1,11 @@
 from typing import TYPE_CHECKING
 
 from fastapi import Depends, Request
+
+if TYPE_CHECKING:
+    from bisheng.knowledge.domain.services.knowledge_file_visibility_service import (
+        KnowledgeFileVisibilityService,
+    )
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from bisheng.common.dependencies.core_deps import get_db_session

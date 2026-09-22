@@ -2,7 +2,7 @@ import os
 import sys
 
 import requests
-# from bisheng.database.models.knowledge import KnowledgeCreate
+from bisheng.knowledge.domain.models.knowledge import KnowledgeCreate
 
 parent_dir = os.path.dirname(os.path.abspath(__file__)).replace('test', '')
 sys.path.append(parent_dir)

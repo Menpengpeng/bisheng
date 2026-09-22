@@ -1,5 +1,6 @@
 from bisheng.workflow.common.node import NodeType
 from bisheng.workflow.nodes.agent.agent import AgentNode
+from bisheng.workflow.nodes.base import BaseNode
 from bisheng.workflow.nodes.code.code import CodeNode
 from bisheng.workflow.nodes.condition.condition import ConditionNode
 from bisheng.workflow.nodes.end.end import EndNode
@@ -32,11 +33,11 @@ NODE_CLASS_MAP = {
 
 class NodeFactory:
     @classmethod
-    def get_node_class(cls, node_type: str) -> 'BaseNode':
+    def get_node_class(cls, node_type: str) -> BaseNode:
         return NODE_CLASS_MAP.get(node_type)
 
     @classmethod
-    def instance_node(cls, node_type: str, **kwargs) -> 'BaseNode':
+    def instance_node(cls, node_type: str, **kwargs) -> BaseNode:
         node_class = cls.get_node_class(node_type)
         if node_class is None:
             raise Exception(f'Unknown node type:{node_type}')

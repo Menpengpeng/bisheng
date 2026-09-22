@@ -1,8 +1,11 @@
 import functools
 import time
 from datetime import datetime
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from bisheng.llm.domain.llm.base import BishengBase
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import ChatGenerationChunk, ChatResult, GenerationChunk
