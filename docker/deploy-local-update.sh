@@ -3,7 +3,7 @@
 # BiSheng 本地构建产物一键部署脚本
 # 用法: ./deploy-local-update.sh [选项]
 #
-# 适用场景：从开发机构建的镜像 tar + 前端 zip 部署到服务器 Docker 环境
+# 适用场景：从开发机构建的镜像 tar + 前端归档（tar.gz/zip）部署到服务器 Docker 环境
 # 处理的异常情况：
 #   1. 上传文件不存在 / 大小为 0
 #   2. docker load 失败（tar 损坏）
@@ -21,7 +21,9 @@ set -euo pipefail
 # ─── 配置 ────────────────────────────────────────────────────
 UPLOAD_DIR="${UPLOAD_DIR:-/home/gs/tmp}"
 BACKEND_TAR="${BACKEND_TAR:-$UPLOAD_DIR/bisheng-backend-dev-local.tar}"
-FRONTEND_ZIP="${FRONTEND_ZIP:-$UPLOAD_DIR/bisheng-platform-frontend.zip}"
+# 前端归档：优先 tar.gz（Windows Compress-Archive 生成的 zip 路径分隔符不合规，
+# 会被 Linux unzip 报警告；tar.gz 不受影响）。也兼容 .zip。
+FRONTEND_ARCHIVE="${FRONTEND_ARCHIVE:-$UPLOAD_DIR/bisheng-platform-frontend.tar.gz}"
 COMPOSE_DIR="${COMPOSE_DIR:-/opt/bisheng/docker}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-bisheng}"
 TEMP_DIR="${TEMP_DIR:-/tmp/bisheng-deploy-$$}"
@@ -95,25 +97,32 @@ check_prerequisites() {
     fi
     info "Compose 目录: $COMPOSE_DIR"
 
-    # 上传文件存在性 + 大小
+    # 上传文件存在性 + 大小（只校验本次实际会用到的文件）
     local missing=()
-    [[ ! -s "$BACKEND_TAR" ]] && missing+=("$BACKEND_TAR")
-    [[ ! -s "$FRONTEND_ZIP" ]] && missing+=("$FRONTEND_ZIP")
+    if [[ -z "${SKIP_BACKEND:-}" ]]; then
+        [[ ! -s "$BACKEND_TAR" ]] && missing+=("$BACKEND_TAR")
+    fi
+    if [[ -z "${SKIP_FRONTEND:-}" ]]; then
+        [[ ! -s "$FRONTEND_ARCHIVE" ]] && missing+=("$FRONTEND_ARCHIVE")
+    fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         error "以下文件不存在或大小为 0："
         printf '  - %s\n' "${missing[@]}"
         error "请先从开发机上传："
-        error "  scp bisheng-backend-dev-local.tar gs@<server>:$UPLOAD_DIR/"
-        error "  scp bisheng-platform-frontend.zip gs@<server>:$UPLOAD_DIR/"
+        [[ -z "${SKIP_BACKEND:-}" ]] && \
+            error "  scp bisheng-backend-dev-local.tar gs@<server>:$UPLOAD_DIR/"
+        [[ -z "${SKIP_FRONTEND:-}" ]] && \
+            error "  scp bisheng-platform-frontend.tar.gz gs@<server>:$UPLOAD_DIR/"
         exit 1
     fi
 
-    local tar_size zip_size
-    tar_size=$(du -h "$BACKEND_TAR" | cut -f1)
-    zip_size=$(du -h "$FRONTEND_ZIP" | cut -f1)
-    info "后端镜像 tar: $BACKEND_TAR ($tar_size)"
-    info "前端产物 zip: $FRONTEND_ZIP ($zip_size)"
+    if [[ -z "${SKIP_BACKEND:-}" ]]; then
+        info "后端镜像 tar: $BACKEND_TAR ($(du -h "$BACKEND_TAR" | cut -f1))"
+    fi
+    if [[ -z "${SKIP_FRONTEND:-}" ]]; then
+        info "前端产物归档: $FRONTEND_ARCHIVE ($(du -h "$FRONTEND_ARCHIVE" | cut -f1))"
+    fi
 }
 
 # ─── 网络一致性检查 ───────────────────────────────────────────
@@ -224,16 +233,56 @@ wait_backend_healthy() {
     exit 1
 }
 
+# ─── 解压前端归档（tar.gz / zip 自动识别）────────────────────
+extract_frontend() {
+    local archive="$1" dest="$2"
+    mkdir -p "$dest"
+
+    case "$archive" in
+        *.tar.gz|*.tgz)
+            info "归档格式: tar.gz"
+            if ! tar -xzf "$archive" -C "$dest"; then
+                error "tar 解压失败，归档可能损坏: $archive"
+                exit 1
+            fi
+            ;;
+        *.zip)
+            info "归档格式: zip"
+            # unzip 遇到可恢复的警告（如条目路径含反斜杠）会返回退出码 1，
+            # 但文件其实已正常提取；只有 >=2 才是真正的失败。旧逻辑用 `if ! unzip`
+            # 把退出码 1 误判为失败，导致前端部署中断，此处修正。
+            local rc=0
+            unzip -o -q "$archive" -d "$dest" || rc=$?
+            if [[ $rc -gt 1 ]]; then
+                error "unzip 解压失败（退出码 $rc），zip 文件可能损坏: $archive"
+                exit 1
+            fi
+            [[ $rc -eq 1 ]] && warn "unzip 返回退出码 1（有警告，文件已提取），继续"
+            ;;
+        *)
+            error "不支持的前端归档格式: $archive（仅支持 .tar.gz / .tgz / .zip）"
+            exit 1
+            ;;
+    esac
+
+    # 校验：解压结果不允许出现含字面反斜杠的路径名
+    # （Windows Compress-Archive 生成的 zip 用 `\` 做分隔符，Linux 下会解出畸形文件名）
+    local bad
+    bad=$(find "$dest" -name '*\\*' -print -quit 2>/dev/null || true)
+    if [[ -n "$bad" ]]; then
+        error "解压结果存在含反斜杠的路径名: $bad"
+        error "该归档由 Windows Compress-Archive 生成，路径分隔符不合规。"
+        error "请在开发机改用: tar -czf bisheng-platform-frontend.tar.gz -C build . 重新打包。"
+        exit 1
+    fi
+}
+
 # ─── 更新前端产物 ────────────────────────────────────────────
 update_frontend() {
     header "更新前端产物"
 
-    step "6/6" "解压前端 zip..."
-    mkdir -p "$TEMP_DIR"
-    if ! unzip -o -q "$FRONTEND_ZIP" -d "$TEMP_DIR"; then
-        error "unzip 失败，zip 文件可能损坏"
-        exit 1
-    fi
+    step "6/6" "解压前端归档..."
+    extract_frontend "$FRONTEND_ARCHIVE" "$TEMP_DIR"
     if [[ ! -f "$TEMP_DIR/index.html" ]]; then
         error "解压后未找到 index.html，构建产物可能不完整"
         exit 1
@@ -353,7 +402,7 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --backend-tar)     BACKEND_TAR="$2"; shift 2 ;;
-            --frontend-zip)    FRONTEND_ZIP="$2"; shift 2 ;;
+            --frontend-archive|--frontend-zip) FRONTEND_ARCHIVE="$2"; shift 2 ;;
             --upload-dir)      UPLOAD_DIR="$2"; shift 2 ;;
             --compose-dir)    COMPOSE_DIR="$2"; shift 2 ;;
             --no-frontend)     SKIP_FRONTEND=1; shift ;;
@@ -367,7 +416,8 @@ BiSheng 本地构建产物一键部署脚本
 
 选项:
   --backend-tar <path>     后端镜像 tar 路径（默认: $UPLOAD_DIR/bisheng-backend-dev-local.tar）
-  --frontend-zip <path>    前端产物 zip 路径（默认: $UPLOAD_DIR/bisheng-platform-frontend.zip）
+  --frontend-archive <path> 前端产物归档路径（默认: $UPLOAD_DIR/bisheng-platform-frontend.tar.gz）
+  --frontend-zip <path>    --frontend-archive 的别名（兼容旧用法，支持 .zip）
   --upload-dir <path>      上传目录（默认: $UPLOAD_DIR）
   --compose-dir <path>     compose 目录（默认: $COMPOSE_DIR）
   --no-frontend            跳过前端更新（只更新后端）
@@ -376,7 +426,7 @@ BiSheng 本地构建产物一键部署脚本
   -h, --help               显示帮助
 
 环境变量（可覆盖默认值）:
-  UPLOAD_DIR, BACKEND_TAR, FRONTEND_ZIP, COMPOSE_DIR, COMPOSE_PROJECT
+  UPLOAD_DIR, BACKEND_TAR, FRONTEND_ARCHIVE, COMPOSE_DIR, COMPOSE_PROJECT
   BACKEND_HEALTH_TIMEOUT, FINAL_IMAGE_TAG, SOURCE_IMAGE_TAG
 
 示例:

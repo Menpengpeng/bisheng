@@ -172,18 +172,21 @@ pnpm install --frozen-lockfile
 # 构建（产物输出到 build/ 目录，不是 dist/）
 pnpm build
 
-# 打包 build 产物
-Compress-Archive -Path build\* -DestinationPath bisheng-platform-frontend.tar.zip -Force
+# 打包 build 产物（用 tar.gz，不要用 Compress-Archive）
+# 注意：PowerShell 的 Compress-Archive 生成的 zip 用反斜杠 `\` 作路径分隔符，
+# 违反 zip 规范，Linux unzip 会报警告（退出码 1）、甚至解出畸形文件名。
+# Windows 自带的 tar（bsdtar）始终使用 `/` 分隔符，跨平台可靠。
+tar -czf bisheng-platform-frontend.tar.gz -C build .
 ```
 
-产物路径：`src/frontend/platform/bisheng-platform-frontend.tar.zip`（约 20MB）
+产物路径：`src/frontend/platform/bisheng-platform-frontend.tar.gz`（约 21MB）
 
 ⚠️ **注意**：vite.config.mts 中 `outDir: "build"`，不是 `dist`。
 
 ### 4.2 上传到部署服务器
 
 ```powershell
-scp e:\myCode\gitHub\bisheng\src\frontend\platform\bisheng-platform-frontend.tar.zip gs@10.100.202.223:/home/gs/tmp/
+scp e:\myCode\gitHub\bisheng\src\frontend\platform\bisheng-platform-frontend.tar.gz gs@10.100.202.223:/home/gs/tmp/
 ```
 
 ### 4.3 在服务器更新前端产物
@@ -193,8 +196,7 @@ sudo su
 
 # 解压到临时目录
 mkdir -p /tmp/bisheng-platform-frontend
-cd /tmp/bisheng-platform-frontend
-unzip -o /home/gs/tmp/bisheng-platform-frontend.tar.zip -d .
+tar -xzf /home/gs/tmp/bisheng-platform-frontend.tar.gz -C /tmp/bisheng-platform-frontend
 
 # 备份旧前端（带时间戳，可选但推荐）
 docker exec bisheng-frontend mv /usr/share/nginx/html/platform /usr/share/nginx/html/platform.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null
@@ -395,13 +397,13 @@ docker logs bisheng-backend-worker --tail 10
 # 在服务器
 rm -rf /tmp/bisheng-platform-frontend
 rm -f /home/gs/tmp/bisheng-backend-dev-local.tar
-rm -f /home/gs/tmp/bisheng-platform-frontend.tar.zip
+rm -f /home/gs/tmp/bisheng-platform-frontend.tar.gz
 ```
 
 ```powershell
 # 在开发机（可选）
 del e:\myCode\gitHub\bisheng\bisheng-backend-dev-local.tar
-del e:\myCode\gitHub\bisheng\src\frontend\platform\bisheng-platform-frontend.tar.zip
+del e:\myCode\gitHub\bisheng\src\frontend\platform\bisheng-platform-frontend.tar.gz
 ```
 
 ---
@@ -508,7 +510,7 @@ docker exec bisheng-frontend nginx -t
 
 ### F5: 前端打包路径错误
 
-**现象**：
+**现象**（历史，使用 Compress-Archive 时）：
 
 ```
 Compress-Archive : 路径"dist\*"不存在
@@ -516,10 +518,11 @@ Compress-Archive : 路径"dist\*"不存在
 
 **原因**：vite.config.mts 配置 `outDir: "build"`，产物在 `build/` 目录不是 `dist/`。
 
-**解决**：
+**解决**：用 tar 打包（不再使用 Compress-Archive）：
 
 ```powershell
-Compress-Archive -Path build\* -DestinationPath bisheng-platform-frontend.tar.zip -Force
+cd e:\myCode\gitHub\bisheng\src\frontend\platform
+tar -czf bisheng-platform-frontend.tar.gz -C build .
 ```
 
 ### F6: SSH 用户权限不足
@@ -534,6 +537,23 @@ sudo su
 usermod -aG docker gs
 # 加组后需重新登录生效
 ```
+
+### F7: 前端 zip 解压失败（反斜杠分隔符）
+
+**现象**（部署脚本前端步骤中断）：
+
+```
+warning:  /home/gs/tmp/bisheng-platform-frontend.zip appears to use backslashes as path separators
+[ERROR] unzip 失败，zip 文件可能损坏
+```
+
+**原因**（两层）：
+1. PowerShell `Compress-Archive` 生成的 zip 用反斜杠 `\` 作路径分隔符，违反 zip 规范；
+2. Linux `unzip` 对"可恢复警告"返回**退出码 1**（文件其实已提取），旧脚本 `if ! unzip` 把 1 误判为失败。
+
+**解决**：
+- 改用 `tar -czf` 打包（Windows 自带 `tar` 始终用 `/` 分隔符）；
+- `deploy-local-update.sh` 已修复：自动识别 `.tar.gz/.zip`，zip 分支只把退出码 `>1` 当失败，并校验解压结果无字面反斜杠路径。
 
 ---
 
@@ -695,8 +715,7 @@ curl http://localhost:7860/health
 
 echo "===== 4. 更新前端产物 ====="
 mkdir -p /tmp/bisheng-platform-frontend
-cd /tmp/bisheng-platform-frontend
-unzip -o /home/gs/tmp/bisheng-platform-frontend.tar.zip -d .
+tar -xzf /home/gs/tmp/bisheng-platform-frontend.tar.gz -C /tmp/bisheng-platform-frontend
 docker exec bisheng-frontend mv /usr/share/nginx/html/platform /usr/share/nginx/html/platform.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null || true
 docker cp /tmp/bisheng-platform-frontend/. bisheng-frontend:/usr/share/nginx/html/platform/
 docker exec bisheng-frontend nginx -s reload
@@ -709,7 +728,7 @@ curl -s http://localhost:3001/api/v1/env
 echo "===== 6. 清理 ====="
 rm -rf /tmp/bisheng-platform-frontend
 rm -f /home/gs/tmp/bisheng-backend-dev-local.tar
-rm -f /home/gs/tmp/bisheng-platform-frontend.tar.zip
+rm -f /home/gs/tmp/bisheng-platform-frontend.tar.gz
 
 echo "===== 部署完成 ====="
 ```
