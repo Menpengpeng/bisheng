@@ -61,7 +61,7 @@ class ToolServices(BaseModel):
         """Get a list of tools visible to users"""
         total_start = perf_counter()
         current_tid = get_current_tenant_id() or DEFAULT_TENANT_ID
-        if self._is_scoped_super_admin():
+        if self.login_user.is_admin() or self._is_scoped_super_admin():
             scoped_preset = ToolPresetType(is_preset) if is_preset is not None else None
             all_tool_type = await GptsToolsDao.aget_tenant_tool_type(
                 current_tid,

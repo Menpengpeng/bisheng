@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from enum import IntEnum
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,6 +9,8 @@ import pytest
 
 
 def _load_tool_service_module():
+    from bisheng.database.models.role_access import AccessType
+
     service_dir = Path(__file__).resolve().parents[2] / 'bisheng' / 'tool' / 'domain' / 'services'
     stubbed = [
         'bisheng.api.services.audit_log',
@@ -75,7 +78,6 @@ def _load_tool_service_module():
         sys.modules['bisheng.database.models.group_resource'] = group_resource_module
 
         role_access_module = ModuleType('bisheng.database.models.role_access')
-        from bisheng.database.models.role_access import AccessType
         role_access_module.AccessType = AccessType
         sys.modules['bisheng.database.models.role_access'] = role_access_module
 
@@ -100,6 +102,10 @@ def _load_tool_service_module():
             @staticmethod
             async def filter_tool_ids_by_permission_async(login_user, tool_ids, permission_id):
                 return tool_ids
+
+            @staticmethod
+            async def get_tool_permission_map_async(login_user, tool_ids, permission_ids):
+                return {}
 
             @staticmethod
             async def has_any_permission_async(login_user, tool_type_id, permission_ids):
@@ -173,6 +179,49 @@ def _load_tool_service_module():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('is_preset', [0, 2])
+async def test_root_admin_lists_all_tenant_api_and_mcp_tools(is_preset):
+    tool_module = _load_tool_service_module()
+
+    class ToolPresetType(IntEnum):
+        API = 0
+        PRESET = 1
+        MCP = 2
+
+    login_user = SimpleNamespace(
+        user_id=5,
+        is_admin=lambda: True,
+        is_global_super=True,
+        aget_user_access_resource_ids=AsyncMock(
+            side_effect=AssertionError('admin must not filter accessible ids'),
+        ),
+    )
+    service = tool_module.ToolServices(request=None, login_user=login_user)
+    other_user_tool = SimpleNamespace(id=21, user_id=2, mask_sensitive_data=lambda: None)
+
+    with patch.object(tool_module, 'ToolPresetType', ToolPresetType), patch.object(
+        tool_module, 'get_current_tenant_id', return_value=1,
+    ), patch.object(
+        tool_module.GptsToolsDao, 'aget_tenant_tool_type',
+        new_callable=AsyncMock, return_value=[other_user_tool], create=True,
+    ) as list_tenant_tools, patch.object(
+        tool_module.GptsToolsDao, 'aget_user_tool_type', new_callable=AsyncMock,
+    ) as list_user_tools, patch.object(
+        tool_module.GptsToolsDao, 'aget_list_by_type', new_callable=AsyncMock, return_value=[],
+    ):
+        result = await service.get_tool_list(is_preset=is_preset, permission_id='view_tool')
+
+    assert [tool.id for tool in result] == [21]
+    assert result[0].write is True
+    assert result[0].delete is True
+    list_tenant_tools.assert_awaited_once_with(
+        1, include_preset=False, is_preset=ToolPresetType(is_preset),
+    )
+    list_user_tools.assert_not_awaited()
+    login_user.aget_user_access_resource_ids.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_get_tool_list_filters_by_use_tool_and_sets_write_from_edit_tool():
     tool_module = _load_tool_service_module()
     ToolServices = tool_module.ToolServices
@@ -192,8 +241,13 @@ async def test_get_tool_list_filters_by_use_tool_and_sets_write_from_edit_tool()
         tool_module.ToolPermissionService,
         'filter_tool_ids_by_permission_async',
         new_callable=AsyncMock,
-        side_effect=[['2'], ['2'], ['2']],
+        return_value=['2'],
     ) as mock_filter_ids, patch.object(
+        tool_module.ToolPermissionService,
+        'get_tool_permission_map_async',
+        new_callable=AsyncMock,
+        return_value={'2': {'edit_tool', 'delete_tool'}},
+    ) as mock_permission_map, patch.object(
         tool_module.GptsToolsDao,
         'aget_user_tool_type',
         new_callable=AsyncMock,
@@ -211,11 +265,8 @@ async def test_get_tool_list_filters_by_use_tool_and_sets_write_from_edit_tool()
     assert result[1].write is True
     assert getattr(result[0], 'delete', False) is False
     assert result[1].delete is True
-    assert mock_filter_ids.call_args_list[0].args[2] == 'use_tool'
-    assert mock_filter_ids.call_args_list[1].args[2] == 'edit_tool'
-    assert mock_filter_ids.call_args_list[1].args[1] == [1, 2]
-    assert mock_filter_ids.call_args_list[2].args[2] == 'delete_tool'
-    assert mock_filter_ids.call_args_list[2].args[1] == [1, 2]
+    mock_filter_ids.assert_awaited_once_with(login_user, [1, 2], 'use_tool')
+    mock_permission_map.assert_awaited_once_with(login_user, [1, 2], ['edit_tool', 'delete_tool'])
 
 
 @pytest.mark.asyncio
@@ -223,7 +274,7 @@ async def test_update_and_delete_tools_use_action_level_permissions():
     tool_module = _load_tool_service_module()
     ToolServices = tool_module.ToolServices
 
-    login_user = SimpleNamespace(user_id=7)
+    login_user = SimpleNamespace(user_id=7, is_admin=lambda: False)
     tool_service = ToolServices(request=None, login_user=login_user)
     preset_tool_type = SimpleNamespace(id=12, user_id=9, is_preset=1, extra='{}', name='tool')
     custom_tool_type = SimpleNamespace(id=12, user_id=9, is_preset=0, extra='{}', name='tool')

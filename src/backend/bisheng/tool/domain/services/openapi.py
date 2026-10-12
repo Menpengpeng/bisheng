@@ -70,7 +70,7 @@ class OpenApiSchema:
                     continue
 
                 if 'requestBody' in method_info:
-                    for _, content in method_info['requestBody']['content'].items():
+                    for content_type, content in method_info['requestBody']['content'].items():
                         if '$ref' in content['schema']:
                             schema_ref = content['schema']['$ref']
                             schema_name = schema_ref.split('/')[-1]
@@ -78,7 +78,21 @@ class OpenApiSchema:
                         else:
                             schema = content['schema']
 
-                        if 'properties' in schema:
+                        if schema.get('type') == 'array':
+                            items = schema.get('items', {})
+                            if '$ref' in items:
+                                item_name = items['$ref'].split('/')[-1]
+                                items = self.contents['components']['schemas'][item_name]
+                            one_api_info['body_parameter_name'] = 'body'
+                            one_api_info['content_type'] = content_type
+                            one_api_info['parameters'].append({
+                                'name': 'body',
+                                'description': schema.get('description', 'JSON request body'),
+                                'in': 'body',
+                                'required': method_info['requestBody'].get('required', False),
+                                'schema': {'type': 'array', 'items': items},
+                            })
+                        elif 'properties' in schema:
                             for param_name, param_info in schema['properties'].items():
                                 param = {
                                     'name': param_name,
@@ -88,7 +102,8 @@ class OpenApiSchema:
                                     'schema': {
                                         'type': param_info.get('type', 'string'),
                                         'title': param_info.get('title', param_name),
-                                        'properties': param_info.get('properties', {})
+                                        'properties': param_info.get('properties', {}),
+                                        'items': param_info.get('items', {}),
                                     },
                                 }
                                 one_api_info['parameters'].append(param)
@@ -120,6 +135,9 @@ class OpenApiSchema:
                 headers = {'Authorization': f'Basic {api_key}'}
             elif auth_type == AuthType.BEARER.value:
                 headers = {'Authorization': f'Bearer {api_key}'}
+
+        if extra.get('content_type'):
+            headers['Content-Type'] = extra['content_type']
 
         # Back to initialization openapiRequired input parameters
         params = {

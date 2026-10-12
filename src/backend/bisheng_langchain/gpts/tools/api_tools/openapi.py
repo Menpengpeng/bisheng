@@ -54,6 +54,17 @@ class OpenApiTools(APIToolBase):
                                      None) or self.params.get('parameter_name')
             if parameter_name:
                 params.update({parameter_name: self.api_key})
+        body_parameter_name = self.params.get('body_parameter_name')
+        if body_parameter_name:
+            json_data = json_data.get(body_parameter_name)
+            required = any(
+                one['name'] == body_parameter_name and one.get('required')
+                for one in self.params['parameters']
+            )
+            if json_data is None and not required:
+                return params, None, path_params
+            if not isinstance(json_data, list):
+                raise ValueError(f'{body_parameter_name} must be a JSON array')
         return params, json_data, path_params
 
     def parse_args_schema(self):
@@ -75,7 +86,7 @@ class OpenApiTools(APIToolBase):
             elif field_type == 'array':
                 field_info = {
                     "type": field_type,
-                    "items": one['schema'].get('items', {}).get('type', 'string'),
+                    "items": one['schema'].get('items') or {"type": "string"},
                     "description": one['description']
                 }
             elif field_type in {'object', 'dict'}:
@@ -105,7 +116,7 @@ class OpenApiTools(APIToolBase):
                     field_info["properties"][param] = object_field_info
             else:
                 raise Exception(f'schema type is not support: {field_type}')
-            args_schema[one['name']] = field_info
+            args_schema['properties'][one['name']] = field_info
         return args_schema
 
     def run(self, **kwargs) -> str:
