@@ -18,6 +18,13 @@ export const getWorkflowReportTemplate = async (key: string, flowId: string): Pr
 }
 
 /**
+ * 导入报告模板后立即落盘（复用 OnlyOffice 保存回调接口）
+ */
+export const saveWorkflowReportTemplate = async (url: string, key: string): Promise<any> => {
+    return await axios.post(`/api/v1/workflow/report/callback`, { status: 2, url, key });
+}
+
+/**
  * 创建工作流
  */
 export const createWorkflowApi = async (name, desc, url, flow): Promise<any> => {

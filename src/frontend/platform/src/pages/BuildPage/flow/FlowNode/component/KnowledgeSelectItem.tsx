@@ -89,7 +89,13 @@ export default function KnowledgeSelectItem({ data, nodeId, onChange, onVarEvent
                 group.params.forEach(param => {
                     if (param.key === 'form_input') {
                         param.value.forEach(val => {
-                            val.file_parse_mode === 'ingest_to_temp_kb' && val.type === 'file'
+                            // F038: form file_parse_mode is a fixed mode array
+                            // (e.g. [extract_text, ingest_to_temp_kb]); normalize legacy
+                            // single-string values before matching.
+                            const modes = Array.isArray(val.file_parse_mode)
+                                ? val.file_parse_mode
+                                : (val.file_parse_mode ? [val.file_parse_mode] : [])
+                            val.type === 'file' && modes.includes('ingest_to_temp_kb')
                                 && files.push({
                                     label: `${val.key}(${val.value})`,
                                     value: `${node.id}.${val.key}`

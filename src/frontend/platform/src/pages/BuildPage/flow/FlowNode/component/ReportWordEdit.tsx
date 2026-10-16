@@ -1,7 +1,7 @@
 import { LoadingIcon } from "@/components/bs-icons/loading"
 import { Button } from "@/components/bs-ui/button"
 import { DialogClose } from "@/components/bs-ui/dialog"
-import { getWorkflowReportTemplate } from "@/controllers/API/workflow"
+import { getWorkflowReportTemplate, saveWorkflowReportTemplate } from "@/controllers/API/workflow"
 import { uploadFileWithProgress } from "@/modals/UploadModal/upload"
 import Word from "@/pages/Report/components/Word"
 import { ChevronDown, ChevronLeft } from "lucide-react"
@@ -135,6 +135,8 @@ const useReport = (versionKey, flowId, onchange) => {
             uploadFileWithProgress(file, (progress) => { }).then(res => {
                 setLoading(false);
                 setDocx(docx => ({ ...docx, path: res.file_path }))
+                // 导入后立即落盘到 workflow/report/{uuid}.docx，避免离开后模板丢失
+                saveWorkflowReportTemplate(res.file_path, docx.key)
             })
         };
 
