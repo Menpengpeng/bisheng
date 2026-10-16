@@ -291,7 +291,9 @@ class InputNode(BaseNode):
         texts = []
         metadatas = []
         try:
-            file_rule = FileProcessBase(knowledge_id=0)
+            # 临时文件解析显式关闭分块重叠：避免重叠文本重复占用“解析结果长度上限”预算
+            # （否则拼接后的文本会比原文长约 10%，导致上限 20000 时实际仅覆盖约 18000 字原文）
+            file_rule = FileProcessBase(knowledge_id=0, chunk_overlap=0)
             from bisheng.knowledge.rag.pipeline.types import PipelineConfig
             from bisheng.knowledge.rag.temp_file_pipeline import TempFilePipeline
 
