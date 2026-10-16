@@ -104,6 +104,12 @@ services:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/data/bisheng:/app/data
     security_opt:
       - seccomp:unconfined
+    # 显式抬高文件描述符上限：API 进程同时持有 MySQL/Redis/Milvus/ES/MinIO/OpenFGA
+    # 等多个连接池，默认上限偏低时会触发 [Errno 24] Too many open files
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     command: sh entrypoint.sh api  # 启动api服务
     restart: on-failure
     healthcheck:
@@ -144,6 +150,13 @@ services:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/data/bisheng:/app/data
     security_opt:
       - seccomp:unconfined
+    # 工作流由该 worker 执行（entrypoint.sh worker → min_worker，-c 100 -P threads），
+    # 每跑一次工作流都会新建 LLM/向量库客户端，fd 占用高，必须抬高上限，
+    # 否则会话会直接以 [Errno 24] Too many open files 结束
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     command: sh entrypoint.sh worker  # 启动celery的异步worker服务，用来处理一些耗时的任务
     restart: on-failure
     depends_on:
