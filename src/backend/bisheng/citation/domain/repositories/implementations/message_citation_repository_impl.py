@@ -1,6 +1,8 @@
 from collections import defaultdict
 from typing import DefaultDict, Dict, List, Optional
 
+from loguru import logger
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -45,13 +47,49 @@ class MessageCitationRepositoryImpl(BaseRepositoryImpl[MessageCitation, int], Me
         """Create citations in batch."""
         if not citations:
             return []
-        return await self.bulk_save(citations)
+        try:
+            return await self.bulk_save(citations)
+        except IntegrityError:
+            # citation_id is globally unique; concurrent check-then-insert can still
+            # hit the unique index. Roll back, retry one-by-one and skip duplicates so
+            # the workflow does not fail on a repeated citation.
+            await self.session.rollback()
+            created: List[MessageCitation] = []
+            for citation in citations:
+                try:
+                    created.append(await self.save(citation))
+                except IntegrityError:
+                    await self.session.rollback()
+                    logger.warning(
+                        "skip duplicate citation_id={} for message_id={}",
+                        citation.citation_id,
+                        citation.message_id,
+                    )
+            return created
 
     def bulk_create_sync(self, citations: List[MessageCitation]) -> List[MessageCitation]:
         """Create citations in batch synchronously."""
         if not citations:
             return []
-        return self.bulk_save_sync(citations)
+        try:
+            return self.bulk_save_sync(citations)
+        except IntegrityError:
+            # citation_id is globally unique; concurrent check-then-insert can still
+            # hit the unique index. Roll back, retry one-by-one and skip duplicates so
+            # the workflow does not fail on a repeated citation.
+            self.session.rollback()
+            created: List[MessageCitation] = []
+            for citation in citations:
+                try:
+                    created.append(self.save_sync(citation))
+                except IntegrityError:
+                    self.session.rollback()
+                    logger.warning(
+                        "skip duplicate citation_id={} for message_id={}",
+                        citation.citation_id,
+                        citation.message_id,
+                    )
+            return created
 
     async def find_by_citation_ids(self, citation_ids: List[str]) -> List[MessageCitation]:
         """Find citations by multiple business citation IDs."""
@@ -64,6 +102,19 @@ class MessageCitationRepositoryImpl(BaseRepositoryImpl[MessageCitation, int], Me
             .order_by(MessageCitation.id.asc())
         )
         result = await self.session.exec(query)
+        return list(result.all())
+
+    def find_by_citation_ids_sync(self, citation_ids: List[str]) -> List[MessageCitation]:
+        """Find citations by multiple business citation IDs synchronously."""
+        if not citation_ids:
+            return []
+
+        query = (
+            select(MessageCitation)
+            .where(col(MessageCitation.citation_id).in_(citation_ids))
+            .order_by(MessageCitation.id.asc())
+        )
+        result = self.session.exec(query)
         return list(result.all())
 
     async def find_by_message_ids_grouped(self, message_ids: List[int]) -> Dict[int, List[MessageCitation]]:

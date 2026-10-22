@@ -504,6 +504,15 @@ class CitationRegistryService:
         for item in grouped_items:
             unique_items[item.citationId] = item
 
+        # citation_id is globally unique. The same citation is written from multiple
+        # messages (retriever + output node, reruns, etc.); de-duplicating only by
+        # message_id is insufficient, so also drop ids persisted anywhere in the DB to
+        # avoid a cross-message 1062.
+        globally_persisted = {
+            entity.citation_id
+            for entity in await self.repository.find_by_citation_ids(list(unique_items.keys()))
+        }
+
         entities = [
             MessageCitation(
                 citation_id=item.citationId,
@@ -516,6 +525,7 @@ class CitationRegistryService:
             )
             for item in unique_items.values()
             if item.citationId not in existing_by_citation_id
+            and item.citationId not in globally_persisted
         ]
 
         if entities:
@@ -546,6 +556,13 @@ class CitationRegistryService:
         for item in grouped_items:
             unique_items[item.citationId] = item
 
+        # Same as save_citations: citation_id is globally unique, so drop ids already
+        # persisted elsewhere before inserting.
+        globally_persisted = {
+            entity.citation_id
+            for entity in self.repository.find_by_citation_ids_sync(list(unique_items.keys()))
+        }
+
         entities = [
             MessageCitation(
                 citation_id=item.citationId,
@@ -558,6 +575,7 @@ class CitationRegistryService:
             )
             for item in unique_items.values()
             if item.citationId not in existing_by_citation_id
+            and item.citationId not in globally_persisted
         ]
 
         if entities:
