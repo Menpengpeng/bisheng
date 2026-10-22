@@ -50,7 +50,9 @@ function parseToValue(input, paramItem) {
         });
         return result;
     };
-    return traverseNodes(tempDiv);
+    // 浏览器序列化 contentEditable 时会把行首缩进空格写成 U+00A0(NBSP)，
+    // 读回时统一还原为普通空格，避免脏字符被保存进节点参数值
+    return traverseNodes(tempDiv).replace(/\u00a0/g, ' ');
 }
 
 export default function VarInput({
