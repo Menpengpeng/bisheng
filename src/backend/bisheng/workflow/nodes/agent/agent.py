@@ -262,7 +262,18 @@ class AgentNode(BaseNode):
             return []
         if not self._chat_history_num:
             return list(self._chat_history_messages)
-        return self._chat_history_messages[-self._chat_history_num :]
+        # 按对话轮次截断: 一轮从 HumanMessage 开始, 到下一轮 HumanMessage 之前结束。
+        # 轮内的 tool_calls 与 tool 响应配对结构永远不会被截断点拆开,
+        # 避免产生孤立 tool 消息触发 400: Messages with role 'tool' must be a response
+        # to a preceding message with 'tool_calls'
+        rounds: list[list[BaseMessage]] = []
+        for message in self._chat_history_messages:
+            if isinstance(message, HumanMessage) or not rounds:
+                rounds.append([message])
+            else:
+                rounds[-1].append(message)
+        recent_rounds = rounds[-self._chat_history_num :]
+        return [message for one_round in recent_rounds for message in one_round]
 
     def _append_chat_history_messages(self, messages: list[BaseMessage]) -> None:
         if not messages:

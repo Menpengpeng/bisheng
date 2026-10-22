@@ -466,7 +466,7 @@
       },
       "chat_history_flag": {
         "label": "Chat History",
-        "help": "Number of past messages to include as context. 0 disables context."
+        "help": "Number of past conversation rounds to include as context. 0 disables context."
       },
       "image_prompt": {
         "label": "Image Input",
