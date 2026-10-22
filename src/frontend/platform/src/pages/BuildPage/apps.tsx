@@ -207,6 +207,8 @@ export default function apps() {
                     }
                 }
                 delete (payload as any).id;
+                // 复制后的上下线状态与新建保持一致，默认下线，不继承复制源状态
+                delete (payload as any).status;
                 const res = await captureAndAlertRequestErrorHoc(
                     createWorkflowApi(payload.name, payload.description || '', payload.logo || '', payload)
                 );
