@@ -42,12 +42,14 @@ export default function Header({ loca, onSave, onLine, onTabChange, canEdit: can
     useEffect(() => {
         if (needSaveRef.current) {
             needSaveRef.current = false
-            onSave()
+            // 保存成功才关闭弹窗，失败时保持打开，避免用户编辑信息丢失
+            Promise.resolve(onSave()).then((res) => {
+                if (res) setEditShow(false)
+            })
         }
     }, [assistantState])
     const handleEditSave = (form) => {
         dispatchAssistant('setBaseInfo', form)
-        setEditShow(false)
         needSaveRef.current = true
     }
 

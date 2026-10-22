@@ -69,7 +69,7 @@ export default function editAssistant() {
     const handleSave = async (showMessage = false) => {
         if (!canEdit) return
         if (!handleCheck()) return
-        await captureAndAlertRequestErrorHoc(saveAssistanttApi({
+        const res = await captureAndAlertRequestErrorHoc(saveAssistanttApi({
             ...assistantState,
             flow_list: assistantState.flow_list.map(item => item.id),
             tool_list: assistantState.tool_list.map(item => item.id),
@@ -77,14 +77,17 @@ export default function editAssistant() {
             guide_question: assistantState.guide_question.filter((item) => item),
             logo: assistantState.viewLogo ? assistantState.logo : '',
         })).then(res => {
-            if (!res) return
+            if (!res) return res
             showMessage && message({
                 title: t('prompt'),
                 variant: 'success',
                 description: t('skills.saveSuccessful')
             })
+            return res
         })
         saveAfter()
+        // 返回保存结果，失败时编辑弹窗保持打开
+        return res
     }
 
     // Publish assistant online

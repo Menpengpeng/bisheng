@@ -467,7 +467,8 @@ const Header = ({ flow, nodes, onTabChange, preFlow, onPreFlowChange, onImportFl
             <ChatTest ref={testRef} />
             {/* 修改应用弹窗 flow&assistant */}
             <CreateApp ref={updateAppModalRef} loca={loca} onSave={(base) => {
-                captureAndAlertRequestErrorHoc(onlineWorkflow({
+                // 返回保存结果，失败时弹窗保持打开（captureAndAlertRequestErrorHoc 失败时返回 false）
+                return captureAndAlertRequestErrorHoc(onlineWorkflow({
                     ...f,
                     ...base,
                     logo: base.viewUrl ? base.logo : '' // When there is no change, the value is empty 
@@ -476,6 +477,7 @@ const Header = ({ flow, nodes, onTabChange, preFlow, onPreFlowChange, onImportFl
                     f.description = base.description
                     f.logo = base.logo
                     setFlow({ ...f, ...base })
+                    return res
                 }))
             }} />
             {/* 上线不可修改提示 */}

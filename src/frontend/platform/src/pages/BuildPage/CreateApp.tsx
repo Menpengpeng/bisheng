@@ -142,14 +142,16 @@ ${t('build.exampleTwo', { ns: 'bs' })}
 
             setLoading(true);
             if (isEditMode) {
-                setLoading(false);
-                setOpen(false);
-                return onSave({
+                const res = await onSave({
                     name: formData.name,
                     description: formData.desc,
                     logo: formData.url,
                     viewUrl: formData.viewUrl,
                 })
+                setLoading(false);
+                // 保存失败时保持弹窗打开，避免用户编辑信息丢失
+                if (res) setOpen(false);
+                return
             }
 
             if (tempDataRef.current) {
