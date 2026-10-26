@@ -119,7 +119,7 @@ export default function apps() {
     // request automatically; `filterData({tag_id|type|status: ...})` then
     // mutates paramsRef and triggers a fresh first-page load.
     const { data: dataSource, loading, hasMore, search, reload, loadMore, filterData, refreshData } = useInfiniteCursorTable<FlowType>(
-        { pageSize: 14, cancelLoadingWhenReload: true, managed: true },
+        { pageSize: 20, cancelLoadingWhenReload: true, managed: true },
         (param) => getAppsApi({
             cursor: param.cursor,
             pageSize: param.pageSize,
