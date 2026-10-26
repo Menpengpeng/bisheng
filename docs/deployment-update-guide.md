@@ -183,10 +183,22 @@ tar -czf bisheng-platform-frontend.tar.gz -C build .
 
 ⚠️ **注意**：vite.config.mts 中 `outDir: "build"`，不是 `dist`。
 
+**client 应用**（终端用户聊天 UI，`/workspace` 路径）改动时同样流程，在 `src/frontend/client` 下执行：
+
+```powershell
+cd e:\myCode\gitHub\bisheng\src\frontend\client
+pnpm build
+tar -czf bisheng-client-frontend.tar.gz -C build .
+```
+
+产物部署到容器 `/usr/share/nginx/html/client/`（nginx 中 `location /workspace/` 的 alias）。
+
 ### 4.2 上传到部署服务器
 
 ```powershell
 scp e:\myCode\gitHub\bisheng\src\frontend\platform\bisheng-platform-frontend.tar.gz gs@10.100.202.223:/home/gs/tmp/
+# client 有改动时再传：
+scp e:\myCode\gitHub\bisheng\src\frontend\client\bisheng-client-frontend.tar.gz gs@10.100.202.223:/home/gs/tmp/
 ```
 
 ### 4.3 在服务器更新前端产物
@@ -691,7 +703,9 @@ backend:
 
 ### 10.4 一次性完整部署脚本（服务器侧）
 
-假设镜像和前端产物已上传到 `/home/gs/tmp/`：
+假设镜像和前端产物已上传到 `/home/gs/tmp/`。
+
+> ⚠️ 实际部署请优先使用仓库脚本 `docker/deploy-local-update.sh`（支持 client 前端、健康检查轮询、异常处理与备份清理；`--no-platform` / `--no-client` 可跳过无改动的前端）。下面是等价的手工简化版，仅作流程参考：
 
 ```bash
 #!/bin/bash
@@ -741,3 +755,4 @@ echo "===== 部署完成 ====="
 |------|---------|
 | 2026-07-24 | 初版，整理后端镜像构建、前端产物部署、nginx 动态解析修复 |
 | 2026-08-17 | 补充实际部署踩坑案例（F1-F6），加入完整部署脚本和验证清单 |
+| 2026-10-24 | `deploy-local-update.sh` 支持 client 前端（`/workspace`）：`--client-archive` / `--no-platform` / `--no-client`；文档补 client 打包部署流程 |

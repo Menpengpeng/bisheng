@@ -4,6 +4,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import Integer, String
+from sqlalchemy.dialects import mysql
+from sqlalchemy.exc import ArgumentError
 
 from bisheng.common.errcode.flow import (
     DbConnectionFailedError,
@@ -45,6 +48,8 @@ def _params(engine='mysql', tables=None, cache_on=False, ttl=None):
 class FakeEngine:
     def __init__(self):
         self.disposed = 0
+        # DDL compilation needs a real dialect; which one is irrelevant here.
+        self.dialect = mysql.dialect()
 
     def dispose(self):
         self.disposed += 1
@@ -185,6 +190,65 @@ def test_get_schema_ddl_disposes_connection(captured_from_uri):
     finally:
         u.SQLDatabase.from_uri = original
     assert instances and instances[0]._engine.disposed == 1
+
+
+class FakeInspector:
+    """Minimal Inspector exposing only what the column-only DDL fallback needs."""
+
+    def __init__(self, columns, pk=('id',)):
+        self._columns = columns
+        self._pk = list(pk)
+
+    def get_columns(self, table_name, schema=None):
+        return self._columns
+
+    def get_pk_constraint(self, table_name, schema=None):
+        return {'constrained_columns': list(self._pk)}
+
+
+class DupFkSQLDatabase(FakeSQLDatabase):
+    """DM8 style: reflection aborts because one FK name exists in many schemas."""
+
+    def __init__(self, tables):
+        super().__init__(tables)
+        self._schema = None
+        self._inspector = FakeInspector([
+            {'name': 'id', 'type': Integer(), 'nullable': False, 'comment': None},
+            {'name': 'name', 'type': String(20), 'nullable': True, 'comment': '中文注释'},
+        ])
+
+    def get_table_info(self, table_names, get_col_comments=False):
+        raise ArgumentError(
+            'ForeignKeyConstraint with duplicate source column references are not supported.')
+
+
+def test_dup_fk_reflection_falls_back_to_column_ddl(monkeypatch):
+    import langchain_community.utilities as u
+
+    db = DupFkSQLDatabase(['users'])
+    monkeypatch.setattr(u.SQLDatabase, 'from_uri',
+                        staticmethod(lambda uri, engine_args=None, **kw: db))
+    result = get_schema_ddl(_params('dm', tables=['users']), ['users'])
+    assert result.found == ['users']
+    assert 'CREATE TABLE users' in result.ddl
+    assert 'id INTEGER NOT NULL' in result.ddl
+    assert 'PRIMARY KEY (id)' in result.ddl
+    assert '中文注释' in result.ddl
+    assert db._engine.disposed == 1
+
+
+def test_unrelated_argument_error_still_propagates(monkeypatch):
+    import langchain_community.utilities as u
+
+    class OtherErrorDatabase(DupFkSQLDatabase):
+        def get_table_info(self, table_names, get_col_comments=False):
+            raise ArgumentError('some unrelated reflection problem')
+
+    db = OtherErrorDatabase(['users'])
+    monkeypatch.setattr(u.SQLDatabase, 'from_uri',
+                        staticmethod(lambda uri, engine_args=None, **kw: db))
+    with pytest.raises(ArgumentError):
+        get_schema_ddl(_params('dm', tables=['users']), ['users'])
 
 
 def test_list_tables_and_truncated_flag(monkeypatch):

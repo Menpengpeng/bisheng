@@ -1,8 +1,8 @@
 /**
  * ToolCallDisplay — compact horizontal row representing one agent tool call.
  *
- * Inflight  : `⏳ 正在调用 {display_name} 工具` (no chips)
- * Finished  : `✓ 已{动作}{类别} ({N} 个结果)` + inline chip badges for each result
+ * Inflight  : `⏳ 正在调用 {display_name}（已用 N 秒）` (no chips)
+ * Finished  : `✓ 已{动作}{类别} ({N} 个结果)（用时 N 秒）` + inline chip badges for each result
  * Failed    : `⚠️ {display_name} 失败: {error}`
  *
  * 3 variants via `tool_type`:
@@ -13,9 +13,10 @@
 import { Outlined } from "bisheng-icons";
 import { AlertCircle } from "lucide-react";
 import { memo, useEffect, useState, type FC } from "react";
+import { useElapsedTicker } from "~/components/Linsight/Execution/useElapsedTicker";
 import type { AgentToolCall } from "~/api/chatApi";
 import { useLocalize } from "~/hooks";
-import { cn } from "~/utils";
+import { cn, formatSeconds } from "~/utils";
 
 export interface ToolCallDisplayProps {
     toolCall: AgentToolCall;
@@ -237,6 +238,18 @@ const variantStyles = {
 
 const ToolCallDisplay: FC<ToolCallDisplayProps> = memo(({ toolCall, showConnector = false }) => {
     const localize = useLocalize();
+    // Live elapsed clock while the tool runs (100ms cadence, same hook as
+    // DeepThinkingGroup); freezes at ended_at - started_at after the end event.
+    const { elapsedMs } = useElapsedTicker(
+        toolCall.started_at,
+        toolCall.ended_at,
+        !!toolCall.inflight,
+    );
+    // Finished rows prefer the backend-stamped duration_ms, falling back to
+    // the ticker's frozen wall-clock span (frontend-stamped live rows).
+    const finalMs = toolCall.inflight ? 0 : (toolCall.duration_ms ?? elapsedMs);
+    const showElapsed = !!toolCall.inflight && elapsedMs > 0;
+    const showDuration = !toolCall.inflight && !toolCall.error && finalMs > 0;
     const variant = classifyToolType(toolCall);
     const rawResults = toolCall.error ? [] : parseResults(toolCall.results);
     // Per v2.5 spec §3:
@@ -328,6 +341,16 @@ const ToolCallDisplay: FC<ToolCallDisplayProps> = memo(({ toolCall, showConnecto
                     )}
                 >
                     <span>{label}</span>
+                    {showElapsed && (
+                        <span>
+                            （{localize("com_tools_elapsed_seconds", { seconds: formatSeconds(elapsedMs) })}）
+                        </span>
+                    )}
+                    {showDuration && (
+                        <span>
+                            （{localize("com_tools_duration_seconds", { seconds: formatSeconds(finalMs) })}）
+                        </span>
+                    )}
                     {!toolCall.inflight &&
                         !toolCall.error &&
                         variant !== "tool" &&

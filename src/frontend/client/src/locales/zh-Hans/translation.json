@@ -823,6 +823,8 @@
   "com_tools_knowledge_search": "知识库检索",
   "com_tools_generic_fallback": "工具",
   "com_tools_result_count": "{{count}} 个结果",
+  "com_tools_elapsed_seconds": "已用 {{seconds}} 秒",
+  "com_tools_duration_seconds": "用时 {{seconds}} 秒",
   "com_ui_accept": "我接受",
   "com_ui_add": "添加",
   "com_ui_add_multi_conversation": "添加多个对话",

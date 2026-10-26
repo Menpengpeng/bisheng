@@ -23,7 +23,10 @@ UPLOAD_DIR="${UPLOAD_DIR:-/home/gs/tmp}"
 BACKEND_TAR="${BACKEND_TAR:-$UPLOAD_DIR/bisheng-backend-dev-local.tar}"
 # 前端归档：优先 tar.gz（Windows Compress-Archive 生成的 zip 路径分隔符不合规，
 # 会被 Linux unzip 报警告；tar.gz 不受影响）。也兼容 .zip。
+# platform → /usr/share/nginx/html/platform（管理/构建端 UI，端口 3001 首页）
+# client   → /usr/share/nginx/html/client（终端用户聊天 UI，/workspace 路径）
 FRONTEND_ARCHIVE="${FRONTEND_ARCHIVE:-$UPLOAD_DIR/bisheng-platform-frontend.tar.gz}"
+CLIENT_ARCHIVE="${CLIENT_ARCHIVE:-$UPLOAD_DIR/bisheng-client-frontend.tar.gz}"
 COMPOSE_DIR="${COMPOSE_DIR:-/opt/bisheng/docker}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-bisheng}"
 TEMP_DIR="${TEMP_DIR:-/tmp/bisheng-deploy-$$}"
@@ -102,8 +105,11 @@ check_prerequisites() {
     if [[ -z "${SKIP_BACKEND:-}" ]]; then
         [[ ! -s "$BACKEND_TAR" ]] && missing+=("$BACKEND_TAR")
     fi
-    if [[ -z "${SKIP_FRONTEND:-}" ]]; then
+    if [[ -z "${SKIP_FRONTEND:-}" && -z "${SKIP_PLATFORM:-}" ]]; then
         [[ ! -s "$FRONTEND_ARCHIVE" ]] && missing+=("$FRONTEND_ARCHIVE")
+    fi
+    if [[ -z "${SKIP_FRONTEND:-}" && -z "${SKIP_CLIENT:-}" ]]; then
+        [[ ! -s "$CLIENT_ARCHIVE" ]] && missing+=("$CLIENT_ARCHIVE")
     fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -112,16 +118,22 @@ check_prerequisites() {
         error "请先从开发机上传："
         [[ -z "${SKIP_BACKEND:-}" ]] && \
             error "  scp bisheng-backend-dev-local.tar gs@<server>:$UPLOAD_DIR/"
-        [[ -z "${SKIP_FRONTEND:-}" ]] && \
+        [[ -z "${SKIP_FRONTEND:-}" && -z "${SKIP_PLATFORM:-}" ]] && \
             error "  scp bisheng-platform-frontend.tar.gz gs@<server>:$UPLOAD_DIR/"
+        [[ -z "${SKIP_FRONTEND:-}" && -z "${SKIP_CLIENT:-}" ]] && \
+            error "  scp bisheng-client-frontend.tar.gz gs@<server>:$UPLOAD_DIR/"
+        error "或用 --no-platform / --no-client 跳过对应前端"
         exit 1
     fi
 
     if [[ -z "${SKIP_BACKEND:-}" ]]; then
         info "后端镜像 tar: $BACKEND_TAR ($(du -h "$BACKEND_TAR" | cut -f1))"
     fi
-    if [[ -z "${SKIP_FRONTEND:-}" ]]; then
-        info "前端产物归档: $FRONTEND_ARCHIVE ($(du -h "$FRONTEND_ARCHIVE" | cut -f1))"
+    if [[ -z "${SKIP_FRONTEND:-}" && -z "${SKIP_PLATFORM:-}" ]]; then
+        info "platform 前端归档: $FRONTEND_ARCHIVE ($(du -h "$FRONTEND_ARCHIVE" | cut -f1))"
+    fi
+    if [[ -z "${SKIP_FRONTEND:-}" && -z "${SKIP_CLIENT:-}" ]]; then
+        info "client 前端归档: $CLIENT_ARCHIVE ($(du -h "$CLIENT_ARCHIVE" | cut -f1))"
     fi
 }
 
@@ -277,17 +289,42 @@ extract_frontend() {
     fi
 }
 
+# ─── 部署单个前端应用到容器（platform / client 共用）──────────
+deploy_frontend_app() {
+    local archive="$1" app_name="$2"
+    local temp_dir="$TEMP_DIR/$app_name"
+
+    info "[$app_name] 解压归档..."
+    extract_frontend "$archive" "$temp_dir"
+    if [[ ! -f "$temp_dir/index.html" ]]; then
+        error "[$app_name] 解压后未找到 index.html，构建产物可能不完整"
+        exit 1
+    fi
+    info "[$app_name] 解压完成"
+
+    # 备份旧产物（清理历史 .bak 避免堆积）+ 拷贝新产物
+    # 注意：容器内 sh 可能是 dash/busybox，只能用 POSIX 的 [ ]，
+    # 不能用 bash 的 [[ ]]（会报 not found 导致备份被静默跳过）。
+    info "[$app_name] 备份旧产物 + 清理历史 .bak..."
+    if ! docker exec "$FRONTEND_CONTAINER" sh -c \
+        "cd /usr/share/nginx/html/ && rm -rf $app_name.bak.* 2>/dev/null; [ -d $app_name ] && mv $app_name $app_name.bak.\$(date +%Y%m%d%H%M%S); mkdir -p $app_name"; then
+        error "[$app_name] 容器内备份旧产物失败"
+        exit 1
+    fi
+
+    info "[$app_name] 拷贝新产物到容器..."
+    if ! docker cp "$temp_dir/." "$FRONTEND_CONTAINER:/usr/share/nginx/html/$app_name/"; then
+        error "[$app_name] docker cp 失败"
+        exit 1
+    fi
+    info "[$app_name] 前端产物已部署"
+}
+
 # ─── 更新前端产物 ────────────────────────────────────────────
 update_frontend() {
     header "更新前端产物"
 
-    step "6/6" "解压前端归档..."
-    extract_frontend "$FRONTEND_ARCHIVE" "$TEMP_DIR"
-    if [[ ! -f "$TEMP_DIR/index.html" ]]; then
-        error "解压后未找到 index.html，构建产物可能不完整"
-        exit 1
-    fi
-    info "前端产物解压完成"
+    step "6/6" "更新前端产物（platform + client）..."
 
     # 确保 frontend 容器运行（异常情况：容器可能已停止）
     local fe_status
@@ -312,23 +349,17 @@ update_frontend() {
         info "frontend 容器运行中"
     fi
 
-    # 备份旧产物（清理历史 .bak 避免堆积）+ 拷贝新产物
-    info "备份旧产物 + 清理历史 .bak..."
-    docker exec "$FRONTEND_CONTAINER" sh -c '
-        cd /usr/share/nginx/html/
-        rm -rf platform.bak.* 2>/dev/null || true
-        if [[ -d platform ]]; then
-            mv platform "platform.bak.$(date +%Y%m%d%H%M%S)"
-        fi
-        mkdir -p platform
-    '
-
-    info "拷贝新产物到容器..."
-    if ! docker cp "$TEMP_DIR/." "$FRONTEND_CONTAINER:/usr/share/nginx/html/platform/"; then
-        error "docker cp 失败"
-        exit 1
+    # platform（3001 首页）与 client（/workspace）相互独立，按需部署
+    if [[ -z "${SKIP_PLATFORM:-}" ]]; then
+        deploy_frontend_app "$FRONTEND_ARCHIVE" "platform"
+    else
+        info "跳过 platform 前端更新（--no-platform）"
     fi
-    info "前端产物已部署"
+    if [[ -z "${SKIP_CLIENT:-}" ]]; then
+        deploy_frontend_app "$CLIENT_ARCHIVE" "client"
+    else
+        info "跳过 client 前端更新（--no-client）"
+    fi
 
     # nginx 语法检查 + reload（关键：改了配置或更新产物后必须 reload 进程）
     info "nginx 语法检查..."
@@ -370,7 +401,22 @@ final_verification() {
     fi
     info "前端页面 200 OK"
 
-    info "3. 前端代理后端 API..."
+    # client 前端（/workspace）：本次部署了 client 才做硬校验，否则仅提示
+    info "3. client 页面（/workspace/）..."
+    local ws_code
+    ws_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/workspace/ 2>/dev/null || echo "000")
+    if [[ "$ws_code" != "200" ]]; then
+        if [[ -z "${SKIP_FRONTEND:-}" && -z "${SKIP_CLIENT:-}" ]]; then
+            error "/workspace/ 返回 $ws_code（期望 200）"
+            error "排查：docker exec $FRONTEND_CONTAINER ls /usr/share/nginx/html/client/（确认产物已拷入）"
+            exit 1
+        fi
+        warn "/workspace/ 返回 $ws_code（本次未部署 client，仅提示）"
+    else
+        info "/workspace/ 200 OK"
+    fi
+
+    info "4. 前端代理后端 API..."
     local api_code
     api_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/api/v1/env 2>/dev/null || echo "000")
     # /api/v1/env 对未登录返回 401 也算正常（说明 nginx 转发到了后端）
@@ -381,7 +427,7 @@ final_verification() {
         exit 1
     fi
 
-    info "4. 网络一致性..."
+    info "5. 网络一致性..."
     local expected_network="${COMPOSE_PROJECT}_default"
     for c in "$BACKEND_CONTAINER" "$WORKER_CONTAINER" "$FRONTEND_CONTAINER"; do
         local net
@@ -403,9 +449,12 @@ main() {
         case "$1" in
             --backend-tar)     BACKEND_TAR="$2"; shift 2 ;;
             --frontend-archive|--frontend-zip) FRONTEND_ARCHIVE="$2"; shift 2 ;;
+            --client-archive)  CLIENT_ARCHIVE="$2"; shift 2 ;;
             --upload-dir)      UPLOAD_DIR="$2"; shift 2 ;;
             --compose-dir)    COMPOSE_DIR="$2"; shift 2 ;;
             --no-frontend)     SKIP_FRONTEND=1; shift ;;
+            --no-platform)     SKIP_PLATFORM=1; shift ;;
+            --no-client)       SKIP_CLIENT=1; shift ;;
             --no-backend)      SKIP_BACKEND=1; shift ;;
             --health-timeout)  BACKEND_HEALTH_TIMEOUT="$2"; shift 2 ;;
             -h|--help)
@@ -416,22 +465,27 @@ BiSheng 本地构建产物一键部署脚本
 
 选项:
   --backend-tar <path>     后端镜像 tar 路径（默认: $UPLOAD_DIR/bisheng-backend-dev-local.tar）
-  --frontend-archive <path> 前端产物归档路径（默认: $UPLOAD_DIR/bisheng-platform-frontend.tar.gz）
+  --frontend-archive <path> platform 前端归档路径（默认: $UPLOAD_DIR/bisheng-platform-frontend.tar.gz）
+  --client-archive <path>  client 前端归档路径（默认: $UPLOAD_DIR/bisheng-client-frontend.tar.gz）
   --frontend-zip <path>    --frontend-archive 的别名（兼容旧用法，支持 .zip）
   --upload-dir <path>      上传目录（默认: $UPLOAD_DIR）
   --compose-dir <path>     compose 目录（默认: $COMPOSE_DIR）
-  --no-frontend            跳过前端更新（只更新后端）
+  --no-frontend            跳过全部前端更新（platform + client）
+  --no-platform            只跳过 platform 前端（client 仍更新）
+  --no-client              只跳过 client 前端（platform 仍更新）
   --no-backend             跳过后端更新（只更新前端）
   --health-timeout <sec>   backend 健康检查超时（默认: $BACKEND_HEALTH_TIMEOUT）
   -h, --help               显示帮助
 
 环境变量（可覆盖默认值）:
-  UPLOAD_DIR, BACKEND_TAR, FRONTEND_ARCHIVE, COMPOSE_DIR, COMPOSE_PROJECT
+  UPLOAD_DIR, BACKEND_TAR, FRONTEND_ARCHIVE, CLIENT_ARCHIVE, COMPOSE_DIR, COMPOSE_PROJECT
   BACKEND_HEALTH_TIMEOUT, FINAL_IMAGE_TAG, SOURCE_IMAGE_TAG
 
 示例:
-  $0                                          # 用默认路径部署
+  $0                                          # 默认：后端 + platform + client
   $0 --no-frontend                            # 只更新后端
+  $0 --no-platform                            # 后端 + client（platform 无改动时）
+  $0 --no-client                              # 后端 + platform（client 无改动时）
   $0 --backend-tar /tmp/custom.tar --health-timeout 180
 EOF
                 exit 0

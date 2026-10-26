@@ -18,7 +18,10 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from loguru import logger
+from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import ArgumentError
+from sqlalchemy.schema import CreateTable
 
 from bisheng.common.errcode.flow import (
     DbConnectionFailedError,
@@ -200,10 +203,15 @@ def _connect(meta: URIResult):
     try:
         # No include_tables here: a missing selected table would raise during
         # construction. Intersection is computed by the callers.
+        # lazy_table_reflection: reflect only the tables actually requested.
+        # Eager reflection loads every table (plus every referenced table) up
+        # front, which is slow on large schemas and fails the whole call when
+        # a single table cannot be reflected.
         return SQLDatabase.from_uri(
             meta.uri,
             engine_args=engine_args,
             sample_rows_in_table_info=0,
+            lazy_table_reflection=True,
         )
     except (ImportError, ModuleNotFoundError) as exc:
         logger.warning('sql schema inspect driver missing: {}', exc)
@@ -246,6 +254,49 @@ def _is_timeout(exc: Exception) -> bool:
     return 'timeout' in text or 'timed out' in text
 
 
+# DM8 returns duplicate foreign-key rows when one constraint name exists in
+# several schemas; SQLAlchemy then aborts reflection with this message.
+_DUP_FK_MARKER = 'duplicate source column references'
+
+
+def _build_ddl_from_columns(db, tables: list[str], with_comments: bool) -> str:
+    """Build ``CREATE TABLE`` DDL from column metadata only, skipping keys.
+
+    Fallback for tables SQLAlchemy cannot reflect (e.g. DM8 reports the same
+    foreign key under several schemas). The DDL is prompt context for the LLM
+    only, so dropping key clauses beats failing the whole schema fetch.
+    """
+    engine, inspector, schema = db._engine, db._inspector, db._schema
+    chunks: list[str] = []
+    for name in tables:
+        columns_info = inspector.get_columns(name, schema=schema)
+        if not columns_info:
+            continue
+        pk_info = inspector.get_pk_constraint(name, schema=schema) or {}
+        pk_columns = set(pk_info.get('constrained_columns') or [])
+        metadata = MetaData()
+        columns = [
+            Column(
+                info['name'],
+                info['type'],
+                nullable=info.get('nullable', True),
+                comment=info.get('comment'),
+            )
+            for info in columns_info
+        ]
+        pk_objs = [col for col in columns if col.name in pk_columns]
+        constraints = [PrimaryKeyConstraint(*pk_objs)] if pk_objs else []
+        table = Table(name, metadata, *columns, *constraints)
+        chunk = str(CreateTable(table).compile(engine)).rstrip()
+        if with_comments:
+            comments = {col.name: col.comment for col in table.columns if col.comment}
+            if comments:
+                chunk += f'\n\n/*\nColumn Comments: {comments}\n*/'
+        chunks.append(chunk)
+    chunks.sort()
+    return '\n\n'.join(chunks)
+
+
 def list_tables(params: SqlAgentConfig) -> tuple[list[str], bool]:
     """List usable tables for configuration-time selection.
 
@@ -283,7 +334,14 @@ def get_schema_ddl(params: SqlAgentConfig, selected_tables: list[str]) -> Schema
         if not found:
             raise DbSchemaNoValidTableError()
         with_comments = meta.dialect in _COL_COMMENT_ENGINES
-        ddl = db.get_table_info(found, get_col_comments=with_comments)
+        try:
+            ddl = db.get_table_info(found, get_col_comments=with_comments)
+        except ArgumentError as exc:
+            if _DUP_FK_MARKER not in str(exc):
+                raise
+            logger.warning('act=sql_schema_reflect_fallback engine={} tables={}',
+                           meta.dialect, len(found))
+            ddl = _build_ddl_from_columns(db, found, with_comments)
     finally:
         db._engine.dispose()
 

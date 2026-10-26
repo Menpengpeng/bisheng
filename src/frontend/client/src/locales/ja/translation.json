@@ -820,6 +820,8 @@
   "com_tools_knowledge_search": "ナレッジベース検索",
   "com_tools_generic_fallback": "ツール",
   "com_tools_result_count": "{{count}}件の結果",
+  "com_tools_elapsed_seconds": "経過 {{seconds}} 秒",
+  "com_tools_duration_seconds": "所要 {{seconds}} 秒",
   "com_ui_accept": "同意する",
   "com_ui_add": "追加",
   "com_ui_add_multi_conversation": "複数の会話を追加",
