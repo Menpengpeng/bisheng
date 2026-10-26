@@ -870,7 +870,10 @@ class KnowledgeFileDao(KnowledgeFileBase):
 
         statement = update(KnowledgeFile).where(col(KnowledgeFile.id) == file_id)
 
-        statement = statement.values(updater_id=updater_id, updater_name=updater_name)
+        # update_time is set explicitly: the DB auto-update (MySQL ON UPDATE / DM8 trigger)
+        # only fires when a column value actually changes, so re-editing as the same user
+        # would otherwise leave the document's update time unchanged.
+        statement = statement.values(updater_id=updater_id, updater_name=updater_name, update_time=datetime.now())
         with get_sync_db_session() as session:
             session.exec(statement)
             session.commit()
