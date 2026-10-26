@@ -18,7 +18,7 @@ from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader,
 )
 from loguru import logger
-from sqlalchemy import func, or_
+from sqlalchemy import Text, cast, func, or_
 from sqlmodel import select
 
 from bisheng.api.services.etl4lm_loader import Etl4lmLoader
@@ -655,9 +655,14 @@ async def list_qa_by_knowledge_id(
         count_sql = count_sql.where(QAKnowledge.status == status)
         list_sql = list_sql.where(QAKnowledge.status == status)
 
+    # questions is a JSON column: cast it to text before LIKE, otherwise the
+    # JsonType serializes the LIKE pattern into a JSON string (extra double
+    # quotes) and the condition never matches. This also covers similar questions.
+    questions_text = cast(QAKnowledge.questions, Text)
+
     if question:
-        count_sql = count_sql.where(QAKnowledge.questions.like(f"%{question}%"))
-        list_sql = list_sql.where(QAKnowledge.questions.like(f"%{question}%"))
+        count_sql = count_sql.where(questions_text.like(f"%{question}%"))
+        list_sql = list_sql.where(questions_text.like(f"%{question}%"))
 
     if answer:
         count_sql = count_sql.where(QAKnowledge.answers.like(f"%{answer}%"))
@@ -666,14 +671,14 @@ async def list_qa_by_knowledge_id(
     if keyword:
         count_sql = count_sql.where(
             or_(
-                QAKnowledge.questions.like(f"%{keyword}%"),
+                questions_text.like(f"%{keyword}%"),
                 QAKnowledge.answers.like(f"%{keyword}%"),
             )
         )
         list_sql = list_sql.where(
             or_(
                 QAKnowledge.answers.like(f"%{keyword}%"),
-                QAKnowledge.questions.like(f"%{keyword}%"),
+                questions_text.like(f"%{keyword}%"),
             )
         )
 
