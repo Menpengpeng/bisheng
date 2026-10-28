@@ -204,6 +204,15 @@ export const useMessageStore = create<State & Actions>((set, get) => ({
             if (type === 'end') {
                 return { messages: newChat.filter(msg => msg.message_id !== message.unique_id) }
             }
+            // Runtime node status (e.g. SQL agent querying) updates the
+            // existing node_run row in place instead of appending a new one.
+            if (type === 'info') {
+                return {
+                    messages: newChat.map(msg => msg.message_id === message.unique_id
+                        ? { ...msg, status: message.status }
+                        : msg)
+                }
+            }
             newChat.push({
                 category, flow_id, chat_id, message_id: message.unique_id, files, is_bot,
                 message, receiver, source, user_id,

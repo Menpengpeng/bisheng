@@ -3,22 +3,29 @@ import json
 import os
 import time
 import uuid
-from typing import AsyncIterator, Iterator, Dict, List
+from typing import AsyncIterator, Dict, Iterator, List
 
 from langchain_core.documents import Document
 from loguru import logger
+
 from bisheng.api.v1.schema.workflow import WorkflowEventType
 from bisheng.api.v1.schemas import ChatResponse
 from bisheng.citation.domain.schemas.citation_schema import CitationRegistryItemSchema
 from bisheng.citation.domain.services.citation_prompt_helper import (
     collect_rag_citation_registry_items,
-    select_registry_items_for_persistence,
     save_message_citations_sync,
+    select_registry_items_for_persistence,
 )
 from bisheng.common.chat.utils import sync_judge_source, sync_process_source_document
-from bisheng.common.constants.enums.telemetry import BaseTelemetryTypeEnum, ApplicationTypeEnum
-from bisheng.common.errcode.flow import WorkFlowNodeRunMaxTimesError, WorkFlowWaitUserTimeoutError, \
-    WorkFlowNodeUpdateError, WorkFlowVersionUpdateError, WorkFlowTaskBusyError, WorkFlowTaskOtherError
+from bisheng.common.constants.enums.telemetry import ApplicationTypeEnum, BaseTelemetryTypeEnum
+from bisheng.common.errcode.flow import (
+    WorkFlowNodeRunMaxTimesError,
+    WorkFlowNodeUpdateError,
+    WorkFlowTaskBusyError,
+    WorkFlowTaskOtherError,
+    WorkFlowVersionUpdateError,
+    WorkFlowWaitUserTimeoutError,
+)
 from bisheng.common.errcode.http_error import ServerError
 from bisheng.common.schemas.telemetry.event_data_schema import NewMessageSessionEventData
 from bisheng.common.services import telemetry_service
@@ -27,13 +34,24 @@ from bisheng.common.utils.title_generator import generate_conversation_title_syn
 from bisheng.core.cache.redis_manager import get_redis_client_sync
 from bisheng.core.logger import trace_id_var
 from bisheng.database.models.flow import FlowDao, FlowType
-from bisheng.database.models.message import ChatMessageDao, ChatMessage
-from bisheng.database.models.session import MessageSessionDao, MessageSession
+from bisheng.database.models.message import ChatMessage, ChatMessageDao
+from bisheng.database.models.session import MessageSession, MessageSessionDao
 from bisheng.llm.domain import LLMService
 from bisheng.utils.threadpool import thread_pool
 from bisheng.workflow.callback.base_callback import BaseCallback
-from bisheng.workflow.callback.event import NodeStartData, NodeEndData, UserInputData, GuideWordData, GuideQuestionData, \
-    OutputMsgData, StreamMsgData, StreamMsgOverData, OutputMsgChooseData, OutputMsgInputData
+from bisheng.workflow.callback.event import (
+    GuideQuestionData,
+    GuideWordData,
+    NodeEndData,
+    NodeStartData,
+    NodeStatusData,
+    OutputMsgChooseData,
+    OutputMsgData,
+    OutputMsgInputData,
+    StreamMsgData,
+    StreamMsgOverData,
+    UserInputData,
+)
 from bisheng.workflow.common.workflow import WorkflowStatus
 
 
@@ -592,6 +610,16 @@ class RedisCallback(BaseCallback):
             ChatResponse(message=data.dict(),
                          category=WorkflowEventType.NodeRun.value,
                          type='end',
+                         flow_id=self.workflow_id,
+                         chat_id=self.chat_id))
+
+    def on_node_status(self, data: NodeStatusData):
+        """ node runtime status event (e.g. SQL agent progress) """
+        logger.debug(f'node status: {data}')
+        self.send_chat_response(
+            ChatResponse(message=data.dict(),
+                         category=WorkflowEventType.NodeRun.value,
+                         type='info',
                          flow_id=self.workflow_id,
                          chat_id=self.chat_id))
 

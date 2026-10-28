@@ -624,5 +624,11 @@
         "label": "出力変数"
       }
     }
+  },
+  "workflowStatus": {
+    "sql_querying": "データベースを照会中...",
+    "sql_query_done": "照会が完了しました。結果を整理しています...",
+    "sql_query_failed": "照会で問題が発生しました。結果を整理しています...",
+    "elapsed": "{{seconds}}秒経過"
   }
 }

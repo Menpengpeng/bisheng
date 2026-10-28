@@ -301,6 +301,9 @@ export default function ChatInput({ autoRun, version, clear, form, wsUrl, onBefo
                     , data.message.input_data)
             }
             insetNodeRun(data)
+            // Runtime status (info) only refreshes the chat row, it must not
+            // mark the node log panel as finished.
+            if (data.type === 'info') return
             return sendNodeLogEvent(data)
         } else if (data.category === "guide_word") {
             data.message.msg = data.message.guide_word

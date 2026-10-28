@@ -2294,5 +2294,11 @@
       "renderFailed": "文件生成失败，请稍后重试"
     }
   },
-  "com_linsight_legacy_sop": "历史 SOP 文档（旧版会话）"
+  "com_linsight_legacy_sop": "历史 SOP 文档（旧版会话）",
+  "workflow_status": {
+    "sql_querying": "查询数据库中...",
+    "sql_query_done": "数据库查询完成，正在整理结果...",
+    "sql_query_failed": "数据库查询出现问题，正在整理结果...",
+    "elapsed": "已等待 {{seconds}}s"
+  }
 }

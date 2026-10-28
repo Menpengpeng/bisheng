@@ -625,5 +625,11 @@
       }
     }
   },
-  "dbType": "Database Type"
+  "dbType": "Database Type",
+  "workflowStatus": {
+    "sql_querying": "Querying the database...",
+    "sql_query_done": "Query finished, preparing the answer...",
+    "sql_query_failed": "Database query failed, preparing the answer...",
+    "elapsed": "Waiting {{seconds}}s"
+  }
 }

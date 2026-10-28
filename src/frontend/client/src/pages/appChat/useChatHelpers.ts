@@ -146,6 +146,14 @@ export default function useChatHelpers() {
                         return messages.filter((msg) => msg.id !== message.unique_id)
                     }
 
+                    // Node runtime status (e.g. SQL agent querying) updates the
+                    // existing node_run row in place instead of appending a new one.
+                    if (type === "info") {
+                        return messages.map((msg) =>
+                            msg.id === message.unique_id ? { ...msg, status: message.status } : msg
+                        )
+                    }
+
                     return [
                         ...messages,
                         {
