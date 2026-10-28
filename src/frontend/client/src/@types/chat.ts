@@ -44,6 +44,9 @@ export type ChatMessageType = {
   create_time: string;
   update_time: string;
   reasoning_log?: string;
+  status?: string;
+  node_status?: string;
+  node_status_at?: number;
 };
 
 export interface ChatVersion {

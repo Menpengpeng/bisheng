@@ -67,6 +67,20 @@ class LLMNodeCallbackHandler(BaseCallbackHandler):
             )
         )
 
+    def _emit_thinking_hint(self, text: str) -> None:
+        """ Append a hint into the node thinking process (reasoning log), so long
+        silent tool calls such as sql_agent give visible feedback. """
+        self.callback_manager.on_stream_msg(
+            StreamMsgData(
+                node_id=self.node_id,
+                name=self.node_name,
+                msg='',
+                reasoning_content=text,
+                unique_id=self.unique_id,
+                output_key=self.output_key,
+            )
+        )
+
     def on_tool_start(self, serialized: dict[str, Any], input_str: str, **kwargs: Any) -> Any:
         """Run when tool starts running."""
         logger.debug(f"on_tool_start  serialized={serialized} input_str={input_str} kwargs={kwargs}")
@@ -81,6 +95,9 @@ class LLMNodeCallbackHandler(BaseCallbackHandler):
             )
         if serialized["name"] == "sql_agent":
             self.output = False
+            # Hint first so the streaming message exists before the status event
+            # arrives, then the frontend can attach the timer to it.
+            self._emit_thinking_hint("\n\n正在查询数据库，请稍候...\n")
             self._emit_node_status("sql_querying")
 
     def on_tool_end(self, output: str, **kwargs: Any) -> Any:

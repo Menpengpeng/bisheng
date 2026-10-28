@@ -147,11 +147,22 @@ export default function useChatHelpers() {
                     }
 
                     // Node runtime status (e.g. SQL agent querying) updates the
-                    // existing node_run row in place instead of appending a new one.
+                    // existing node_run row and the node's streaming message.
                     if (type === "info") {
-                        return messages.map((msg) =>
-                            msg.id === message.unique_id ? { ...msg, status: message.status } : msg
-                        )
+                        const statusAt = message.status === "sql_querying" ? Date.now() : undefined
+                        return messages.map((msg) => {
+                            if (msg.id === message.unique_id) {
+                                return { ...msg, status: message.status }
+                            }
+                            if (msg.category === "stream_msg" && msg.node_id === message.node_id) {
+                                return {
+                                    ...msg,
+                                    node_status: message.status,
+                                    node_status_at: statusAt ?? msg.node_status_at,
+                                }
+                            }
+                            return msg
+                        })
                     }
 
                     return [

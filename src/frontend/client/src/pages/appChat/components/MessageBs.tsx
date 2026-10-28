@@ -1,5 +1,5 @@
 import { CheckIcon, ChevronDown, Loader2 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, useEffect } from "react";
 import { useParams } from "react-router-dom";
 import { ChatMessageType } from "~/@types/chat";
 import Markdown from "~/components/Chat/Messages/Content/Markdown";
@@ -16,11 +16,22 @@ import MessageButtons from "./MessageButtons";
 import useLocalize from "~/hooks/useLocalize";
 
 
-export const ReasoningLog = ({ loading, msg = '' }) => {
+export const ReasoningLog = ({ loading, msg = '', status = '', statusAt = 0 }) => {
     const t = useLocalize()
     const [open, setOpen] = useState(true)
+    const [now, setNow] = useState(Date.now())
+
+    // Tick every second while a long-running tool (sql_agent) is running.
+    useEffect(() => {
+        if (status !== 'sql_querying') return
+        const timer = setInterval(() => setNow(Date.now()), 1000)
+        return () => clearInterval(timer)
+    }, [status])
 
     if (!msg) return null
+
+    const statusText = status ? t(`workflow_status.${status}`) : ''
+    const elapsed = statusAt ? Math.max(0, Math.floor((now - statusAt) / 1000)) : 0
 
     return <div className="py-1 mb-4">
         <div className="rounded-sm border">
@@ -28,6 +39,9 @@ export const ReasoningLog = ({ loading, msg = '' }) => {
                 {loading ? <div className="flex items-center font-bold gap-2 text-sm">
                     <Loader2 className="text-primary duration-300 animate-spin" />
                     <span>{t('com_bs_reasoning_thinking')}</span>
+                    {statusText && <span className="font-normal text-gray-500">
+                        {statusText}{status === 'sql_querying' && statusAt ? ` · ${t('workflow_status.elapsed', { seconds: elapsed })}` : ''}
+                    </span>}
                 </div>
                     : <div className="flex items-center font-bold gap-2 text-sm">
                         <div className="w-5 h-5 bg-[#05B353] rounded-full p-1" >
@@ -119,7 +133,12 @@ export default function MessageBs({
             />
         )}
         <div className="w-fit group max-w-[90%]">
-            <ReasoningLog loading={!data.end && (data.reasoning_log || reasoningLog)} msg={data.reasoning_log || reasoningLog} />
+            <ReasoningLog
+                loading={!data.end && (data.reasoning_log || reasoningLog)}
+                msg={data.reasoning_log || reasoningLog}
+                status={data.node_status}
+                statusAt={data.node_status_at}
+            />
             {!(data.reasoning_log && !message && !data.files.length) && <>
                 <div className="flex gap-2 items-center">
                     {data.sender ? <p className="text-gray-600 text-xs mb-1 ml-2">{data.sender}</p> : <p />}

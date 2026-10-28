@@ -7,7 +7,7 @@ import { WorkflowMessage } from "@/types/flow";
 import { formatStrTime } from "@/util/utils";
 import { copyText } from "@/utils";
 import { ChevronDown } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, useEffect } from "react";
 import ChatFile from "./ChatFileFile";
 import MessageMarkDown from "./MessageMarkDown";
 import { useMessageStore } from "./messageStore";
@@ -16,12 +16,23 @@ import CitationReferencesDrawer from "@/components/bs-comp/chatComponent/Citatio
 import { normalizeCitationItems, parseLegacyWebCitationContent } from "@/components/bs-comp/chatComponent/citationUtils";
 
 
-const ReasoningLog = ({ loading, msg = '' }) => {
+const ReasoningLog = ({ loading, msg = '', status = '', statusAt = 0 }) => {
     const [open, setOpen] = useState(true)
+    const [now, setNow] = useState(Date.now())
     // console.log('msg :>> ', msg);
     const { t } = useTranslation('flow')
 
+    // Tick every second while a long-running tool (sql_agent) is running.
+    useEffect(() => {
+        if (status !== 'sql_querying') return
+        const timer = setInterval(() => setNow(Date.now()), 1000)
+        return () => clearInterval(timer)
+    }, [status])
+
     if (!msg) return null
+
+    const statusText = status ? t(`workflowStatus.${status}`) : ''
+    const elapsed = statusAt ? Math.max(0, Math.floor((now - statusAt) / 1000)) : 0
 
     return <div className="py-1">
         <div className="rounded-sm border">
@@ -30,6 +41,9 @@ const ReasoningLog = ({ loading, msg = '' }) => {
                     <div className="flex items-center font-bold gap-2 text-sm">
                         <LoadIcon className="text-primary duration-300" />
                         <span>{t('thinking')}</span>
+                        {statusText && <span className="font-normal text-gray-500">
+                            {statusText}{status === 'sql_querying' && statusAt ? ` · ${t('workflowStatus.elapsed', { seconds: elapsed })}` : ''}
+                        </span>}
                     </div>
                     :
                     <div className="flex items-center font-bold gap-2 text-sm">
@@ -82,7 +96,12 @@ export default function MessageBs({ debug, mark = false, logo, data, onUnlike = 
     const chatId = useMessageStore(state => state.chatId)
     return <div className="bisheng-message flex w-full">
         <div className="w-fit group max-w-[90%]">
-            <ReasoningLog loading={!data.end && data.reasoning_log} msg={data.reasoning_log} />
+            <ReasoningLog
+                loading={!data.end && data.reasoning_log}
+                msg={data.reasoning_log}
+                status={data.node_status}
+                statusAt={data.node_status_at}
+            />
             {!(data.reasoning_log && !displayMessage && !data.files?.length) && <>
                 <div className="flex justify-between items-center mb-1">
                     {data.sender ? <p className="text-gray-600 text-xs">{data.sender}</p> : <p />}
