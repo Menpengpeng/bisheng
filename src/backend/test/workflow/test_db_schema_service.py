@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import Integer, String
 from sqlalchemy.dialects import mysql
-from sqlalchemy.exc import ArgumentError
+from sqlalchemy.exc import ArgumentError, OperationalError
 
 from bisheng.common.errcode.flow import (
     DbConnectionFailedError,
@@ -249,6 +249,35 @@ def test_unrelated_argument_error_still_propagates(monkeypatch):
                         staticmethod(lambda uri, engine_args=None, **kw: db))
     with pytest.raises(ArgumentError):
         get_schema_ddl(_params('dm', tables=['users']), ['users'])
+
+
+def test_reflection_failure_keeps_connection_error_code(monkeypatch):
+    import langchain_community.utilities as u
+
+    class BrokenReflectionDatabase(FakeSQLDatabase):
+        def get_table_info(self, table_names, get_col_comments=False):
+            raise OperationalError('SELECT * FROM users', {}, Exception('permission denied'))
+
+    db = BrokenReflectionDatabase(['users'])
+    monkeypatch.setattr(u.SQLDatabase, 'from_uri',
+                        staticmethod(lambda uri, engine_args=None, **kw: db))
+    with pytest.raises(DbConnectionFailedError):
+        get_schema_ddl(_params('mysql', tables=['users']), ['users'])
+    assert db._engine.disposed == 1
+
+
+def test_reflection_timeout_keeps_timeout_error_code(monkeypatch):
+    import langchain_community.utilities as u
+
+    class SlowReflectionDatabase(FakeSQLDatabase):
+        def get_table_info(self, table_names, get_col_comments=False):
+            raise OperationalError('SELECT * FROM users', {}, Exception('query timeout'))
+
+    db = SlowReflectionDatabase(['users'])
+    monkeypatch.setattr(u.SQLDatabase, 'from_uri',
+                        staticmethod(lambda uri, engine_args=None, **kw: db))
+    with pytest.raises(DbInspectTimeoutError):
+        get_schema_ddl(_params('mysql', tables=['users']), ['users'])
 
 
 def test_list_tables_and_truncated_flag(monkeypatch):

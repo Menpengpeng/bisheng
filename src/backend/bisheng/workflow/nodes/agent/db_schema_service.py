@@ -213,23 +213,8 @@ def _connect(meta: URIResult):
             sample_rows_in_table_info=0,
             lazy_table_reflection=True,
         )
-    except (ImportError, ModuleNotFoundError) as exc:
-        logger.warning('sql schema inspect driver missing: {}', exc)
-        raise DbDriverMissingError(exception=exc) from exc
-    except (TimeoutError, OSError) as exc:
-        if _is_timeout(exc):
-            logger.warning('sql schema inspect timeout: {}', type(exc).__name__)
-            raise DbInspectTimeoutError(exception=exc) from exc
-        raise DbConnectionFailedError(exception=exc) from exc
     except Exception as exc:
-        if _is_driver_missing(exc):
-            logger.warning('sql schema inspect driver missing: {}', exc)
-            raise DbDriverMissingError(exception=exc) from exc
-        if _is_timeout(exc):
-            logger.warning('sql schema inspect timeout: {}', type(exc).__name__)
-            raise DbInspectTimeoutError(exception=exc) from exc
-        logger.warning('sql schema inspect connection failed: {}', type(exc).__name__)
-        raise DbConnectionFailedError(exception=exc) from exc
+        _raise_db_error(exc)
 
 
 def _is_driver_missing(exc: Exception) -> bool:
@@ -254,12 +239,28 @@ def _is_timeout(exc: Exception) -> bool:
     return 'timeout' in text or 'timed out' in text
 
 
+def _raise_db_error(exc: Exception) -> None:
+    """Map an inspection/connection error to the workflow error code.
+
+    Shared by connection setup and reflection, so moving reflection from
+    construction to ``get_table_info`` keeps the original error codes.
+    """
+    if isinstance(exc, (ImportError, ModuleNotFoundError)) or _is_driver_missing(exc):
+        logger.warning('sql schema inspect driver missing: {}', exc)
+        raise DbDriverMissingError(exception=exc) from exc
+    if _is_timeout(exc):
+        logger.warning('sql schema inspect timeout: {}', type(exc).__name__)
+        raise DbInspectTimeoutError(exception=exc) from exc
+    logger.warning('sql schema inspect connection failed: {}', type(exc).__name__)
+    raise DbConnectionFailedError(exception=exc) from exc
+
+
 # DM8 returns duplicate foreign-key rows when one constraint name exists in
 # several schemas; SQLAlchemy then aborts reflection with this message.
 _DUP_FK_MARKER = 'duplicate source column references'
 
 
-def _build_ddl_from_columns(db, tables: list[str], with_comments: bool) -> str:
+def build_ddl_from_columns(db, tables: list[str], with_comments: bool) -> str:
     """Build ``CREATE TABLE`` DDL from column metadata only, skipping keys.
 
     Fallback for tables SQLAlchemy cannot reflect (e.g. DM8 reports the same
@@ -341,7 +342,11 @@ def get_schema_ddl(params: SqlAgentConfig, selected_tables: list[str]) -> Schema
                 raise
             logger.warning('act=sql_schema_reflect_fallback engine={} tables={}',
                            meta.dialect, len(found))
-            ddl = _build_ddl_from_columns(db, found, with_comments)
+            ddl = build_ddl_from_columns(db, found, with_comments)
+        except Exception as exc:
+            # Reflection now happens here instead of at construction time;
+            # keep the same workflow error codes.
+            _raise_db_error(exc)
     finally:
         db._engine.dispose()
 
