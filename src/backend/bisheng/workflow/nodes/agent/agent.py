@@ -24,6 +24,7 @@ from bisheng.common.constants.enums.telemetry import ApplicationTypeEnum
 from bisheng.knowledge.domain.knowledge_rag import KnowledgeRag
 from bisheng.knowledge.domain.models.knowledge import KnowledgeDao
 from bisheng.knowledge.domain.services.knowledge_utils import KnowledgeUtils
+from bisheng.llm.domain.schemas import AssistantLLMItem
 from bisheng.llm.domain.services import LLMService
 from bisheng.tool.domain.services.executor import ToolExecutor
 from bisheng.workflow.callback.event import StreamMsgOverData
@@ -213,13 +214,15 @@ class AgentNode(BaseNode):
         self._chat_history_flag = self.node_params["chat_history_flag"]["value"] > 0
         self._chat_history_num = self.node_params["chat_history_flag"]["value"]
 
-        self._llm = LLMService.get_bisheng_llm_sync(
+        # 节点配置的模型不可用时降级为系统默认工作流模型
+        self._llm = LLMService.get_bisheng_llm_for_workflow_sync(
             model_id=self.node_params["model_id"],
             temperature=self.node_params.get("temperature", 1),
             app_id=self.workflow_id,
             app_name=self.workflow_name,
             app_type=ApplicationTypeEnum.WORKFLOW,
             user_id=self.user_id,
+            tenant_id=self.tenant_id,
         )
 
         # Whether to output the results to the user
@@ -285,7 +288,16 @@ class AgentNode(BaseNode):
         assistant_llm = LLMService.sync_get_assistant_llm(tenant_id=self.tenant_id)
         if not assistant_llm.llm_list:
             raise Exception("Assistant reasoning model list is empty")
-        default_llm = [one for one in assistant_llm.llm_list if one.model_id == self.node_params["model_id"]]
+        # 按实际生效的模型查找 (降级后可能与节点配置的模型不同)
+        effective_model_id = getattr(self._llm, "model_id", None) or self.node_params["model_id"]
+        default_llm = [one for one in assistant_llm.llm_list if one.model_id == effective_model_id]
+        if not default_llm and effective_model_id != self.node_params["model_id"]:
+            # 降级后的系统默认模型不必在助手推理模型列表中, 此时使用助手默认参数
+            logger.warning(
+                "fallback workflow model {} is not in the assistant model list, use default agent parameters",
+                effective_model_id,
+            )
+            default_llm = [AssistantLLMItem(model_id=effective_model_id)]
         if not default_llm:
             raise Exception("The selected inference model is not in the list of assistant inference models")
         default_llm = default_llm[0]
@@ -378,11 +390,12 @@ class AgentNode(BaseNode):
             if schema_result.ddl:
                 sql_tool_config["schema_ddl"] = schema_result.ddl
             # 运行日志面板展示 Schema 来源(缓存命中/回源), 经 parse_log 推送前端
-            self._sql_schema_log = self._format_schema_cache_log(
-                schema_result, self._sql_agent.schema_cache_enabled)
+            self._sql_schema_log = self._format_schema_cache_log(schema_result, self._sql_agent.schema_cache_enabled)
             logger.info(
                 "act=sql_agent_schema_prepared tables={} missing={} from_cache={}",
-                len(schema_result.found), len(schema_result.missing), schema_result.from_cache,
+                len(schema_result.found),
+                len(schema_result.missing),
+                schema_result.from_cache,
             )
         else:
             # 未选表: 走运行时自发现路径, 不使用缓存, 也在运行日志中说明
@@ -566,9 +579,7 @@ class AgentNode(BaseNode):
             # F043: schema cache source summary (sql agent only)
             sql_schema_log = getattr(self, "_sql_schema_log", None)
             if sql_schema_log:
-                one_ret.append(
-                    {"key": "sql_schema_cache", "value": sql_schema_log, "type": "params"}
-                )
+                one_ret.append({"key": "sql_schema_cache", "value": sql_schema_log, "type": "params"})
 
             # Handler Call Log
             one_ret.extend(self.parse_tool_log(self._tool_invoke_list[index]))

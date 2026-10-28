@@ -43,13 +43,15 @@ class RagNode(RagUtils):
 
         self._qa_prompt = None
 
-        self._llm = LLMService.get_bisheng_llm_sync(
+        # 节点配置的模型不可用时降级为系统默认工作流模型
+        self._llm = LLMService.get_bisheng_llm_for_workflow_sync(
             model_id=self.node_params["model_id"],
             temperature=self.node_params.get("temperature", 1),
             app_id=self.workflow_id,
             app_name=self.workflow_name,
             app_type=ApplicationTypeEnum.WORKFLOW,
             user_id=self.user_id,
+            tenant_id=self.tenant_id,
         )
         self._minio_client = get_minio_storage_sync()
 

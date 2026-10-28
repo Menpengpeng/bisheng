@@ -27,7 +27,12 @@ from bisheng.common.errcode.llm_tenant import (
 )
 from bisheng.common.errcode.server import (
     AsrModelConfigDeletedError,
+    LlmModelConfigDeletedError,
+    LlmModelOfflineError,
+    LlmModelTypeError,
+    LlmProviderDeletedError,
     NoAsrModelConfigError,
+    NoLlmModelConfigError,
     NoTtsModelConfigError,
     TtsModelConfigDeletedError,
 )
@@ -1163,6 +1168,48 @@ class LLMService:
         """Initialize LiftedllmConversation Model"""
         return BishengLLM(**kwargs)
 
+    # 工作流节点配置的模型不可用时降级为系统默认工作流模型
+    # 仅覆盖配置层面的不可用: 鉴权、网络、超时等运行时异常仍需抛出, 避免被静默掩盖
+    _WORKFLOW_MODEL_UNAVAILABLE_ERRORS = (
+        NoLlmModelConfigError,
+        LlmModelConfigDeletedError,
+        LlmProviderDeletedError,
+        LlmModelTypeError,
+        LlmModelOfflineError,
+    )
+
+    @classmethod
+    def get_bisheng_llm_for_workflow_sync(
+        cls,
+        model_id: int | None,
+        *,
+        tenant_id: int | None = None,
+        **kwargs,
+    ) -> BaseChatModel:
+        """构造工作流节点使用的对话模型
+
+        节点配置的模型不可用 (未配置、模型被删除、服务商被删除、类型不符、已下线) 时,
+        降级为租户系统模型设置中的工作流默认模型。返回对象的 ``model_id`` 即实际使用的模型。
+        """
+        try:
+            return cls.get_bisheng_llm_sync(model_id=model_id, **kwargs)
+        except cls._WORKFLOW_MODEL_UNAVAILABLE_ERRORS as error:
+            fallback_model_id = cls._sync_workflow_default_model_id(tenant_id)
+            if fallback_model_id is None or fallback_model_id == cls._coerce_model_id(model_id):
+                raise
+            logger.warning(
+                "workflow model {} is unavailable ({}), falling back to the system default workflow model {}",
+                model_id,
+                error,
+                fallback_model_id,
+            )
+            return cls.get_bisheng_llm_sync(model_id=fallback_model_id, **kwargs)
+
+    @classmethod
+    def _sync_workflow_default_model_id(cls, tenant_id: int | None) -> int | None:
+        """读取系统模型设置中的工作流默认模型 ID"""
+        return cls._coerce_model_id(cls.sync_get_workflow_llm(tenant_id).model_id)
+
     @classmethod
     async def get_bisheng_linsight_llm(cls, invoke_user_id: int, **kwargs) -> BaseChatModel:
         return await BishengLLM.get_bisheng_llm(
@@ -1282,6 +1329,15 @@ class LLMService:
         """Get the default model configuration for the evaluation feature"""
         cfg, _, _ = await cls.aget_workflow_llm_with_meta(tenant_id)
         return cfg
+
+    @classmethod
+    def sync_get_workflow_llm(cls, tenant_id: int | None = None) -> EvaluationLLMConfig:
+        """Get the workflow default model configuration (sync)"""
+        return cls._get_typed_sync(
+            ConfigKeyEnum.WORKFLOW_LLM,
+            EvaluationLLMConfig,
+            tenant_id,
+        )
 
     @classmethod
     async def aget_workflow_llm_with_meta(

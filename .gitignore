@@ -301,3 +301,4 @@ docs-ui-refactor/
 # CoAligne local state + sync config (per-developer; the tool rewrites them itself)
 .coaligne/
 .coaligneignore
+src/frontend/platform/bisheng-platform-frontend.tar.zip
