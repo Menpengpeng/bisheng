@@ -10,7 +10,7 @@ from bisheng.common.schemas.api import UnifiedResponseModel, resp_200
 from bisheng.database.models.role_access import AccessType
 from bisheng.knowledge.domain.models.knowledge import KnowledgeDao
 from bisheng.knowledge.domain.models.knowledge_file import KnowledgeFileDao
-from bisheng.open_endpoints.domain.schemas.citation import OpenCitationResponse
+from bisheng.open_endpoints.domain.schemas.citation import OpenCitationItem, OpenCitationResponse
 from bisheng.open_endpoints.domain.utils import get_default_operator_async
 
 router = APIRouter(prefix='/citation', tags=['OpenAPI', 'Citation'])
@@ -57,4 +57,15 @@ async def get_open_citation_detail(
         download_url=payload.downloadUrl,
         preview_url=payload.previewUrl,
         bbox=first_item.bbox if first_item else None,
+        items=[
+            OpenCitationItem(
+                item_id=citation_item.itemId,
+                chunk_id=citation_item.chunkId,
+                chunk_index=citation_item.chunkIndex,
+                content=citation_item.content,
+                bbox=citation_item.bbox,
+                page=citation_item.page,
+            )
+            for citation_item in payload.items
+        ],
     ))
