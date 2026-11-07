@@ -18,6 +18,11 @@ class NodeEndData(NodeStartData):
     input_data: Any = Field(None, description='Input variable data for node exec')
 
 
+class NodeStatusData(NodeStartData):
+    # 节点运行中的状态码(如 sql_querying), 前端据此展示等待文案
+    status: str = Field('', description='Node runtime status code')
+
+
 class UserInputData(BaseModel):
     node_id: str = Field(..., description='Node unique id')
     name: str = Field(..., description='Node name')

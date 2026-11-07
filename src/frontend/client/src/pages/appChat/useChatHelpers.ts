@@ -183,6 +183,25 @@ export default function useChatHelpers() {
                         return messages.filter((msg) => msg.id !== message.unique_id)
                     }
 
+                    // Node runtime status (e.g. SQL agent querying) updates the
+                    // existing node_run row and the node's streaming message.
+                    if (type === "info") {
+                        const statusAt = message.status === "sql_querying" ? Date.now() : undefined
+                        return messages.map((msg) => {
+                            if (msg.id === message.unique_id) {
+                                return { ...msg, status: message.status }
+                            }
+                            if (msg.category === "stream_msg" && msg.node_id === message.node_id) {
+                                return {
+                                    ...msg,
+                                    node_status: message.status,
+                                    node_status_at: statusAt ?? msg.node_status_at,
+                                }
+                            }
+                            return msg
+                        })
+                    }
+
                     return [
                         ...messages,
                         {

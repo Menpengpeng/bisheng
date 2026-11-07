@@ -176,6 +176,8 @@ const useReport = (versionKey, flowId, onchange) => {
             uploadFileWithProgress(file, (progress) => { }).then(res => {
                 setLoading(false);
                 setDocx(docx => ({ ...docx, path: res.file_path }))
+                // 导入后立即落盘到 workflow/report/{uuid}.docx，避免离开后模板丢失
+                saveWorkflowReportTemplate(res.file_path, docx.key)
             })
         };
 

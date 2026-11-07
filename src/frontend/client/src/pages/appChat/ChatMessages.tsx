@@ -6,6 +6,7 @@ import {
   displayText,
   describeRun,
   createRunLabels,
+  type ChatMessage,
 } from "@bisheng/chat/core";
 import { ClientChatMarkdown } from "./components/ClientChatMarkdown";
 import appStore from "~/store";
@@ -32,6 +33,9 @@ import { useMessage } from "./useMessages";
 // selection model so the pair-group walk (question → adjacent answers)
 // finds the right neighbors. Order preserved so adjacency works.
 const _SELECTABLE_CATEGORIES = new Set(["question", "answer", "agent_answer", "output_msg", "stream_msg"]);
+
+// 二开：后端在节点运行期间推送的状态码（如 SQL agent）
+const RUNTIME_STATUS_KEYS = new Set(["sql_querying", "sql_query_done", "sql_query_failed"]);
 
 type ChatMessagesProps = {
   useName?: string;
@@ -80,6 +84,17 @@ export default function ChatMessages({
 
   const remark = chatState?.flow?.guide_word;
 
+  // 二开：node_run 行的状态存在 status，流式回答存在 node_status
+  const runtimeStatus = (message: ChatMessage) => {
+    const status = displayText(message.raw.node_status ?? message.raw.status);
+    if (!RUNTIME_STATUS_KEYS.has(status)) return undefined;
+    const since = status === "sql_querying" ? Number(message.raw.node_status_at) : NaN;
+    return {
+      text: localize(`workflow_status.${status}`),
+      since: Number.isFinite(since) ? since : undefined,
+    };
+  };
+
   return (
     <div
       id="messageScrollPanne"
@@ -103,6 +118,7 @@ export default function ChatMessages({
             completed: localize("com_bs_reasoning_done"),
             stopped: localize("appChat.stopped"),
           }}
+          formatElapsed={(seconds) => localize("workflow_status.elapsed", { seconds })}
           onChoice={(message, value) => {
             const payload = asRecord(message.payload);
             emitAreaTextEvent({
@@ -117,6 +133,7 @@ export default function ChatMessages({
           }}
           slots={{
             runPresentation: (message) => describeRun(message, chatState?.flow, createRunLabels(localize)),
+            runtimeStatus,
             title: (message) =>
               message.kind === "user" ? displayText(message.raw.user_name) || useName || "" : title,
             avatar: (message) =>

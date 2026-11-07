@@ -331,3 +331,5 @@ src/backend/migration_reports
 .cursor/
 config-106120.yaml
 values-106120.yaml
+# Local platform frontend deploy archive (do not commit)
+src/frontend/platform/bisheng-platform-frontend.tar.zip

@@ -1,14 +1,36 @@
 import { Outlined } from 'bisheng-icons';
-import { useState, type ReactNode, type Ref } from 'react';
+import { useEffect, useState, type ReactNode, type Ref } from 'react';
+
+export interface RuntimeStatus {
+  /** 已本地化的状态文案 */
+  text: string;
+  /** 状态开始时间（毫秒）；提供时展示每秒刷新的已等待秒数 */
+  since?: number;
+}
+/** 二开：长耗时节点（如 SQL agent）的状态提示，内部每秒刷新已等待时间 */
+export function RuntimeStatusText({ status, formatElapsed }: { status: RuntimeStatus; formatElapsed?: (seconds: number) => string }) {
+  const [now, setNow] = useState(() => Date.now());
+  const { since } = status;
+  useEffect(() => {
+    if (since === undefined) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [since]);
+  const elapsed = since === undefined ? undefined : formatElapsed?.(Math.max(0, Math.floor((now - since) / 1000)));
+  return <span className="font-normal text-gray-500">{status.text}{elapsed ? ` · ${elapsed}` : ''}</span>;
+}
 
 export interface ReasoningDetailsProps {
   text: string;
   pending: boolean;
   stopped?: boolean;
   labels: { thinking: string; completed: string; stopped?: string };
+  /** 二开：运行中节点的状态提示 */
+  status?: RuntimeStatus;
+  formatElapsed?: (seconds: number) => string;
 }
 /** Reasoning presentation extracted from the client answer message. */
-export function ReasoningDetails({ text, pending, stopped = false, labels }: ReasoningDetailsProps) {
+export function ReasoningDetails({ text, pending, stopped = false, labels, status, formatElapsed }: ReasoningDetailsProps) {
   const [open, setOpen] = useState(true);
   if (!text) return null;
   return <div className="py-1 mb-4">
@@ -21,6 +43,7 @@ export function ReasoningDetails({ text, pending, stopped = false, labels }: Rea
           {pending ? <Outlined.Loading size={16} className="text-primary duration-300 animate-spin" />
             : stopped ? <Outlined.Square size={16} className="text-text-3" /> : <Outlined.CheckCircle size={16} className="text-success" />}
           <span>{stopped ? labels.stopped : pending ? labels.thinking : labels.completed}</span>
+          {pending && status?.text && <RuntimeStatusText status={status} formatElapsed={formatElapsed} />}
         </div>
         <Outlined.Down size={16} className={open ? 'rotate-180' : undefined} />
       </div>

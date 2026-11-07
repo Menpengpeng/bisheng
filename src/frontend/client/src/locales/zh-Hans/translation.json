@@ -840,6 +840,8 @@
   "com_tools_knowledge_search": "知识库检索",
   "com_tools_generic_fallback": "工具",
   "com_tools_result_count": "{{count}} 个结果",
+  "com_tools_elapsed_seconds": "已用 {{seconds}} 秒",
+  "com_tools_duration_seconds": "用时 {{seconds}} 秒",
   "com_ui_accept": "我接受",
   "com_ui_add": "添加",
   "com_ui_add_multi_conversation": "添加多个对话",
@@ -2833,5 +2835,11 @@
     "checking": "正在核验知识空间访问权限…",
     "failed": "知识空间权限加载失败，请刷新页面后重试。",
     "revoked": "以下知识空间的访问权限已失效：{{names}}。请在“添加上下文”中重新选择可访问的空间。"
+  },
+  "workflow_status": {
+    "sql_querying": "查询数据库中...",
+    "sql_query_done": "数据库查询完成，正在整理结果...",
+    "sql_query_failed": "数据库查询出现问题，正在整理结果...",
+    "elapsed": "已等待 {{seconds}}s"
   }
 }

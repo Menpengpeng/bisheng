@@ -47,6 +47,7 @@ from bisheng.workflow.callback.event import (
     GuideWordData,
     NodeEndData,
     NodeStartData,
+    NodeStatusData,
     OutputMsgChooseData,
     OutputMsgData,
     OutputMsgInputData,
@@ -809,6 +810,16 @@ class RedisCallback(BaseCallback):
                 chat_id=self.chat_id,
             )
         )
+
+    def on_node_status(self, data: NodeStatusData):
+        """ node runtime status event (e.g. SQL agent progress) """
+        logger.debug(f'node status: {data}')
+        self.send_chat_response(
+            ChatResponse(message=data.dict(),
+                         category=WorkflowEventType.NodeRun.value,
+                         type='info',
+                         flow_id=self.workflow_id,
+                         chat_id=self.chat_id))
 
     def on_user_input(self, data: UserInputData):
         """user input event"""

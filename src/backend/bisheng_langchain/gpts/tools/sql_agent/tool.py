@@ -8,6 +8,35 @@ from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph as CompiledGraph
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import ArgumentError
+
+# DM8 reports one foreign key under several schemas, which makes SQLAlchemy
+# abort reflection with this message.
+_DUP_FK_MARKER = 'duplicate source column references'
+
+
+class SQLDatabaseDM(SQLDatabase):
+    """SQLDatabase tolerant of DM8 duplicate foreign-key reflection rows.
+
+    The DM dialect reflects constraints without filtering on the owner, so a
+    foreign key name repeated across schemas yields duplicated local columns.
+    Fall back to column-only DDL, which is all the agent prompt needs.
+    """
+
+    def get_table_info(self, table_names=None, get_col_comments=False):
+        try:
+            return super().get_table_info(table_names, get_col_comments=get_col_comments)
+        except ArgumentError as exc:
+            if _DUP_FK_MARKER not in str(exc):
+                raise
+            from bisheng.workflow.nodes.agent.db_schema_service import build_ddl_from_columns
+
+            return build_ddl_from_columns(
+                self,
+                list(table_names or self.get_usable_table_names()),
+                get_col_comments,
+            )
+
 
 _agent_system_prompt = """You are an autonomous agent that answers user questions by querying an SQL database through the provided tools.
 
@@ -101,13 +130,14 @@ class SqlAgentAPIWrapper(BaseModel):
         self.schema_ddl = kwargs.get('schema_ddl')
 
         if self.selected_tables:
-            self.db = SQLDatabase.from_uri(
+            self.db = SQLDatabaseDM.from_uri(
                 self.sql_address,
                 include_tables=self.selected_tables,
                 sample_rows_in_table_info=0,
+                lazy_table_reflection=True,
             )
         else:
-            self.db = SQLDatabase.from_uri(self.sql_address)
+            self.db = SQLDatabaseDM.from_uri(self.sql_address, lazy_table_reflection=True)
 
         toolkit = SQLDatabaseToolkit(db=self.db, llm=self.llm)
         tools = toolkit.get_tools()

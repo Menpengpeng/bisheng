@@ -8,6 +8,8 @@ export { default as buildTree } from './buildTree';
 export { default as cleanupPreset } from './cleanupPreset';
 export { default as cn } from './cn';
 export * from './convos';
+// 二开: 工具调用耗时展示依赖 formatSeconds
+export * from './duration';
 export * from './endpoints';
 export * from './files';
 export * from './forms';

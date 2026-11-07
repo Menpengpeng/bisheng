@@ -14,6 +14,9 @@ import { normalizeCitationItems } from '../chatComponent/citationUtils';
 import SourceEntry from '../chatComponent/SourceEntry';
 import ResouceModal from '@/pages/ChatAppPage/components/ResouceModal';
 
+// 二开：后端在节点运行期间推送的状态码（如 SQL agent）
+const RUNTIME_STATUS_KEYS = new Set(['sql_querying', 'sql_query_done', 'sql_query_failed']);
+
 interface PlatformConversationMessagesProps {
     mode: ChatMode;
     sessionKey: string;
@@ -33,6 +36,16 @@ export function PlatformConversationMessages({ mode, sessionKey, messages: rows,
     const { t } = useTranslation(['bs', 'shared']);
     const messages = messagesForPresentation(rows, { mode, sessionKey });
     const sourceRef = useRef<{ openModal: (value: { chatId: string; messageId?: string; message: string }) => void }>(null);
+    // 二开：node_run 行的 state 存在 status，流式回答存在 node_status
+    const runtimeStatus = (message: ChatMessage) => {
+        const status = displayText(message.raw.node_status ?? message.raw.status);
+        if (!RUNTIME_STATUS_KEYS.has(status)) return undefined;
+        const since = status === 'sql_querying' ? Number(message.raw.node_status_at) : NaN;
+        return {
+            text: t(`flow:workflowStatus.${status}`),
+            since: Number.isFinite(since) ? since : undefined,
+        };
+    };
     const handleMark = (message: ChatMessage) => {
         if (!canAnnotate || !message.sourceMessageId) return;
         const pair = selectQaPair(messages, message.key);
@@ -41,8 +54,10 @@ export function PlatformConversationMessages({ mode, sessionKey, messages: rows,
     return <>
         <ConversationMessages messages={messages} canExecute={canExecute} onChoice={onChoice}
             labels={{ confirm: t('chat.confirm'), confirmed: t('chat.confirmed'), thinking: t('flow:thinking'), completed: t('flow:thoughtCompleted') }}
+            formatElapsed={seconds => t('flow:workflowStatus.elapsed', { seconds })}
             slots={{
                 runPresentation: message => describeRun(message, runCatalog, createRunLabels(key => String(t(key)))),
+                runtimeStatus,
                 title: message => message.kind === 'user' ? displayText(message.raw.user_name) || userName : title,
                 avatar: message => message.kind === 'user' ? <img className="w-6 h-6 min-w-6" src={__APP_ENV__.BASE_URL + '/assets/user.png'} alt="" /> : logo,
                 content: (text, message) => {

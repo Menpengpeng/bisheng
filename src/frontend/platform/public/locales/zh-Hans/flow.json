@@ -461,7 +461,7 @@
       },
       "chat_history_flag": {
         "label": "历史聊天记录",
-        "help": "带入模型上下文的历史消息条数，为 0 时代表不包含上下文信息"
+        "help": "带入模型上下文的历史对话轮数，为 0 时代表不包含上下文信息"
       },
       "image_prompt": {
         "label": "视觉",
@@ -624,5 +624,11 @@
   "rerunWorkflow": "重新运行",
   "type": "类型",
   "valueType": "值类型",
-  "selectDbType": "请选择数据库类型"
+  "selectDbType": "请选择数据库类型",
+  "workflowStatus": {
+    "sql_querying": "查询数据库中...",
+    "sql_query_done": "数据库查询完成，正在整理结果...",
+    "sql_query_failed": "数据库查询出现问题，正在整理结果...",
+    "elapsed": "已等待 {{seconds}}s"
+  }
 }

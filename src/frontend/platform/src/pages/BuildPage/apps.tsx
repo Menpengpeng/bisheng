@@ -23,6 +23,7 @@ import { deleteFlowFromDatabase, getAppsApi, getFlowApi } from "@/controllers/AP
 import type { HostedAppActionResult } from "@/controllers/API/hostedApp";
 import { copyReportTemplate, createWorkflowApi, onlineWorkflow } from "@/controllers/API/workflow";
 import { handleUiRequest } from "@/controllers/request";
+import { captureAndAlertRequestErrorHoc } from "@/controllers/request";
 import { AppNumType, AppType } from "@/types/app";
 import { locationContext } from "@/contexts/locationContext";
 import { HostedAppCard } from "./HostedAppCard";
@@ -194,7 +195,7 @@ export default function Apps() {
     // request automatically; `filterData({tag_id|type|status: ...})` then
     // mutates paramsRef and triggers a fresh first-page load.
     const { data: dataSource, loading, hasMore, search, reload, loadMore, filterData, refreshData } = useInfiniteCursorTable<FlowType>(
-        { pageSize: 14, cancelLoadingWhenReload: true, managed: true },
+        { pageSize: 20, cancelLoadingWhenReload: true, managed: true },
         (param) => getAppsApi({
             cursor: param.cursor,
             pageSize: param.pageSize,
@@ -283,7 +284,11 @@ export default function Apps() {
                     }
                 }
                 delete (payload as any).id;
-                const res = await createWorkflowApi(payload.name, payload.description || '', payload.logo || '', payload);
+                // 复制后的上下线状态与新建保持一致，默认下线，不继承复制源状态
+                delete (payload as any).status;
+                const res = await captureAndAlertRequestErrorHoc(
+                    createWorkflowApi(payload.name, payload.description || '', payload.logo || '', payload)
+                );
                 if (res?.id) {
                     reload();
                     navigate(`/flow/${res.id}`);

@@ -9,7 +9,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 
 import { changeAssistantStatusApi, getAssistantDetailApi, saveAssistanttApi } from "@/controllers/API/assistant";
 import { checkAppEditPermission } from "@/controllers/API/flow";
-import { handleUiRequest, showApiError } from "@/controllers/request";
+import { captureAndAlertRequestErrorHoc, handleUiRequest, showApiError } from "@/controllers/request";
 import { useAssistantStore } from "@/store/assistantStore";
 import { OnlineState } from "@/types/flow";
 import { useEffect, useRef, useState } from "react";
@@ -80,18 +80,21 @@ function EditAssistantContent() {
     const handleSave = async (showMessage = false) => {
         if (!canEdit) return
         if (!handleCheck()) return
-        await saveAssistanttApi({
+        const res = await captureAndAlertRequestErrorHoc(saveAssistanttApi({
             ...assistantState,
             flow_list: assistantState.flow_list.map(item => item.id),
             tool_list: assistantState.tool_list.map(item => item.id),
             knowledge_list: assistantState.knowledge_list.map(item => item.id),
             guide_question: assistantState.guide_question.filter((item) => item),
             logo: assistantState.viewLogo ? assistantState.logo : '',
-        }).then(res => {
-            if (!res) return
+        })).then(res => {
+            if (!res) return res
             showMessage && toast.show({ type: 'success', message: [String(t('prompt') ?? ''), String(t('skills.saveSuccessful') ?? '')].filter(Boolean).join('\n') })
+            return res
         })
         saveAfter()
+        // 返回保存结果，失败时编辑弹窗保持打开
+        return res
     }
 
     // Publish assistant online

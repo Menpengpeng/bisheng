@@ -139,6 +139,24 @@ const store = createStore<State & Actions>((set, get) => ({
             if (type === 'end') {
                 return { messages: newChat.filter(msg => msg.message_id !== message.unique_id) }
             }
+            // Runtime node status (e.g. SQL agent querying) updates the
+            // existing node_run row and the node's streaming message in place.
+            if (type === 'info') {
+                const statusAt = message.status === 'sql_querying' ? Date.now() : undefined
+                return {
+                    messages: newChat.map(msg => {
+                        if (msg.message_id === message.unique_id) return { ...msg, status: message.status }
+                        if (msg.category === 'stream_msg' && msg.node_id === message.node_id) {
+                            return {
+                                ...msg,
+                                node_status: message.status,
+                                node_status_at: statusAt ?? msg.node_status_at
+                            }
+                        }
+                        return msg
+                    })
+                }
+            }
             newChat.push({
                 category, flow_id, chat_id, message_id: message.unique_id, files, is_bot,
                 message, receiver, source, user_id,

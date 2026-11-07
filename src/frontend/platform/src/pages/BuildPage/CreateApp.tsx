@@ -179,14 +179,16 @@ const CreateApp = forwardRef<ModalRef, ModalProps & { loca?: any }>(
             const request = generation.current;
             try {
             if (isEditMode) {
-                await onSave({
+                const res = await onSave({
                     name: formData.name,
                     description: formData.desc,
                     logo: formData.url,
                     viewUrl: formData.viewUrl,
                 })
-                setOpen(false);
-                return;
+                setLoading(false);
+                // 保存失败时保持弹窗打开，避免用户编辑信息丢失
+                if (res) setOpen(false);
+                return
             }
 
             const template = tempDataRef.current ? JSON.parse(JSON.stringify(tempDataRef.current)) : null;

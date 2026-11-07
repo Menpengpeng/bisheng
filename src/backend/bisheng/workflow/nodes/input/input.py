@@ -120,12 +120,14 @@ class InputNode(BaseNode):
             logger.debug(f"{self.name} recommended questions chat history is empty")
             return
         recommended_system_prompt, _ = self.parse_msg_with_variables(recommended_system_prompt)
-        llm_obj = LLMService.get_bisheng_llm_sync(
+        # 推荐问题所用模型不可用时降级为系统默认工作流模型
+        llm_obj = LLMService.get_bisheng_llm_for_workflow_sync(
             model_id=recommended_llm,
             app_id=self.workflow_id,
             app_name=self.workflow_name,
             app_type=ApplicationTypeEnum.WORKFLOW,
             user_id=self.user_id,
+            tenant_id=self.tenant_id,
         )
         user_prompt = f"# Current Conversation Context\n{chat_history}"
         result = llm_obj.invoke([SystemMessage(content=recommended_system_prompt), HumanMessage(content=user_prompt)])
@@ -337,8 +339,11 @@ class InputNode(BaseNode):
         texts = []
         metadatas = []
         try:
-            file_rule = FileProcessBase(knowledge_id=0)
             from bisheng.chat_session.domain.services.workflow_file_service import WorkflowFileService
+
+            # 临时文件解析显式关闭分块重叠: 避免重叠文本重复占用"解析结果长度上限"预算
+            # (否则拼接后的文本会比原文长约 10%, 导致上限 20000 时实际仅覆盖约 18000 字原文)
+            file_rule = FileProcessBase(knowledge_id=0, chunk_overlap=0)
             from bisheng.knowledge.rag.pipeline.types import PipelineConfig
             from bisheng.knowledge.rag.temp_file_pipeline import TempFilePipeline
 

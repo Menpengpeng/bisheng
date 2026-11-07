@@ -55,10 +55,9 @@ function parseToValue(input, paramItem) {
         });
         return result;
     };
-    // Typing a space next to an inserted variable makes the browser write a
-    // non-breaking space (U+00A0) instead, because a plain one would collapse
-    // against the chip. It looks identical and reaches the tool verbatim, so a
-    // query built this way fails with a syntax error nobody can see.
+    // 在已插入的变量旁输入空格时，浏览器会写入不间断空格（U+00A0）而非普通空格，
+    // 因为普通空格会与变量标签折叠在一起。两者看起来完全一致且会被原样传给工具，
+    // 这样拼接出的查询会报出难以察觉的语法错误，因此读回时统一还原为普通空格
     return traverseNodes(tempDiv).replace(/\u00A0/g, ' ');
 }
 

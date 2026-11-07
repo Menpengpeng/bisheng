@@ -5,7 +5,7 @@ import { splitMessageContent } from '../core/messageContent';
 import type { RunPresentation } from '../core/describeRun';
 import type { ChatMessage } from '../core/types';
 import { ChoiceMessage } from './ChoiceMessage';
-import { MessageBubble, ReasoningDetails } from './MessageBubble';
+import { MessageBubble, ReasoningDetails, RuntimeStatusText, type RuntimeStatus } from './MessageBubble';
 import { MessageFrame } from './MessageFrame';
 import { GreetingMessage } from './GreetingMessage';
 
@@ -24,17 +24,21 @@ export interface ConversationMessageSlots {
   selection?: (message: ChatMessage) => ReactNode;
   footer?: (message: ChatMessage, contentRef: RefObject<HTMLDivElement>) => ReactNode;
   runPresentation?: (message: ChatMessage) => RunPresentation;
+  /** 二开：运行中节点的状态提示（如 SQL agent） */
+  runtimeStatus?: (message: ChatMessage) => RuntimeStatus | undefined;
 }
 export interface ConversationMessagesProps {
   messages: readonly ChatMessage[];
   canExecute: boolean;
   labels: ConversationLabels;
   slots: ConversationMessageSlots;
+  /** 二开：格式化已等待秒数的文案 */
+  formatElapsed?: (seconds: number) => string;
   onChoice?: (message: ChatMessage, value: string) => void | Promise<void>;
   onError?: (error: unknown) => void;
 }
 interface ConversationRowProps extends Omit<ConversationMessagesProps, 'messages'> { message: ChatMessage }
-function ConversationRow({ message, canExecute, labels, slots, onChoice, onError }: ConversationRowProps) {
+function ConversationRow({ message, canExecute, labels, slots, formatElapsed, onChoice, onError }: ConversationRowProps) {
   const contentRef = useRef<HTMLDivElement>(null);
   const payload = asRecord(message.payload);
   const { text, reasoning } = splitMessageContent(message.text);
@@ -67,10 +71,14 @@ function ConversationRow({ message, canExecute, labels, slots, onChoice, onError
   }
   if (message.kind === 'run') {
     const run = slots.runPresentation?.(message);
-    if (message.category === 'node_run') return <div className="py-1 px-4 flex items-center font-bold gap-2 text-sm">
-      {!message.final && <Outlined.Loading size={16} className="animate-spin text-primary" />}
-      <span>{displayText(payload.name)}</span>
-    </div>;
+    if (message.category === 'node_run') {
+      const runtimeStatus = slots.runtimeStatus?.(message);
+      return <div className="py-1 px-4 flex items-center font-bold gap-2 text-sm">
+        {!message.final && <Outlined.Loading size={16} className="animate-spin text-primary" />}
+        <span>{displayText(payload.name)}</span>
+        {runtimeStatus?.text && <RuntimeStatusText status={runtimeStatus} formatElapsed={formatElapsed} />}
+      </div>;
+    }
     return <div><details className="py-1 rounded-sm border max-w-[90%]">
       <summary className="flex items-center gap-2 px-4 py-2 cursor-pointer text-sm font-bold">
         {!message.final ? <Outlined.Loading size={16} className="animate-spin text-primary" />
@@ -83,7 +91,8 @@ function ConversationRow({ message, canExecute, labels, slots, onChoice, onError
   const reasoningText = message.reasoning || reasoning;
   return <MessageBubble title={title} logo={logo} sender={displayText(message.raw.sender)} contentRef={contentRef}
     selection={slots.selection?.(message)}
-    reasoning={<ReasoningDetails text={reasoningText} stopped={stopped} pending={!message.final && !stopped} labels={labels} />}
+    reasoning={<ReasoningDetails text={reasoningText} stopped={stopped} pending={!message.final && !stopped} labels={labels}
+      status={slots.runtimeStatus?.(message)} formatElapsed={formatElapsed} />}
     hideBody={!!reasoningText && !text && !message.files.length}
     status={stopStatus}
     pending={!stopped && message.kind !== 'user' && !message.final && !text && !message.files.length}

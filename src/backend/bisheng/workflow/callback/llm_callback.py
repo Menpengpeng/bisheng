@@ -7,7 +7,7 @@ from loguru import logger
 
 from bisheng.llm.domain.utils import extract_reasoning_content
 from bisheng.workflow.callback.base_callback import BaseCallback
-from bisheng.workflow.callback.event import OutputMsgData, StreamMsgData, StreamMsgOverData
+from bisheng.workflow.callback.event import NodeStatusData, OutputMsgData, StreamMsgData, StreamMsgOverData
 
 
 class LLMNodeCallbackHandler(BaseCallbackHandler):
@@ -55,6 +55,32 @@ class LLMNodeCallbackHandler(BaseCallbackHandler):
     def is_global_stream_suppressed(cls) -> bool:
         return getattr(cls._thread_state, "suppression_count", 0) > 0
 
+    def _emit_node_status(self, status: str) -> None:
+        """ Push a node-level status code so the frontend can show what is running
+        (e.g. SQL agent keeps silent for a long time). """
+        self.callback_manager.on_node_status(
+            NodeStatusData(
+                unique_id=self.unique_id,
+                node_id=self.node_id,
+                name=self.node_name,
+                status=status,
+            )
+        )
+
+    def _emit_thinking_hint(self, text: str) -> None:
+        """ Append a hint into the node thinking process (reasoning log), so long
+        silent tool calls such as sql_agent give visible feedback. """
+        self.callback_manager.on_stream_msg(
+            StreamMsgData(
+                node_id=self.node_id,
+                name=self.node_name,
+                msg='',
+                reasoning_content=text,
+                unique_id=self.unique_id,
+                output_key=self.output_key,
+            )
+        )
+
     def on_tool_start(self, serialized: dict[str, Any], input_str: str, **kwargs: Any) -> Any:
         """Run when tool starts running."""
         logger.debug(f"on_tool_start  serialized={serialized} input_str={input_str} kwargs={kwargs}")
@@ -69,6 +95,10 @@ class LLMNodeCallbackHandler(BaseCallbackHandler):
             )
         if serialized["name"] == "sql_agent":
             self.output = False
+            # Hint first so the streaming message exists before the status event
+            # arrives, then the frontend can attach the timer to it.
+            self._emit_thinking_hint("\n\n正在查询数据库，请稍候...\n")
+            self._emit_node_status("sql_querying")
 
     def on_tool_end(self, output: str, **kwargs: Any) -> Any:
         """Run when tool ends running."""
@@ -85,6 +115,7 @@ class LLMNodeCallbackHandler(BaseCallbackHandler):
             )
         if kwargs["name"] == "sql_agent":
             self.output = self._original_output
+            self._emit_node_status("sql_query_done")
 
     def on_tool_error(self, error: Union[Exception, KeyboardInterrupt], **kwargs: Any) -> Any:
         """Run when tool errors."""
@@ -99,6 +130,7 @@ class LLMNodeCallbackHandler(BaseCallbackHandler):
             )
         if kwargs["name"] == "sql_agent":
             self.output = self._original_output
+            self._emit_node_status("sql_query_failed")
 
     def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
         chunk = kwargs.get("chunk", None)

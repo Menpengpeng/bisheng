@@ -9,7 +9,7 @@ from bisheng.common.errcode.http_error import NotFoundError
 from bisheng.common.schemas.api import UnifiedResponseModel, resp_200
 from bisheng.knowledge.domain.models.knowledge_file import KnowledgeFileDao
 from bisheng.open_api.domain.scopes import open_api_scope
-from bisheng.open_endpoints.domain.schemas.citation import OpenCitationResponse
+from bisheng.open_endpoints.domain.schemas.citation import OpenCitationItem, OpenCitationResponse
 from bisheng.open_endpoints.domain.utils import get_open_api_operator_async
 from bisheng.permission.application.business_authorization import (
     check_business_action,
@@ -62,4 +62,15 @@ async def get_open_citation_detail(
         download_url=payload.downloadUrl,
         preview_url=payload.previewUrl,
         bbox=first_item.bbox if first_item else None,
+        items=[
+            OpenCitationItem(
+                item_id=citation_item.itemId,
+                chunk_id=citation_item.chunkId,
+                chunk_index=citation_item.chunkIndex,
+                content=citation_item.content,
+                bbox=citation_item.bbox,
+                page=citation_item.page,
+            )
+            for citation_item in payload.items
+        ],
     ))

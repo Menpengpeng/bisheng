@@ -2410,6 +2410,8 @@ class KnowledgeService(KnowledgeUtils):
         cls.update_chunk_updater_info(vector_client, es_client, db_knowledge, file_id, login_user)
 
         KnowledgeFileDao.update_file_updater(file_id, login_user.user_id, login_user.user_name)
+        # bump the knowledge base update time so the library list reflects the change
+        KnowledgeDao.update_knowledge_update_time(db_knowledge)
 
         return True
 
@@ -2455,6 +2457,8 @@ class KnowledgeService(KnowledgeUtils):
         cls.update_chunk_updater_info(vector_client, es_client, db_knowledge, file_id, login_user)
 
         KnowledgeFileDao.update_file_updater(file_id, login_user.user_id, login_user.user_name)
+        # bump the knowledge base update time so the library list reflects the change
+        KnowledgeDao.update_knowledge_update_time(db_knowledge)
 
         return True
 

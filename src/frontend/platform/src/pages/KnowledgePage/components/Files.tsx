@@ -435,6 +435,7 @@ export default function Files({ onPreview, canEditKb = false, canDeleteKb = fals
                             <TableHead className="min-w-[250px]">{t('fileName')}</TableHead>
                             <TableHead>{t('segmentationStrategy')}</TableHead>
                             <TableHead className="min-w-[150px]">{t('tags')}</TableHead>
+                            <TableHead className="min-w-[100px]">{t('creationTime')}</TableHead>
                             <TableHead className="min-w-[100px]">{t('updateTime')}</TableHead>
                             <TableHead className="flex items-center gap-4 min-w-[130px]">
                                 {t('status')}
@@ -499,6 +500,7 @@ export default function Files({ onPreview, canEditKb = false, canDeleteKb = fals
                                         onUpdate={reload}
                                     />
                                 </TableCell>
+                                <TableCell>{el.create_time?.replace('T', ' ')}</TableCell>
                                 <TableCell>{el.update_time.replace('T', ' ')}</TableCell>
 
                                 <TableCell>

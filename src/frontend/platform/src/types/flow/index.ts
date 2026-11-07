@@ -218,4 +218,7 @@ export interface WorkflowMessage {
   reasoning_log?: string; // 推理
   extra?: string;
   citations?: ChatCitation[] | null;
+  status?: string; // 节点运行状态码(node_run info)
+  node_status?: string; // 节点运行状态码(流消息)
+  node_status_at?: number; // 状态开始时间戳(ms)，用于前端计时
 }

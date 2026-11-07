@@ -41,13 +41,45 @@ def test_agent_node_history_respects_window_size():
         AIMessage(content='a1'),
         HumanMessage(content='q2'),
         AIMessage(content='a2'),
+        HumanMessage(content='q3'),
+        AIMessage(content='a3'),
     ]
 
+    # 按轮次截断: 保留最近 2 轮 (q2, q3), 每轮 Human+AI 完整保留
     messages = node._get_chat_history_messages()
 
-    assert len(messages) == 2
+    assert len(messages) == 4
     assert messages[0].content == 'q2'
     assert messages[1].content == 'a2'
+    assert messages[2].content == 'q3'
+    assert messages[3].content == 'a3'
+
+
+def test_agent_node_history_keeps_tool_pairs_intact_when_truncated():
+    node = AgentNode.__new__(AgentNode)
+    node._chat_history_flag = True
+    node._chat_history_num = 1
+    node._chat_history_messages = [
+        HumanMessage(content='q1'),
+        AIMessage(content='a1'),
+        HumanMessage(content='q2'),
+        AIMessage(content='', tool_calls=[{
+            'name': 'search',
+            'args': {},
+            'id': 'call_2',
+        }]),
+        ToolMessage(content='result', tool_call_id='call_2'),
+        AIMessage(content='a2'),
+    ]
+
+    # 取最近 1 轮: 整轮保留, tool_calls 与 tool 响应配对结构不被截断拆开
+    messages = node._get_chat_history_messages()
+
+    assert len(messages) == 4
+    assert isinstance(messages[0], HumanMessage)
+    assert messages[1].tool_calls
+    assert isinstance(messages[2], ToolMessage)
+    assert messages[3].content == 'a2'
 
 
 def test_agent_node_parse_log_keeps_only_real_tool_logs():

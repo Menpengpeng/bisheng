@@ -461,7 +461,7 @@
       },
       "chat_history_flag": {
         "label": "履歴チャット",
-        "help": "モデルコンテキストに履歴メッセージの数を含めます。0の場合、コンテキスト情報は含まれません"
+        "help": "モデルコンテキストに含める履歴会話のラウンド数。0の場合、コンテキスト情報は含まれません"
       },
       "image_prompt": {
         "label": "視覚",
@@ -624,5 +624,11 @@
   "rerunWorkflow": "再実行",
   "type": "タイプ",
   "valueType": "値のタイプ",
-  "selectDbType": "データベースの種類を選択"
+  "selectDbType": "データベースの種類を選択",
+  "workflowStatus": {
+    "sql_querying": "データベースを照会中...",
+    "sql_query_done": "照会が完了しました。結果を整理しています...",
+    "sql_query_failed": "照会で問題が発生しました。結果を整理しています...",
+    "elapsed": "{{seconds}}秒経過"
+  }
 }
