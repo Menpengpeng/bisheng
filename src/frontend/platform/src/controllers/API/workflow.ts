@@ -20,15 +20,16 @@ export const getWorkflowReportTemplate = async (key: string, flowId: string): Pr
 
 /**
  * 导入报告模板后立即落盘（复用 OnlyOffice 保存回调接口）
+ * 与手动保存 saveWorkflowReportTemplate 同名冲突，这里独立命名
  */
-export const saveWorkflowReportTemplate = async (url: string, key: string): Promise<any> => {
+export const persistImportedReportTemplate = async (url: string, key: string): Promise<any> => {
     return await axios.post(`/api/v1/workflow/report/callback`, { status: 2, url, key });
 }
 
 /**
  * 创建工作流
  */
-export const createWorkflowApi = async (name, desc, url, flow): Promise<any> => {
+export const createWorkflowApi = async (name, desc, url, flow?): Promise<any> => {
     if (url) {
         // logo保存相对路径
         url = url.replace('/bisheng', '')
@@ -73,7 +74,7 @@ export async function deleteVersion(versionId: string) {
  * @returns {Promise<any>}.
  * @throws .
  */
-export async function createWorkFlowVersion(flow_id, versionData: { name: string, description: string, original_version_id: number, data: any }) {
+export async function createWorkFlowVersion(flow_id, versionData: { name: string, description: string, original_version_id: number, data: any }): Promise<any> {
     return await axios.post(`/api/v1/workflow/versions?flow_id=${flow_id}`, versionData);
 }
 
@@ -84,7 +85,7 @@ export async function createWorkFlowVersion(flow_id, versionData: { name: string
  * @returns {Promise<any>}.
  * @throws .
  */
-export async function getVersionDetails(versionId: string) {
+export async function getVersionDetails(versionId: string | number): Promise<any> {
     return await axios.get(`/api/v1/workflow/versions/${versionId}`);
 }
 
@@ -96,7 +97,7 @@ export async function getVersionDetails(versionId: string) {
  * @returns {Promise<any>}.
  * @throws .
  */
-export async function updateVersion(versionId: string, versionData: { name: string, description: string, data: any }) {
+export async function updateVersion(versionId: string | number, versionData: { name: string, description: string, data: any }): Promise<any> {
     return await axios.put(`/api/v1/workflow/versions/${versionId}`, versionData);
 }
 
@@ -123,9 +124,9 @@ export async function changeWorkflowCurrentVersion({ flow_id, version_id }: { fl
 /** 上线工作流 & 修改信息 
  * status: 2 上线 1 下线
 */
-export const onlineWorkflow = async (flow, status = ''): Promise<any> => {
+export const onlineWorkflow = async (flow, status: number | string = ''): Promise<any> => {
     const { name, description, logo } = flow
-    const data = { name, description, logo }
+    const data: any = { name, description, logo }
     if (status) {
         data['status'] = status
         delete data['logo']

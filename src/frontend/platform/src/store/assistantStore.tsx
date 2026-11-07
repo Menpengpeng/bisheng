@@ -17,6 +17,8 @@ type Actions = {
   // The backend stores the generated description itself, so this does not mark the page as changed
   setGeneratedDesc: (desc: string) => void
   saveAfter: () => void
+  /** 仅更新本地助手状态，不标记为已修改 */
+  changeStatus: (status: number) => void
   destroy: () => void
 }
 

@@ -12,7 +12,7 @@ import { useTranslation } from "react-i18next";
 import useFlowStore from "../../flowStore";
 
 
-const TabsHead = memo(({ tab, onChange }) => {
+const TabsHead = memo(({ tab, onChange }: { tab: KnowledgeTypeValues; onChange: (key: string) => void }) => {
     const { t } = useTranslation('flow');
 
     return (
@@ -83,7 +83,7 @@ export default function KnowledgeSelectItem({ data, nodeId, onChange, onVarEvent
     // input文件变量s
     const loadFiles = () => {
         const files = []
-        flow.nodes.forEach(node => {
+        flow.nodes.forEach((node: any) => {
             if (node.data.type !== 'input') return
             if (node.data.tab.value === "dialog_input") return
             node.data.group_params.forEach(group => {
@@ -138,7 +138,7 @@ export default function KnowledgeSelectItem({ data, nodeId, onChange, onVarEvent
         else loadFiles()
 
         setTabType(val)
-        const inputDom = document.getElementById('knowledge-select-item')
+        const inputDom = document.getElementById('knowledge-select-item') as HTMLInputElement | null
         if (inputDom) {
             inputDom.value = ''
         }

@@ -18,6 +18,7 @@ import { ClientMessageAttachments } from "./components/ClientMessageAttachments"
 import { ClientUserActions } from "./components/ClientUserActions";
 import { emitAreaTextEvent, EVENT_TYPE } from "./useAreaText";
 import { useMemo } from "react";
+import type { RunningStatus } from "~/@types/chat";
 import { useRecoilValue } from "recoil";
 import type { CitationReferencesDesktopPayload } from "~/components/Chat/Messages/Content/CitationReferencesDrawer";
 import { SelectionMessagesProvider, SelectAllBelowBanner } from "~/components/Chat/MessageSelection";
@@ -60,7 +61,8 @@ export default function ChatMessages({
   selectionActive = false,
 }: ChatMessagesProps) {
   const { messageScrollRef, messages, chatId } = useMessage(readOnly);
-  const { inputForm, guideWord, inputDisabled, error } = useRecoilValue(currentRunningState);
+  // 当前会话尚未建立运行态时选择器返回 null，这里按空对象兜底避免解构报错
+  const { inputForm, guideWord, inputDisabled, error } = (useRecoilValue(currentRunningState) ?? {}) as RunningStatus;
   const chatState = useRecoilValue(currentChatState);
   const config = useRecoilValue(bishengConfState);
   const latexParsing = useRecoilValue(appStore.LaTeXParsing);
@@ -202,8 +204,8 @@ export default function ChatMessages({
           />
         )}
         {!readOnly &&
-          !error?.code && inputForm &&
-          (chatState?.flow.flow_type === 10 ? (
+          !error?.code && inputForm && chatState &&
+          (chatState.flow.flow_type === 10 ? (
             <InputForm data={inputForm} flow={chatState.flow} logo={logo} />
           ) : (
             <InputFormSkill flow={chatState.flow} logo={logo} />

@@ -155,7 +155,7 @@ export const playDing = () => {
 export const toggleNav = (shouldExpand) => {
   return // 去掉自动收起展开
   // 获取导航栏切换按钮元素
-  const navToggle = document.querySelector('div[id="toggle-left-nav"]');
+  const navToggle = document.querySelector('div[id="toggle-left-nav"]') as HTMLElement | null;
 
   if (!navToggle) {
     console.error('未找到导航栏切换按钮');
@@ -163,12 +163,12 @@ export const toggleNav = (shouldExpand) => {
   }
 
   // 获取当前展开状态
-  const isExpanded = navToggle.getAttribute('aria-expanded') === 'true';
+  const isExpanded = navToggle?.getAttribute('aria-expanded') === 'true';
 
   // 判断是否需要操作
   if ((shouldExpand && !isExpanded) || (!shouldExpand && isExpanded)) {
     // 触发点击事件来切换状态
-    navToggle.click();
+    navToggle?.click();
   }
 }
 

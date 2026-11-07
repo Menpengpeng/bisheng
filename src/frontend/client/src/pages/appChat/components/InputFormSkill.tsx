@@ -1,7 +1,7 @@
 // @ts-strict-ignore
 
 import { Select } from "@bisheng/ui";
-import { forwardRef, useContext, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { forwardRef, useContext, useEffect, useImperativeHandle, useRef, useState, type ReactNode } from "react";
 import { getVariablesApi } from "~/api/apps";
 import { useToastContext } from "~/Providers";
 import { useLocalize } from "~/hooks";
@@ -17,7 +17,7 @@ import { MessageFrame } from '@bisheng/chat';
  * @description
  * 表单项数据由组件的参数信息和单独接口获取的必填信息及排序信息而来。
  */
-const InputFormSkill = forwardRef(({ flow, logo }, ref) => {
+const InputFormSkill = forwardRef<unknown, { flow: any; logo?: ReactNode }>(({ flow, logo }, ref) => {
     const type = 'chat'
     const vid = 0
     const { showToast } = useToastContext();
@@ -121,7 +121,7 @@ const InputFormSkill = forwardRef(({ flow, logo }, ref) => {
                                         fileTypes={["pdf"]}
                                         suffixes={flow.data.nodes.find(el => el.id === item.nodeId)
                                             ?.data.node.template.file_path.suffixes || ['xxx']}
-                                        onFileChange={(val: string) => handleChange(i, val)}
+                                        onFileChange={(val) => handleChange(i, val)}
                                         flow={flow}
                                     ></InputFileComponent> : <></>
                         }

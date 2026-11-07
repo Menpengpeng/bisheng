@@ -9,6 +9,8 @@ export interface AssistantDetail {
     desc?: string;
     /** logo文件的相对地址，为空则不更新 */
     logo?: string;
+    /** logo文件的可访问地址，仅用于前端预览 */
+    viewLogo?: string;
     /** 用户可见的prompt，为空则不更新 */
     prompt?: string;
     /** 开场白，为空则不更新 */

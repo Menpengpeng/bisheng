@@ -277,7 +277,7 @@ export default function Apps() {
             if (item.flow_type === AppNumType.FLOW) {
                 const payload = JSON.parse(JSON.stringify(flow)) as typeof flow;
                 payload.name = `${flow.name}-${generateUUID(5)}`;
-                if (payload.data?.source) delete payload.data.source;
+                if ((payload.data as any)?.source) delete (payload.data as any).source;
                 if (payload.data?.nodes?.length) {
                     for (const node of payload.data.nodes) {
                         await copyReportTemplate(node.data);
@@ -437,7 +437,7 @@ export default function Apps() {
                             <AppTempSheet onSelect={handleCreateApp} onCustomCreate={handleCreateApp}>
                                 <CardComponent<FlowType>
                                     data={null}
-                                    type='assist'
+                                    type={AppType.ASSISTANT}
                                     title={t('log.createBuild')}
                                     description={(<>
                                         <p><p>{t('build.provideSceneTemplates')}</p></p>
@@ -502,7 +502,7 @@ export default function Apps() {
                                     headSelecter={(
                                         item.version_list?.length ? <CardSelectVersion
                                             showPop={item.status !== 2}
-                                            data={item}
+                                            data={item as any}
                                         /> : null)}
                                     labelPannel={
                                         <LabelShow

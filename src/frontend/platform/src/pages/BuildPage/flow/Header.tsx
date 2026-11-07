@@ -32,6 +32,14 @@ import useFlowStore from "./flowStore";
 import { useBeforeUnload } from "./hooks/useBeforeUnload";
 import { useNodeEvent } from "./hooks/useNodeEvent";
 import Notification from "./Notification";
+
+declare global {
+    interface Window {
+        /** 版本切换时暂存的目标版本 id，供 refrenshVersions 消费后删除 */
+        flow_version?: number
+    }
+}
+
 const APP_HEADER_ACTIONS = [
     'edit',
     'publish',
@@ -318,7 +326,7 @@ const Header = ({ flow, nodes, onTabChange, preFlow, onPreFlowChange, onImportFl
                         dropDown={(
                             <div className=" overflow-y-auto max-h-96 max-h">
                                 <RadioGroup value={version.id + ''} onValueChange={handleUiRequest(async (vid) => {
-                                    if (isOnlineVersionFun() && hasChanged) return setModelVersionId(vid)
+                                    if (isOnlineVersionFun() && hasChanged) return setModelVersionId(Number(vid))
                                     const { edges, nodes, viewport } = flow
                                     await updateVersion(version.id, {
                                         name: version.name, description: '', data: {

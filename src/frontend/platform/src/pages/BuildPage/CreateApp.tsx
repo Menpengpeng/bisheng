@@ -30,13 +30,20 @@ type ModalRef = {
     edit: (type: string, appId: string) => void;
 };
 
-const CreateApp = forwardRef<ModalRef, ModalProps & { loca?: any }>(
+type CreateAppProps = ModalProps & {
+    loca?: any;
+    /** 编辑模式下保存基础信息，返回保存结果；false/undefined 表示失败 */
+    onSave?: (base: { name: string; description: string; logo: string; viewUrl: string }) => Promise<any>;
+};
+
+const CreateApp = forwardRef<ModalRef, CreateAppProps>(
     ({ onSave, loca }, ref) => {
         const [open, setOpen] = useState(false);
         const [formData, setFormData] = useState({
             url: '',
             name: '',
             desc: '',
+            viewUrl: '',
         });
         const [appType, setType] = useState<AppType>(AppType.ASSISTANT); // assistant or workflow
         const [isEditMode, setIsEditMode] = useState(false); // edit mode
@@ -66,6 +73,7 @@ const CreateApp = forwardRef<ModalRef, ModalProps & { loca?: any }>(
                     url: '',
                     name: '',
                     desc: '',
+                    viewUrl: '',
                 });
                 if (tempId) {
                     void handleSelectTemplate(type, tempId);
@@ -113,7 +121,7 @@ const CreateApp = forwardRef<ModalRef, ModalProps & { loca?: any }>(
                 const [template] = await readTempsDatabase(type, tempId);
                 if (request !== generation.current) return;
                 tempDataRef.current = JSON.parse(JSON.stringify(template));
-                setFormData({ url: template.logo || '', name: `${template.name}-${generateUUID(5)}`, desc: template.description || '' });
+                setFormData({ url: template.logo || '', name: `${template.name}-${generateUUID(5)}`, desc: template.description || '', viewUrl: '' });
             } catch (error) {
                 if (request === generation.current) { setOpen(false); showApiError(error); }
             } finally {
@@ -126,6 +134,7 @@ const CreateApp = forwardRef<ModalRef, ModalProps & { loca?: any }>(
                 url: flow.logo,
                 name: flow.name,
                 desc: flow.description,
+                viewUrl: '',
             });
         };
 
@@ -313,7 +322,7 @@ const CreateApp = forwardRef<ModalRef, ModalProps & { loca?: any }>(
                     </div>
                     <DialogFooter>
                         <DialogClose>
-                            <Button variant="outlined" type="button" onClick={() => setFormData({ name: '', desc: '', url: '' })} color="default">
+                            <Button variant="outlined" type="button" onClick={() => setFormData({ name: '', desc: '', url: '', viewUrl: '' })} color="default">
                                 {t('cancel')}
                             </Button>
                         </DialogClose>
