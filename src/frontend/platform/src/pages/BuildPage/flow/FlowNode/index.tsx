@@ -1,23 +1,26 @@
 // @ts-strict-ignore
+import { Alert, toast } from '@bisheng/ui';
 import { LoadingIcon } from '@/components/bs-icons/loading';
-import { Card, CardContent } from '@/components/bs-ui/card';
-import { useToast } from '@/components/bs-ui/toast/use-toast';
+import { Card,CardContent } from '@/components/bs-ui/card';
+
 import { cname } from '@/components/bs-ui/utils';
+import { locationContext } from '@/contexts/locationContext';
 import { WorkflowNode } from '@/types/flow';
-import { Handle, NodeToolbar, Position } from '@xyflow/react';
-import { ChevronDown } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Handle,NodeToolbar,Position } from '@xyflow/react';
+import { Outlined } from "bisheng-icons";
+
+import { useCallback,useContext,useEffect,useMemo,useRef,useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import Sidebar from '../Sidebar';
 import EditText from './EditText';
 import NodeLogo from './NodeLogo';
 import NodeTabs from './NodeTabs';
 import NodeToolbarComponent from './NodeToolbarComponent';
 import ParameterGroup from './ParameterGroup';
+import ParameterSubGroup from './ParameterSubGroup';
 import RunLog from './RunLog';
 import { RunTest } from './RunTest';
 import { useUpdateVariableState } from './flowNodeStore';
-import { useTranslation } from 'react-i18next';
-import ParameterSubGroup from './ParameterSubGroup';
 
 export const CustomHandle = ({ id = '', node, isLeft = false, className = '' }) => {
     const [openLeft, setOpenLeft] = useState(false);
@@ -108,9 +111,10 @@ export const CustomHandle = ({ id = '', node, isLeft = false, className = '' }) 
 function CustomNode({ data: node, selected, isConnectable }: { data: WorkflowNode, selected: boolean, isConnectable: boolean }) {
     const [focusUpdate, setFocusUpdate] = useState(false)
     const runRef = useRef(null)
-    const { message } = useToast()
+
     const [currentTab, setCurrentTab] = useState<undefined | string>(node.tab && node.tab.value)
     const { t } = useTranslation('flow')
+    const { appConfig } = useContext(locationContext)
 
     // 检查知识库检索设置
     const hasKnowledgeSearchEnabled = useMemo(() => {
@@ -173,10 +177,7 @@ function CustomNode({ data: node, selected, isConnectable }: { data: WorkflowNod
         // vilidate node
         const errors = await validateAll({ tmp: true })
 
-        if (errors.length) return message({
-            description: errors,
-            variant: 'warning'
-        })
+        if (errors.length) return toast.show({ type: 'warning', message: errors.filter(Boolean).join('\n') })
 
         runRef.current.run(node)
     }
@@ -215,7 +216,7 @@ function CustomNode({ data: node, selected, isConnectable }: { data: WorkflowNod
                     const searchStr = map[type]
                     if (!currentValue.includes(searchStr)) {
                         hackCountRef.current++
-                        const hackSpace = hackCountRef.current % 2 === 0 ? ' ' : '' // Avoid React's refresh mechanism 
+                        const hackSpace = hackCountRef.current % 2 === 0 ? ' ' : '' // Avoid React's refresh mechanism
                         targetParam.value = currentValue === '\n' ? searchStr : `${currentValue}\n${searchStr}${hackSpace}`;
                     }
                 }
@@ -287,7 +288,7 @@ function CustomNode({ data: node, selected, isConnectable }: { data: WorkflowNod
                                 setExpend(!expend)
                                 node.expand = !expend
                             }}>
-                            <ChevronDown
+                            <Outlined.Down
                                 className={`bisheng-label ${expend && 'rotate-180'}`}
                                 size={16}
                             /></div>}
@@ -305,6 +306,15 @@ function CustomNode({ data: node, selected, isConnectable }: { data: WorkflowNod
                         <p className='text-xs text-muted-foreground mt-2 min-h-4'>{node.description}</p>
                     </EditText>
                 </div>
+                {/* The Code node runs unsandboxed Python, so it ships switched off.
+                    Say so here rather than letting the author find out from a failed run. */}
+                {node.type === 'code' && !appConfig.codeNodeEnabled && (
+                    <Alert
+                        type="warning"
+                        description={t('node.code.disabledHint')}
+                    />
+                )}
+
                 {/* body */}
                 <div className='-nowheel bg-[#F7F8FB] dark:bg-background pb-5 rounded-b-[20px]'>
                     <div className={expend || ['output', 'condition', 'end'].includes(node.type) ? `` : 'h-0 overflow-hidden'}>

@@ -1,10 +1,10 @@
 import { useState, useMemo, useCallback, useRef } from 'react';
 import { OptionTypes } from '~/types/chat';
 import type { DynamicSettingProps } from '~/types/chat';
-import { Label, Input, HoverCard, HoverCardTrigger, Tag } from '~/components/ui';
+import { Label, Input, HoverCard, HoverCardTrigger } from '~/components/ui';
+import { Tag } from '@bisheng/ui';
 import { useChatContext, useToastContext } from '~/Providers';
 import { TranslationKeys, useLocalize, useParameterEffects } from '~/hooks';
-import { cn, defaultTextProps } from '~/utils';
 import OptionHover from './OptionHover';
 import { ESide } from '~/common';
 
@@ -143,17 +143,18 @@ function DynamicTags({
               {currentTags && currentTags.length > 0 && (
                 <div className="flex w-full gap-1 p-1">
                   {currentTags.map((tag: string, index: number) => (
-                    <Tag
-                      key={`${tag}-${index}`}
-                      label={tag}
-                      onClick={onTagClick}
-                      onRemove={() => {
-                        onTagRemove(index);
-                        if (inputRef.current) {
-                          inputRef.current.focus();
-                        }
-                      }}
-                    />
+                    <div key={`${tag}-${index}`} onClick={onTagClick}>
+                      <Tag
+                        closable
+                        closeLabel={localize('com_ui_delete')}
+                        onClose={() => {
+                          onTagRemove(index);
+                          inputRef.current?.focus();
+                        }}
+                      >
+                        {tag}
+                      </Tag>
+                    </div>
                   ))}
                 </div>
               )}
@@ -175,7 +176,7 @@ function DynamicTags({
                 }}
                 onChange={(e) => setTagText(e.target.value)}
                 placeholder={placeholderCode ? localize(placeholder as TranslationKeys) ?? placeholder : placeholder}
-                className={cn('flex h-10 max-h-10 border-none bg-surface-secondary px-3 py-2')}
+                className="border-none bg-surface-secondary"
               />
             </div>
           </div>

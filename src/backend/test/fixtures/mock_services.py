@@ -70,6 +70,10 @@ class _KnowledgeUtilsPlaceholder:
         return "preview-cache-key"
 
     @classmethod
+    def preview_cache_key_for_split_rule(cls, *args, **kwargs):
+        return "preview-cache-key"
+
+    @classmethod
     async def process_retry_files(cls, *args, **kwargs):
         return ([], set())
 
@@ -132,6 +136,7 @@ PREMOCK_MODULES: list[str] = [
     # config_service and telemetry — deepest offenders
     "bisheng.common.services",
     "bisheng.common.services.base",
+    "bisheng.common.services.metric_log",
     "bisheng.common.services.config_service",
     "bisheng.common.services.telemetry",
     "bisheng.common.services.telemetry.telemetry_service",

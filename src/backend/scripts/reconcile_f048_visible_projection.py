@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Audit or repair the F048 flattened visible projection.
+"""Audit or repair F048 visible and service-account marker projections.
 
 The command is safe for production use when run in a maintenance window.  It
 uses PermissionGrant/PermissionGrantAssignee as the canonical authorization
 source, rebuilds permission_visible_source_projection, idempotently ensures
 all expected direct ``visible`` tuples, verifies them at higher consistency,
-and can perform the immutable Authorization Model + Catalog forward cutover required after an
-older F048 migration. An explicit orphan audit compares Store tuples with all
+mirrors CURRENT resource mode markers for ``service_account:*``, and can
+perform the immutable Authorization Model + Catalog forward cutover required
+after an older F048 migration. An explicit orphan audit compares Store tuples with all
 ACTIVE SQL visible-source contributions. Orphan cleanup is separately gated by
 ``--cleanup-orphan-tuples`` and the checksum printed by a prior dry-run.
 
@@ -36,6 +37,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from types import SimpleNamespace
 from typing import Any
 
 _BACKEND_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -53,7 +55,9 @@ from bisheng.core.context.manager import (  # noqa: E402
 from bisheng.core.context.tenant import bypass_tenant_filter  # noqa: E402
 from bisheng.core.database import get_async_db_session  # noqa: E402
 from bisheng.core.openfga.authorization_model_f048 import (  # noqa: E402
+    MIGRATED_RESOURCE_TYPES,
     MODEL_VERSION,
+    OWNER_PROJECTION_RESOURCE_TYPES,
     authorization_model_checksum,
     get_authorization_model_f048,
 )
@@ -70,6 +74,7 @@ from bisheng.permission.application.catalog_api import (  # noqa: E402
     SqlCatalogImpact,
     SqlCatalogState,
 )
+from bisheng.permission.application.catalog_bootstrap import _catalog_tuples  # noqa: E402
 from bisheng.permission.application.control_state import (  # noqa: E402
     SqlPermissionControlState,
 )
@@ -120,6 +125,7 @@ EXIT_OK = 0
 EXIT_BLOCKED = 3
 EXIT_RUNTIME_ERROR = 4
 HIGHER_CONSISTENCY = "HIGHER_CONSISTENCY"
+SERVICE_ACCOUNT_MARKER_SUBJECT = "service_account:*"
 ACTIVE_OPERATION_STATUSES = ("PREPARED", "STAGING", "COMMIT_UNKNOWN", "COMMITTED")
 
 
@@ -152,6 +158,8 @@ class ReconcileReport:
     persisted_active_source_count: int
     source_upsert_count: int
     source_retire_count: int
+    visible_tuple_count: int
+    service_account_marker_tuple_count: int
     expected_tuple_count: int
     source_checksum: str
     expected_tuple_checksum: str
@@ -433,6 +441,66 @@ async def _load_persisted_sources() -> tuple[PermissionVisibleSourceProjection, 
             )
 
 
+async def load_service_account_resource_markers() -> frozenset[tuple[str, str, str]]:
+    """Compile SA state gates from the authoritative CURRENT resource modes."""
+
+    with bypass_tenant_filter():
+        async with get_async_db_session() as session:
+            rows = tuple(
+                (
+                    await session.exec(
+                        select(ResourcePermissionMode)
+                        .where(ResourcePermissionMode.projection_state == "CURRENT")
+                        .order_by(
+                            ResourcePermissionMode.tenant_id,
+                            ResourcePermissionMode.resource_type,
+                            ResourcePermissionMode.resource_id,
+                        )
+                    )
+                ).all()
+            )
+    return _compile_service_account_resource_markers(rows)
+
+
+async def load_service_account_catalog_markers() -> frozenset[tuple[str, str, str]]:
+    """Compile the CURRENT Catalog's ``service_account:*`` markers from SQL.
+
+    A Catalog released before service accounts joined the model (2026-09-09)
+    carries only ``user:*`` markers on its model releases, so every action a
+    service account receives through a model (edit, use, manage_permission ...)
+    evaluates to false. Re-publishing a Catalog writes both subjects, but an
+    unchanged model never re-publishes one. This uses the exact rule a publish
+    or a fresh install uses (``catalog_bootstrap._catalog_tuples``) and keeps
+    only the service-account half; the ``user:*`` half is already there.
+    """
+
+    snapshot = await SqlPermissionControlState().current_catalog()
+    model_release = SimpleNamespace(models=tuple(model.snapshot for model in snapshot.models))
+    return frozenset(
+        (row["user"], row["relation"], row["object"])
+        for row in _catalog_tuples(snapshot.release_key, model_release)
+        if row["user"] == SERVICE_ACCOUNT_MARKER_SUBJECT
+    )
+
+
+def _compile_service_account_resource_markers(
+    rows: tuple[ResourcePermissionMode, ...],
+) -> frozenset[tuple[str, str, str]]:
+    supported_types = frozenset((*MIGRATED_RESOURCE_TYPES, *OWNER_PROJECTION_RESOURCE_TYPES))
+    tuples: set[tuple[str, str, str]] = set()
+    for row in rows:
+        _require(
+            row.resource_type in supported_types,
+            f"unsupported resource permission type: {row.resource_type}",
+        )
+        mode = row.mode.casefold()
+        _require(mode in {"custom", "inherit"}, f"invalid resource permission mode: {row.mode}")
+        object_key = f"{row.resource_type}:{row.resource_id}"
+        tuples.add(("service_account:*", "permission_enabled", object_key))
+        tuples.add(("service_account:*", f"{mode}_mode", object_key))
+    return frozenset(tuples)
+
+
 def _compile_sources(grants: tuple[GrantSnapshot, ...]):
     compiler = VisibilityProjectionCompiler()
     grouped: dict[int, list[GrantSnapshot]] = defaultdict(list)
@@ -471,6 +539,7 @@ def _build_report(
     assignee_count: int,
     canonical_sources: tuple[Any, ...],
     persisted: tuple[PermissionVisibleSourceProjection, ...],
+    resource_marker_tuples: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> tuple[ReconcileReport, tuple[Any, ...], tuple[PermissionVisibleSourceProjection, ...], frozenset]:
     desired = {_source_key(row): row for row in canonical_sources}
     persisted_active = {_source_key(row): row for row in persisted if row.state == "ACTIVE"}
@@ -482,7 +551,8 @@ def _build_report(
         or persisted_active[key].tuple_fingerprint != row.tuple_fingerprint
     )
     retires = tuple(row for key, row in sorted(persisted_active.items()) if key not in desired)
-    expected = frozenset(_tuple_key(row) for row in canonical_sources)
+    visible_tuples = frozenset(_tuple_key(row) for row in canonical_sources)
+    expected = visible_tuples | resource_marker_tuples
     report = ReconcileReport(
         mode=mode,
         store_id=current.store_id,
@@ -496,6 +566,8 @@ def _build_report(
         persisted_active_source_count=len(persisted_active),
         source_upsert_count=len(upserts),
         source_retire_count=len(retires),
+        visible_tuple_count=len(visible_tuples),
+        service_account_marker_tuple_count=len(resource_marker_tuples),
         expected_tuple_count=len(expected),
         source_checksum=_checksum([row.model_dump(mode="json") for row in sorted(canonical_sources, key=_source_key)]),
         expected_tuple_checksum=_checksum(sorted(expected)),
@@ -783,6 +855,33 @@ async def _verify_expected_tuples(
         )
 
 
+async def ensure_service_account_resource_markers(
+    client: FGAClient,
+    expected: frozenset[tuple[str, str, str]],
+) -> None:
+    """Repair resource-state gates after the caller establishes maintenance.
+
+    Both the model publisher and the full reconciler use CURRENT SQL modes as
+    their source. Never turn CUSTOM resources into INHERIT or create per-account
+    descendant Grants. Duplicate-ignore writes make unchanged-model runs safe.
+    """
+    await _ensure_expected_tuples(client, expected, batch_size=80)
+    await _verify_expected_tuples(client, expected)
+
+
+async def ensure_service_account_catalog_markers(
+    client: FGAClient,
+    expected: frozenset[tuple[str, str, str]],
+) -> None:
+    """Write and verify the CURRENT Catalog's service-account markers.
+
+    Additive and duplicate-ignoring, like the resource markers: the user half of
+    the Catalog and every Grant are left exactly as they are.
+    """
+    await _ensure_expected_tuples(client, expected, batch_size=80)
+    await _verify_expected_tuples(client, expected)
+
+
 async def _authorization_release_id(store_id: str, model_id: str) -> int:
     with bypass_tenant_filter():
         async with get_async_db_session() as session:
@@ -958,6 +1057,7 @@ async def execute(args: argparse.Namespace, *, live_settings: Any = settings) ->
         target_client = source_client
 
         grants, assignee_count = await _load_canonical_grants()
+        resource_marker_tuples = await load_service_account_resource_markers()
         canonical_sources = _compile_sources(grants)
         persisted = await _load_persisted_sources()
         report, upserts, retires, expected = _build_report(
@@ -969,6 +1069,7 @@ async def execute(args: argparse.Namespace, *, live_settings: Any = settings) ->
             assignee_count=assignee_count,
             canonical_sources=canonical_sources,
             persisted=persisted,
+            resource_marker_tuples=resource_marker_tuples,
         )
         print(json.dumps(asdict(report), ensure_ascii=False, sort_keys=True))
         orphan_audit: OrphanTupleAudit | None = None
@@ -1110,8 +1211,9 @@ async def execute(args: argparse.Namespace, *, live_settings: Any = settings) ->
                     "model_version": MODEL_VERSION,
                     "source_upserts": len(upserts),
                     "source_retires": len(retires),
-                    "visible_tuples_ensured": len(expected),
-                    "visible_tuples_verified": len(expected),
+                    "service_account_marker_tuples_ensured": len(resource_marker_tuples),
+                    "visible_tuples_ensured": report.visible_tuple_count,
+                    "expected_tuples_verified": len(expected),
                 },
                 ensure_ascii=False,
                 sort_keys=True,

@@ -23,6 +23,8 @@ class ConfigKeyEnum(Enum):
     WORKSTATION_KNOWLEDGE_SPACE = "workstation_knowledge_space"  # Knowledge Space Configuration
 
     LINSIGHT_LLM = "linsight_llm"  # workstation Default Model Configuration
+    JWT_SECRET = "jwt_secret"  # Generated JWT signing secret (F072); only used when config.yaml leaves it unset
+    SANDBOX_ENDPOINT = "sandbox_endpoint"  # Page-configured sandbox addresses and token ciphertext
 
 
 class ConfigBase(SQLModelSerializable):
@@ -130,3 +132,13 @@ class ConfigDao(ConfigBase):
                 await session.commit()
                 await session.refresh(new_config)
                 return new_config
+
+    @classmethod
+    def delete_by_key(cls, key: str) -> None:
+        """Drop one config row. Missing keys are a no-op."""
+        with get_sync_db_session() as session:
+            row = session.exec(select(Config).where(Config.key == key)).first()
+            if row is None:
+                return
+            session.delete(row)
+            session.commit()

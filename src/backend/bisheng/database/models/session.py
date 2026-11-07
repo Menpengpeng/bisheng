@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Integer
+from sqlalchemy import BigInteger, Index, Integer, String, or_
 from sqlmodel import Column, DateTime, Field, col, func, select, text, update
 
 from bisheng.common.models.base import SQLModelSerializable
@@ -23,6 +23,14 @@ class MessageSessionBase(SQLModelSerializable):
     chat_id: str = Field(default=None, primary_key=True, description="Session UniqueID")
     name: str | None = Field(default="", description="SessionName")
     flow_id: str = Field(default="", index=True, description="Apply UniqueID")
+    entry_flow_id: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String(255),
+            nullable=True,
+            comment="F071 knowledge-space visible entry override; null uses flow_id",
+        ),
+    )
     flow_type: int = Field(description="App type. Skills, assistants, workflows")
     flow_name: str = Field(default="", index=True, description="Application name")
     flow_description: str | None = Field(default=None, description="App Description")
@@ -39,6 +47,18 @@ class MessageSessionBase(SQLModelSerializable):
             index=True,
             comment="F017: user leaf tenant for INV-T13 derived-data attribution",
         ),
+    )
+    api_subject_type: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+    api_subject_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger().with_variant(Integer, "sqlite"), nullable=True),
+    )
+    external_user_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
     )
     group_ids: list[int] | None = Field(
         default=None, sa_column=Column(JsonType), description="Belongs to a user groupIDVertical"
@@ -60,6 +80,16 @@ class MessageSessionBase(SQLModelSerializable):
 
 class MessageSession(MessageSessionBase, table=True):
     __tablename__ = "message_session"
+    __table_args__ = (
+        Index("idx_message_session_entry_flow_id", "entry_flow_id"),
+        Index(
+            "idx_message_session_api_subject",
+            "tenant_id",
+            "api_subject_type",
+            "api_subject_id",
+            "update_time",
+        ),
+    )
 
 
 class MessageSessionDao(MessageSessionBase):
@@ -192,6 +222,13 @@ class MessageSessionDao(MessageSessionBase):
             statement = statement.order_by(MessageSession.create_time.desc())
         with get_sync_db_session() as session:
             return session.exec(statement).all()
+
+    @classmethod
+    def get_statement_results_sync(cls, statement, page: int = 0, limit: int = 0) -> list[MessageSession]:
+        if page and limit:
+            statement = statement.offset((page - 1) * limit).limit(limit)
+        with get_sync_db_session() as session:
+            return list(session.exec(statement).all())
 
     @classmethod
     async def afilter_session(
@@ -374,15 +411,26 @@ class MessageSessionDao(MessageSessionBase):
 
     @classmethod
     @retry_on_transient_db_conflict()
-    def update_session_name_sync(cls, chat_id: str, name: str):
+    def update_session_name_sync(
+        cls, chat_id: str, name: str, *, only_if_default: bool = False, tenant_id: int | None = None
+    ) -> bool:
         statement = (
             update(MessageSession)
             .where(col(MessageSession.chat_id) == chat_id)
             .values(name=name, update_time=datetime.now())
         )
+        if only_if_default:
+            if tenant_id is None:
+                raise ValueError("tenant_id is required for a generated session title")
+            # Bulk UPDATEs do not receive the automatic tenant SELECT filter.
+            statement = statement.where(
+                col(MessageSession.tenant_id) == tenant_id,
+                or_(col(MessageSession.name).is_(None), col(MessageSession.name).in_(["", "New Chat"])),
+            )
         with get_sync_db_session() as session:
-            session.exec(statement)
+            result = session.exec(statement)
             session.commit()
+            return result.rowcount > 0
 
     @classmethod
     async def get_user_used_apps(

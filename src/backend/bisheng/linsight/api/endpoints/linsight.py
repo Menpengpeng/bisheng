@@ -1,7 +1,8 @@
 import json
 import os
 import time
-from datetime import datetime
+import zipfile
+from io import BytesIO
 from typing import Literal, Union
 from urllib import parse
 
@@ -13,6 +14,8 @@ from starlette.websockets import WebSocket
 
 from bisheng.api.services.invite_code.invite_code import InviteCodeService
 from bisheng.api.v1.schemas import UnifiedResponseModel, resp_200
+from bisheng.citation.domain.services.citation_handle_service import strip_citation_handles
+from bisheng.citation.domain.services.citation_prompt_helper import strip_citation_markers
 from bisheng.common.constants.enums.telemetry import ApplicationTypeEnum, BaseTelemetryTypeEnum
 from bisheng.common.dependencies.user_deps import UserPayload
 from bisheng.common.errcode import BaseErrorCode
@@ -30,7 +33,7 @@ from bisheng.common.schemas.telemetry.event_data_schema import ApplicationAliveE
 from bisheng.common.services import telemetry_service
 from bisheng.common.services.config_service import settings
 from bisheng.core.cache.redis_manager import get_redis_client
-from bisheng.core.context.tenant import bypass_tenant_filter_if
+from bisheng.core.context.tenant import bypass_tenant_filter_if, get_current_tenant_id
 from bisheng.core.logger import trace_id_var
 from bisheng.core.storage.minio.minio_manager import get_minio_storage
 from bisheng.database.models.session import MessageSessionDao
@@ -46,6 +49,13 @@ from bisheng.linsight.domain.schemas.linsight_schema import (
     LinsightQuestionSubmitSchema,
     SubmitFileSchema,
 )
+from bisheng.linsight.domain.services.artifact_preview_service import LinsightArtifactPreviewService
+from bisheng.linsight.domain.services.deliverable_download_service import (
+    deliverable_workspace_path,
+    find_deliverable,
+    workspace_fetcher,
+)
+from bisheng.linsight.domain.services.md_image_refs import build_markdown_bundle, inline_local_images
 from bisheng.linsight.domain.services.message_stream_handle import MessageStreamHandle
 from bisheng.linsight.domain.services.state_message_manager import (
     LinsightStateMessageManager,
@@ -53,6 +63,7 @@ from bisheng.linsight.domain.services.state_message_manager import (
     MessageEventType,
 )
 from bisheng.linsight.domain.services.workbench_impl import LinsightWorkbenchImpl
+from bisheng.sensitive_word.domain.services.sensitive_word_policy_service import SensitiveWordPolicyService
 from bisheng.share_link.api.dependencies import header_share_token_parser
 from bisheng.share_link.domain.models.share_link import ShareLink
 from bisheng.utils import util
@@ -138,32 +149,25 @@ async def linsight_file_download(
     login_user: UserPayload = Depends(UserPayload.get_login_user),
     share_link: Union["ShareLink", None] = Depends(header_share_token_parser),
 ) -> UnifiedResponseModel:
-    with bypass_tenant_filter_if(share_link is not None):
-        session_version_model = await LinsightSessionVersionDao.get_by_id(session_version_id)
-    if not session_version_model:
-        raise NotFoundError()
-
-    # judge permission
-    if session_version_model.user_id != login_user.user_id and not login_user.is_admin():
-        # Access by sharing a link. Both share shapes grant, same as
-        # session-version-list / execute-task-detail: a workbench_chat share
-        # carries resource_id = the session and no versionId, and its recipient
-        # must still be able to open the task's output files.
-        shared_to_session = share_link is not None and share_link.resource_id == session_version_model.session_id
-        shared_to_version = (
-            share_link is not None
-            and share_link.meta_data is not None
-            and share_link.meta_data.get("versionId") == session_version_id
-        )
-        if not (shared_to_session or shared_to_version):
-            raise UnAuthorizedError()
+    version = await LinsightArtifactPreviewService.load_accessible_version(session_version_id, login_user, share_link)
 
     minio_client = await get_minio_storage()
-    file_url = file_url.lstrip("/")
-    if file_url.startswith(minio_client.bucket):
-        file_url = file_url[len(minio_client.bucket) + 1 :]
-    file_share_url = await minio_client.get_share_link(file_url)
+    file_key = LinsightArtifactPreviewService.owned_file_key(version, file_url, minio_client.bucket)
+    file_share_url = await minio_client.get_share_link(file_key)
     return resp_200(data={"file_path": file_share_url})
+
+
+@router.post("/workbench/file_preview", summary="Task Result Slide Preview", response_model=UnifiedResponseModel)
+async def linsight_file_preview(
+    file_url: str = Body(..., embed=True),
+    session_version_id: str = Body(..., embed=True),
+    login_user: UserPayload = Depends(UserPayload.get_login_user),
+    share_link: Union["ShareLink", None] = Depends(header_share_token_parser),
+) -> UnifiedResponseModel:
+    """PDF preview of a task-generated .ppt/.pptx: ready with a signed link, or still converting."""
+    version = await LinsightArtifactPreviewService.load_accessible_version(session_version_id, login_user, share_link)
+    result = await LinsightArtifactPreviewService.get_pptx_preview(version, file_url)
+    return resp_200(data=result)
 
 
 # Submit an Idea User Issue Request
@@ -180,6 +184,24 @@ async def submit_linsight_workbench(
     """
 
     logger.info(f"Users {login_user.user_id} Submit an Idea Question: {submit_obj.question}")
+
+    tenant_id = get_current_tenant_id() or getattr(login_user, "tenant_id", None) or 0
+    blocked = SensitiveWordPolicyService.evaluate_workbench_user_text(tenant_id, submit_obj.question or "")
+    if blocked:
+        logger.warning(
+            "workbench content safety hit tenant_id={} mode=input chat_id={}",
+            tenant_id,
+            submit_obj.session_id or "",
+        )
+
+        async def blocked_generator():
+            auto_reply = blocked.auto_reply or ""
+            yield {
+                "event": "content_safety_blocked",
+                "data": json.dumps({"auto_reply": auto_reply, "message": auto_reply}, ensure_ascii=False),
+            }
+
+        return EventSourceResponse(blocked_generator())
 
     async def event_generator():
         """
@@ -269,6 +291,26 @@ async def start_execute(
 
     await MessageSessionDao.touch_session(session_version_model.session_id)
 
+    # Persist the bot task turn BEFORE enqueueing so a refresh while the task is
+    # still QUEUED (status stays NOT_STARTED until the worker dequeues it in
+    # _execute_workflow) re-hydrates the task turn from the conversation and keeps
+    # showing the 排队中 QueueCard. Without this the category="task" row is written
+    # only at execution start, so a queued refresh finds just the user question and
+    # the whole task panel (queue badge included) disappears.
+    #
+    # The order matters: the upsert is find-then-insert with no unique key, and
+    # the worker's own start-time call runs the same upsert milliseconds after the
+    # enqueue. Persisting AFTER the enqueue raced it — both found no row, both
+    # inserted, and the conversation showed the task panel twice. Writing the row
+    # first turns the worker's call into a plain in-place update.
+    try:
+        await linsight_execute_utils.persist_task_turn_message(session_version_model)
+    except Exception:
+        # Best-effort: the task still runs; only the reload-while-queued view is
+        # affected if this fails (the worker writes the row at execution start
+        # regardless).
+        logger.exception("Failed to persist queued task turn message")
+
     try:
         await linsight_execute_utils.enqueue_session_for_execution(session_version_model)
 
@@ -276,21 +318,6 @@ async def start_execute(
         logger.error(f"Failed to start the Ideas task: {e!s}")
         await InviteCodeService.revoke_invite_code(user_id=login_user.user_id)
         return LinsightStartTaskError.return_resp(data=str(e))
-
-    # Persist the bot task turn at enqueue time so a refresh while the task is
-    # still QUEUED (status stays NOT_STARTED until the worker dequeues it in
-    # _execute_workflow) re-hydrates the task turn from the conversation and keeps
-    # showing the 排队中 QueueCard. Without this the category="task" row is written
-    # only at execution start, so a queued refresh finds just the user question and
-    # the whole task panel (queue badge included) disappears. Upsert is idempotent:
-    # _execute_workflow's start-time call later updates this same row in place.
-    try:
-        await linsight_execute_utils.persist_task_turn_message(session_version_model)
-    except Exception:
-        # Best-effort: enqueue already succeeded and the task will run; only the
-        # reload-while-queued view is affected if this fails (the worker writes
-        # the row at execution start regardless).
-        logger.exception("Failed to persist queued task turn message")
 
     return resp_200(
         data=True, message="Ideas execution task has started, execution results will be returned via message flow"
@@ -473,50 +500,9 @@ async def terminate_execute(
         # return resp_500(code=400, message="Execution terminated for Inspiration session version")
         return InvalidOperationError.return_resp()
 
-    await MessageSessionDao.touch_session(session_version_model.session_id)
-
-    from bisheng.linsight.worker import LinsightQueue
-
-    redis_client = await get_redis_client()
-    queue = LinsightQueue("queue", namespace="linsight", redis=redis_client)
-
-    try:
-        # Remove task from queue
-        await queue.remove(linsight_session_version_id)
-    except Exception as e:
-        logger.error(f"Failed to delete queue task: {e!s}")
-
-    # Update status is terminated
-    session_version_model.status = SessionVersionStatusEnum.TERMINATED
-
-    state_message_manager = LinsightStateMessageManager(session_version_id=linsight_session_version_id)
-
-    await state_message_manager.set_session_version_info(session_version_model)
-
-    # Persist the bot task turn so the terminated state survives a refresh. A task
-    # cancelled while still queued never reached _execute_workflow, so no
-    # category="task" row was written yet — without this, a refresh shows only the
-    # user question and the "task terminated" banner is lost. Upsert is idempotent:
-    # a task terminated mid-execution already has the placeholder row.
-    try:
-        await linsight_execute_utils.persist_task_turn_message(session_version_model)
-    except Exception:
-        # Best-effort: the termination itself (status flip + WS push) already
-        # succeeded; only the reload-time banner is affected if this fails.
-        logger.exception("Failed to persist terminated task turn message")
-
-    state_message_manager = LinsightStateMessageManager(session_version_id=session_version_model.id)
-    # Push termination message
-    await state_message_manager.push_message(
-        MessageData(
-            event_type=MessageEventType.TASK_TERMINATED,
-            data={
-                "message": "Task has been actively stopped by the user",
-                "session_id": session_version_model.id,
-                "terminated_at": datetime.now().isoformat(),
-            },
-        )
-    )
+    # F073: the termination itself is shared with the Open API; the ownership
+    # and state checks above stay here (v1 behaviour unchanged).
+    await LinsightWorkbenchImpl.terminate(session_version_model)
 
     return resp_200(data=True, message="Idea Execution Terminated")
 
@@ -686,6 +672,64 @@ async def task_message_stream(
         )
 
 
+def _strip_citation_markers_in_zip(zip_bytes: bytes) -> bytes:
+    """Rewrite the ``.md`` entries of a download bundle without citation spans.
+
+    The stored report keeps its markers (the preview renders them as badges);
+    only the bytes handed to the user lose them, same as the docx / pdf
+    conversions. Every other entry is copied through untouched, and a bundle
+    with no markdown in it is returned as-is.
+    """
+    with zipfile.ZipFile(BytesIO(zip_bytes)) as src:
+        entries = src.infolist()
+        if not any(info.filename.lower().endswith(".md") for info in entries):
+            return zip_bytes
+        out = BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for info in entries:
+                data = src.read(info)
+                if info.filename.lower().endswith(".md"):
+                    try:
+                        # F069: unregistered short handles ([S99]) go too.
+                        data = strip_citation_handles(strip_citation_markers(data.decode("utf-8"))).encode("utf-8")
+                    except UnicodeDecodeError:
+                        # Not UTF-8 text, so it cannot carry the PUA markers; ship the bytes as-is.
+                        logger.warning(
+                            "batch download: {} is not utf-8, citation markers left untouched", info.filename
+                        )
+                dst.writestr(info, data)
+    return out.getvalue()
+
+
+async def _bake_citations_in_zip(zip_bytes: bytes, login_user) -> bytes:
+    """F069 P2: bake the ``.md`` entries of a download bundle for this exporter.
+
+    Markers become visible ``[n]`` with a references section, filtered by the
+    exporter's permissions; unresolvable ones are stripped. Every other entry
+    is copied through untouched, and a bundle with no markdown is returned as-is.
+    """
+    from bisheng.citation.domain.services.citation_export_service import bake_citations_for_export
+
+    with zipfile.ZipFile(BytesIO(zip_bytes)) as src:
+        entries = src.infolist()
+        if not any(info.filename.lower().endswith(".md") for info in entries):
+            return zip_bytes
+        payloads: list[tuple[zipfile.ZipInfo, bytes]] = []
+        for info in entries:
+            data = src.read(info)
+            if info.filename.lower().endswith(".md"):
+                try:
+                    data = (await bake_citations_for_export(data.decode("utf-8"), login_user)).encode("utf-8")
+                except UnicodeDecodeError:
+                    logger.warning("batch download: {} is not utf-8, citation markers left untouched", info.filename)
+            payloads.append((info, data))
+    out = BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for info, data in payloads:
+            dst.writestr(info, data)
+    return out.getvalue()
+
+
 # Batch Download Task Files
 @router.post("/workbench/batch-download-files", summary="Batch Download Task Files")
 async def batch_download_files(
@@ -704,6 +748,7 @@ async def batch_download_files(
     try:
         # Call to implement class processing batch download
         zip_bytes = await LinsightWorkbenchImpl.batch_download_files(file_info_list)
+        zip_bytes = await _bake_citations_in_zip(zip_bytes, login_user)
 
         zip_name = zip_name if os.path.splitext(zip_name)[-1] == ".zip" else f"{zip_name}.zip"
         # Convert to unicode String
@@ -747,7 +792,11 @@ async def get_queue_status(
 async def download_md_to_pdf_or_docx(
     file_info: DownloadFilesSchema = Body(..., description="File information"),
     to_type: Literal["pdf", "docx"] = Body(..., description="the target file type of the conversion,pdfORdocx"),
+    session_version_id: str | None = Body(
+        None, description="Task version owning the md; when given, its workspace images are embedded"
+    ),
     login_user: UserPayload = Depends(UserPayload.get_login_user),
+    share_link: Union["ShareLink", None] = Depends(header_share_token_parser),
 ):
     """
     InspirationmdTransferpdf or docx Mengunduh
@@ -756,11 +805,31 @@ async def download_md_to_pdf_or_docx(
     :param login_user:
     :return:
     """
+    version = (
+        await LinsightArtifactPreviewService.load_accessible_version(session_version_id, login_user, share_link)
+        if session_version_id
+        else None
+    )
     try:
         # Call the implementation class to process the file download
         file_name, file_bytes = await LinsightWorkbenchImpl.download_file(file_info)
 
-        md_str = file_bytes.decode("utf-8")
+        # F069 P2: hidden citation spans become visible [n] plus a references
+        # section filtered by this user's permissions; unresolvable spans and
+        # unregistered short handles ([S99]) are stripped as before.
+        from bisheng.citation.domain.services.citation_export_service import bake_citations_for_export
+
+        md_str = await bake_citations_for_export(file_bytes.decode("utf-8"), login_user)
+
+        # Workspace images are inlined as data URIs: the converter's sanitizer
+        # drops scheme-less src values, so a plain path would lose the image.
+        if version is not None:
+            minio_client = await get_minio_storage()
+            file_key = LinsightArtifactPreviewService.owned_file_key(version, file_info.file_url, minio_client.bucket)
+            deliverable = find_deliverable(version, file_key, minio_client.bucket)
+            source_path = deliverable_workspace_path(version, deliverable) if deliverable else None
+            if source_path:
+                md_str, _ = await inline_local_images(md_str, source_path, workspace_fetcher(version.id))
 
         # Filename Removal Extension
         file_name = os.path.splitext(file_name)[0]
@@ -790,6 +859,54 @@ async def download_md_to_pdf_or_docx(
         return ResourceDownloadError.return_resp(data=str(e))
 
 
+@router.post("/workbench/download-md-bundle", summary="Download a markdown deliverable with its images")
+async def download_md_bundle(
+    session_version_id: str = Body(..., embed=True),
+    file_url: str = Body(..., embed=True),
+    file_name: str = Body(..., embed=True),
+    login_user: UserPayload = Depends(UserPayload.get_login_user),
+    share_link: Union["ShareLink", None] = Depends(header_share_token_parser),
+):
+    """Zip a markdown deliverable with the workspace images it references.
+
+    The md is rewritten to point at ``images/<name>`` inside the zip, so it
+    renders when opened locally. When none of its images can be found, the md
+    alone is returned (``text/markdown``); the caller tells the two apart by
+    the Content-Type.
+    """
+    version = await LinsightArtifactPreviewService.load_accessible_version(session_version_id, login_user, share_link)
+    minio_client = await get_minio_storage()
+    file_key = LinsightArtifactPreviewService.owned_file_key(version, file_url, minio_client.bucket)
+    deliverable = find_deliverable(version, file_key, minio_client.bucket)
+    if deliverable is None:
+        raise NotFoundError()
+    try:
+        _, file_bytes = await LinsightWorkbenchImpl.download_file(
+            DownloadFilesSchema(file_name=file_name, file_url=file_key)
+        )
+        from bisheng.citation.domain.services.citation_export_service import bake_citations_for_export
+
+        md_str = await bake_citations_for_export(file_bytes.decode("utf-8"), login_user)
+        source_path = deliverable_workspace_path(version, deliverable)
+        bundle = (
+            await build_markdown_bundle(md_str, file_name, source_path, workspace_fetcher(version.id))
+            if source_path
+            else None
+        )
+        if bundle is None:
+            content, media_type, out_name = md_str.encode("utf-8"), "text/markdown; charset=utf-8", file_name
+        else:
+            content, media_type, out_name = bundle, "application/zip", f"{os.path.splitext(file_name)[0]}.zip"
+        return StreamingResponse(
+            iter([content]),
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={parse.quote(out_name)}"},
+        )
+    except Exception as e:
+        logger.error(f"markdown bundle download failed: {e!s}")
+        return ResourceDownloadError.return_resp(data=str(e))
+
+
 @router.get(
     "/sop/showcase/result",
     summary="Obtain the results of the execution of the selected cases of Lingsi",
@@ -813,4 +930,9 @@ async def get_sop_showcase_result(
     if not version_info or version_info.status != SessionVersionStatusEnum.COMPLETED:
         return resp_200(data={"version_info": None, "execute_tasks": []})
     execute_task_models = await LinsightWorkbenchImpl.get_execute_task_detail(linsight_version_id)
-    return resp_200(data={"version_info": version_info, "execute_tasks": execute_task_models})
+    # F073: never echo the Open API submission metadata (caller instructions,
+    # credential id). This endpoint does no ownership check; that gap is
+    # pre-existing and tracked separately.
+    return resp_200(
+        data={"version_info": version_info.model_dump(exclude={"api_meta"}), "execute_tasks": execute_task_models}
+    )

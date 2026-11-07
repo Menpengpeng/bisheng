@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import zipfile
+import zlib
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 from uuid import uuid4
@@ -43,6 +44,20 @@ from uuid import uuid4
 import yaml
 from pypinyin import lazy_pinyin
 
+from bisheng.common.errcode.linsight import (
+    SkillArchiveDamagedError,
+    SkillArchiveEncryptedError,
+    SkillBundleTooLargeError,
+    SkillEmptyFileError,
+    SkillEntryLimitError,
+    SkillFileTooLargeError,
+    SkillManifestMissingError,
+    SkillManifestTooLargeError,
+    SkillMultipleError,
+    SkillPathEscapeError,
+    SkillTypeMismatchError,
+    SkillValidationError,
+)
 from bisheng.common.services.config_service import settings as bisheng_settings
 from bisheng.core.cache.utils import CACHE_DIR
 from bisheng.core.storage.minio.minio_manager import get_minio_storage_sync
@@ -50,18 +65,89 @@ from bisheng.core.storage.minio.minio_manager import get_minio_storage_sync
 SKILL_MD = "SKILL.md"
 # Object-key namespace for skill bundles, sibling to the workspace's "workspace/".
 SKILL_OBJECT_PREFIX = "linsight/skills"
+# Personal bundles stay out of the tenant prefix so a tenant-skill delete cannot
+# remove a user's copy, and the other way around.
+PERSONAL_SKILL_OBJECT_PREFIX = "linsight/personal-skills"
 # Legacy on-disk layout, still used by the one-off migration/restore scripts to
 # find bundles a pre-object-storage release left on a node's local disk.
 LEGACY_TENANT_SKILLS_DIR = "data/skills"
 
-# Upload payload limit: the .md / .zip / .skill bytes that arrive over HTTP.
-MAX_BUNDLE_SIZE = 10 * 1024 * 1024
-# Unpacked limit: sum of every extracted file's contents (also the GitHub import's
-# total download size). Deliberately larger than the upload limit — an archive of
-# pptx templates/fonts/images compresses well and expands past 10MB while the .zip
-# itself is far below it. This line is the zip-bomb guard, not a second copy of the
-# upload limit. (deepagents' MAX_SKILL_FILE_SIZE is a per-SKILL.md cap, unrelated.)
-MAX_UNPACKED_SIZE = 100 * 1024 * 1024
+_MB = 1024 * 1024
+# Upload payload limit (default): the .md / .zip / .skill bytes that arrive over HTTP.
+MAX_BUNDLE_SIZE = 200 * _MB
+# Unpacked limit (default): sum of every extracted file's size (also the GitHub
+# import's total download size). Deliberately larger than the upload limit — an
+# archive of pptx templates/fonts/images compresses well and can expand past the
+# upload cap while the .zip itself stays under it. (deepagents' MAX_SKILL_FILE_SIZE is a per-SKILL.md
+# cap, unrelated.)
+MAX_UNPACKED_SIZE = 500 * _MB
+# Hard ceiling no configuration can lift. A bundle is held in memory whole — at upload
+# (the unpacked mapping plus its repacked archive) and at every task start that selects
+# it (skill_provisioning copies it into the session workspace) — so a runaway setting
+# must not be able to OOM the API process or a worker. The store's own write and
+# materialize guards check this ceiling, not the live setting: a bundle accepted under
+# a larger setting has to stay readable after an admin lowers it.
+MAX_UNPACKED_CEILING = 1024 * _MB
+# Personal uploads ignore the tenant's 系统配置 caps.
+# A skill file (.md) may be 200 MiB. A compressed package (.zip / .skill) may be
+# 50 MiB, and its unpacked contents may be 200 MiB. SKILL.md inside a package
+# stays at 1 MiB. Equal to a limit passes. The 200 MiB figure on the dialog is
+# the account quota, separate from these per-upload caps.
+PERSONAL_FILE_MAX_BYTES = 200 * _MB
+PERSONAL_ARCHIVE_MAX_BYTES = 50 * _MB
+PERSONAL_UNPACKED_MAX_BYTES = 200 * _MB
+PERSONAL_SKILL_MD_MAX_BYTES = 1 * _MB
+PERSONAL_ENTRY_MAX_COUNT = 1000
+
+# macOS reports Markdown as text/x-markdown (UTI net.daringfireball.markdown).
+# Browsers put that on the upload, so a real .md file would otherwise be rejected.
+_MD_CONTENT_TYPES = frozenset(
+    {
+        "text/markdown",
+        "text/x-markdown",
+        "text/plain",
+        "application/octet-stream",
+        "",
+    }
+)
+_ZIP_CONTENT_TYPES = frozenset({"application/zip", "application/x-zip-compressed", "application/octet-stream", ""})
+
+
+class BundleTooLargeError(ValueError):
+    """Unpacked contents exceed the cap — distinct from a malformed-archive ValueError."""
+
+
+async def _configured_bytes(field: str, fallback: int) -> int:
+    """A ``linsight.<field>`` MB setting from 系统配置, in bytes; ``fallback`` when unreadable or < 1."""
+    try:
+        megabytes = int(getattr(await bisheng_settings.aget_linsight_conf(), field))
+    except Exception:
+        return fallback
+    if megabytes < 1:
+        return fallback
+    return megabytes * _MB
+
+
+async def resolve_skill_upload_limit() -> int:
+    """The effective upload cap in bytes.
+
+    Read from 系统配置 (``linsight.skill_upload_max_size_mb``) so a deployment can raise it
+    without a release; MAX_BUNDLE_SIZE is only the fallback when the config is unreadable.
+    """
+    return await _configured_bytes("skill_upload_max_size_mb", MAX_BUNDLE_SIZE)
+
+
+async def resolve_skill_unpacked_limit() -> int:
+    """The effective unpacked cap in bytes (系统配置 ``linsight.skill_unpacked_max_size_mb``).
+
+    Never below the upload cap: a stored (uncompressed) archive unpacks to about its own
+    size, so raising only the upload cap must not leave files that pass it bouncing off
+    this one. Never above MAX_UNPACKED_CEILING.
+    """
+    configured = await _configured_bytes("skill_unpacked_max_size_mb", MAX_UNPACKED_SIZE)
+    return min(max(configured, await resolve_skill_upload_limit()), MAX_UNPACKED_CEILING)
+
+
 MAX_NAME_LEN = 64
 MAX_DESCRIPTION_LEN = 1024
 MAX_DISPLAY_NAME_LEN = 255
@@ -163,35 +249,193 @@ def compose_skill_md(
     return render_skill_md(meta, body)
 
 
-def unpack_zip_bytes(data: bytes) -> dict[str, bytes]:
+def _decode_zip_name(info: zipfile.ZipInfo) -> str:
+    """Recover an entry's real filename from an archive that mislabels its encoding.
+
+    ZIP general-purpose bit 11 (0x800) marks the name as UTF-8; without it the
+    spec says CP437, and ``zipfile`` obeys. But macOS Finder's "Compress" writes
+    UTF-8 bytes *without* setting the bit, so a skill packed on a Mac arrives with
+    every Chinese filename mojibake'd ("外评检索指引.md" -> "σñûΦ»äµúÇτ┤óµîçσ╝Ò.md").
+    That is not merely ugly: SKILL.md points at ``references/外评检索指引.md``, and
+    the agent's read of that path then misses a file stored under the garbled name,
+    so the skill silently runs without its reference material.
+
+    CP437 maps all 256 byte values, so re-encoding is a lossless way back to the
+    original bytes. Try UTF-8 first, then GBK (what Chinese Windows' built-in
+    "send to compressed folder" emits), and keep the CP437 reading only when
+    neither decodes — i.e. an archive that really is CP437-named.
+    """
+    if info.flag_bits & 0x800:
+        return info.orig_filename
+    try:
+        raw = info.orig_filename.encode("cp437")
+    except UnicodeEncodeError:  # not a cp437 decode after all — trust zipfile
+        return info.orig_filename
+    if raw.isascii():
+        return info.orig_filename
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return info.orig_filename
+
+
+def unpack_zip_bytes(
+    data: bytes,
+    max_unpacked: int | None = None,
+    *,
+    skill_errors: bool = False,
+    max_entries: int | None = None,
+) -> dict[str, bytes]:
     """Extract a .zip/.skill archive into {relative_posix_path: bytes}.
 
     A single top-level wrapper directory (the common "zip a folder" shape) is
     stripped so SKILL.md lands at the bundle root. Raises ValueError when the
-    archive is unreadable or contains no SKILL.md.
+    archive is unreadable or contains no SKILL.md, and BundleTooLargeError when
+    the entries' total size exceeds ``max_unpacked`` (default MAX_UNPACKED_CEILING).
+
+    ``skill_errors`` maps the same checks onto the personal-upload error codes
+    (encrypted, damaged, missing manifest, path escape, multiple skills, too many
+    entries) without a second unpacker. The default stays ValueError so existing
+    callers keep their messages.
+
+    The size cap is enforced *before* anything is decompressed, from the sizes the
+    central directory declares. Summing the extracted bytes afterwards let a small
+    zip bomb inflate fully in memory before it was refused. The declared size is
+    binding: ``zipfile`` never returns more than ``file_size`` bytes for an entry,
+    and an entry that understates it fails its CRC check (an invalid archive here).
     """
+    if max_unpacked is None:
+        max_unpacked = MAX_UNPACKED_CEILING
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as exc:
+        if skill_errors:
+            raise SkillArchiveDamagedError() from exc
         raise ValueError("invalid zip archive") from exc
     files: dict[str, bytes] = {}
     with zf:
+        entries: list[tuple[str, zipfile.ZipInfo]] = []
         for info in zf.infolist():
+            if skill_errors and info.flag_bits & 0x1:
+                raise SkillArchiveEncryptedError()
             if info.is_dir():
                 continue
-            path = info.filename.replace("\\", "/").lstrip("/")
+            path = _decode_zip_name(info).replace("\\", "/").lstrip("/")
             if not path or path.startswith("__MACOSX/") or PurePosixPath(path).name == ".DS_Store":
                 continue
-            files[path] = zf.read(info)
+            if skill_errors:
+                try:
+                    _safe_rel_path(path)
+                except ValueError:
+                    raise SkillPathEscapeError() from None
+            entries.append((path, info))
+        if max_entries is not None and len(entries) > max_entries:
+            raise SkillEntryLimitError(limit_count=max_entries)
+        if sum(info.file_size for _, info in entries) > max_unpacked:
+            raise BundleTooLargeError(f"bundle exceeds {max_unpacked} bytes when unpacked")
+        try:
+            for path, info in entries:
+                files[path] = zf.read(info)
+        except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
+            if skill_errors:
+                raise SkillArchiveDamagedError() from exc
+            raise ValueError(f"corrupted zip archive: {exc}") from exc
     if not files:
+        if skill_errors:
+            raise SkillManifestMissingError()
         raise ValueError("empty archive")
     if SKILL_MD not in files:
         tops = {p.split("/", 1)[0] for p in files}
         if len(tops) == 1 and all("/" in p for p in files):
             prefix = next(iter(tops)) + "/"
             files = {p[len(prefix) :]: c for p, c in files.items()}
+    if skill_errors:
+        manifests = [path for path in files if PurePosixPath(path).name == SKILL_MD]
+        if len(manifests) > 1:
+            raise SkillMultipleError()
+        if SKILL_MD not in files:
+            raise SkillManifestMissingError()
+        return files
     if SKILL_MD not in files:
         raise ValueError("SKILL.md not found at archive root")
+    return files
+
+
+def _declared_content_type(content_type: str | None) -> str:
+    return (content_type or "").split(";", 1)[0].strip().lower()
+
+
+def _looks_like_zip(data: bytes) -> bool:
+    return data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"))
+
+
+async def accept_skill_upload(
+    filename: str,
+    data: bytes,
+    *,
+    owner_user_id: int,
+    content_type: str | None = None,
+) -> dict[str, bytes]:
+    """Validate an upload and return its file map. Does not write object storage.
+
+    ``owner_user_id == 0`` uses the tenant's configured size caps. Any other owner
+    uses the fixed personal caps and the personal manifest / entry limits.
+    """
+    personal = owner_user_id != 0
+    if personal:
+        unpacked_limit = PERSONAL_UNPACKED_MAX_BYTES
+    else:
+        upload_limit = await resolve_skill_upload_limit()
+        unpacked_limit = await resolve_skill_unpacked_limit()
+
+    if len(data) == 0:
+        raise SkillEmptyFileError()
+    lower = (filename or "").lower()
+    if lower.endswith(".md"):
+        kind = "md"
+    elif lower.endswith(".zip"):
+        kind = "zip"
+    elif lower.endswith(".skill"):
+        # Browsers have no MIME for this extension and often send text/plain
+        # or another generic type. The bytes decide whether it is a zip.
+        kind = "skill"
+    else:
+        raise SkillValidationError(msg="unsupported file type: expecting .md, .zip or .skill")
+
+    mime = _declared_content_type(content_type)
+    if kind == "md":
+        if mime not in _MD_CONTENT_TYPES or _looks_like_zip(data):
+            raise SkillTypeMismatchError()
+    elif kind == "skill":
+        if not _looks_like_zip(data):
+            raise SkillTypeMismatchError()
+    elif mime not in _ZIP_CONTENT_TYPES or not _looks_like_zip(data):
+        raise SkillTypeMismatchError()
+
+    if personal:
+        upload_limit = PERSONAL_FILE_MAX_BYTES if kind == "md" else PERSONAL_ARCHIVE_MAX_BYTES
+    if len(data) > upload_limit:
+        raise SkillFileTooLargeError(limit_mb=upload_limit // _MB)
+
+    if kind == "md":
+        files = {SKILL_MD: data}
+    else:
+        try:
+            files = unpack_zip_bytes(
+                data,
+                max_unpacked=unpacked_limit,
+                skill_errors=True,
+                max_entries=PERSONAL_ENTRY_MAX_COUNT if personal else None,
+            )
+        except BundleTooLargeError:
+            raise SkillBundleTooLargeError(limit_mb=unpacked_limit // _MB) from None
+
+    # A markdown upload is the skill file, so its 200 MiB cap is the only size
+    # check. Inside a package, SKILL.md itself stays at 1 MiB.
+    if personal and kind != "md" and len(files.get(SKILL_MD, b"")) > PERSONAL_SKILL_MD_MAX_BYTES:
+        raise SkillManifestTooLargeError(limit_mb=PERSONAL_SKILL_MD_MAX_BYTES // _MB)
     return files
 
 
@@ -276,7 +520,7 @@ class SkillStore:
         return self.minio.bucket
 
     # ---- keys & cache paths ----
-    def object_key(self, tenant_id: int, name: str, content_hash: str) -> str:
+    def object_key(self, tenant_id: int, name: str, content_hash: str, *, owner_user_id: int = 0) -> str:
         """Object key stored in ``linsight_skill.object_path``.
 
         The tenant segment is the numeric ``tenant_id`` and is deliberately NOT
@@ -286,26 +530,33 @@ class SkillStore:
         can never kick in — a Root-tenant fallback here would let a sub-tenant
         read the Root tenant's skills. Do not "align" this with the F017 prefix.
         """
+        if owner_user_id:
+            return f"{PERSONAL_SKILL_OBJECT_PREFIX}/{tenant_id}/{owner_user_id}/{name}/{content_hash}.zip"
         return f"{SKILL_OBJECT_PREFIX}/{tenant_id}/{name}/{content_hash}.zip"
 
-    def _skill_prefix(self, tenant_id: int, name: str) -> str:
+    def _skill_prefix(self, tenant_id: int, name: str, owner_user_id: int = 0) -> str:
+        if owner_user_id:
+            return f"{PERSONAL_SKILL_OBJECT_PREFIX}/{tenant_id}/{owner_user_id}/{name}/"
         return f"{SKILL_OBJECT_PREFIX}/{tenant_id}/{name}/"
 
-    def cache_dir(self, tenant_id: int, name: str, content_hash: str) -> Path:
+    def cache_dir(self, tenant_id: int, name: str, content_hash: str, *, owner_user_id: int = 0) -> Path:
         """Local directory holding one materialized bundle version."""
+        if owner_user_id:
+            return self.root / "personal" / str(tenant_id) / str(owner_user_id) / name / content_hash
         return self.root / str(tenant_id) / name / content_hash
 
     # ---- bundle IO ----
-    def exists(self, tenant_id: int, name: str, content_hash: str) -> bool:
-        if (self.cache_dir(tenant_id, name, content_hash) / SKILL_MD).is_file():
+    def exists(self, tenant_id: int, name: str, content_hash: str, *, owner_user_id: int = 0) -> bool:
+        if (self.cache_dir(tenant_id, name, content_hash, owner_user_id=owner_user_id) / SKILL_MD).is_file():
             return True
         return bool(
             self.minio.object_exists_sync(
-                bucket_name=self._bucket(), object_name=self.object_key(tenant_id, name, content_hash)
+                bucket_name=self._bucket(),
+                object_name=self.object_key(tenant_id, name, content_hash, owner_user_id=owner_user_id),
             )
         )
 
-    def write_bundle(self, tenant_id: int, name: str, files: dict[str, bytes]) -> BundleRef:
+    def write_bundle(self, tenant_id: int, name: str, files: dict[str, bytes], *, owner_user_id: int = 0) -> BundleRef:
         """Publish a bundle version and return its pointer.
 
         The object PUT is a single atomic operation, so there is no window in
@@ -318,24 +569,43 @@ class SkillStore:
         for rel, content in files.items():
             _safe_rel_path(rel)
             total += len(content)
-        if total > MAX_UNPACKED_SIZE:
-            raise ValueError(f"bundle exceeds {MAX_UNPACKED_SIZE} bytes when unpacked")
+        # The ceiling, not the configured cap: ingress (upload / GitHub import) already
+        # applied the latter, and an edit that re-publishes an existing bundle must not
+        # fail just because an admin has since lowered the setting.
+        if total > MAX_UNPACKED_CEILING:
+            raise BundleTooLargeError(f"bundle exceeds {MAX_UNPACKED_CEILING} bytes when unpacked")
 
         content_hash = bundle_content_hash(files)
-        key = self.object_key(tenant_id, name, content_hash)
+        key = self.object_key(tenant_id, name, content_hash, owner_user_id=owner_user_id)
         self.minio.put_object_sync(bucket_name=self._bucket(), object_name=key, file=pack_bundle_zip(files))
         # Seed the local cache from what we already hold, so the writing node
         # never round-trips to fetch back bytes it just uploaded.
-        self._install_cache(self.cache_dir(tenant_id, name, content_hash), files)
+        self._install_cache(self.cache_dir(tenant_id, name, content_hash, owner_user_id=owner_user_id), files)
         return BundleRef(size=total, content_hash=content_hash, object_key=key)
 
-    def read_text(self, tenant_id: int, name: str, content_hash: str, rel: str = SKILL_MD) -> str:
-        target = self.materialize(tenant_id, name, content_hash) / _safe_rel_path(rel)
+    async def publish_upload(
+        self,
+        tenant_id: int,
+        name: str,
+        filename: str,
+        data: bytes,
+        *,
+        owner_user_id: int,
+        content_type: str | None = None,
+    ) -> BundleRef:
+        """Validate first, then write. A rejected upload leaves object storage untouched."""
+        files = await accept_skill_upload(filename, data, owner_user_id=owner_user_id, content_type=content_type)
+        return self.write_bundle(tenant_id, name, files, owner_user_id=owner_user_id)
+
+    def read_text(
+        self, tenant_id: int, name: str, content_hash: str, rel: str = SKILL_MD, *, owner_user_id: int = 0
+    ) -> str:
+        target = self.materialize(tenant_id, name, content_hash, owner_user_id=owner_user_id) / _safe_rel_path(rel)
         if not target.is_file():
             raise FileNotFoundError(str(target))
         return target.read_text(encoding="utf-8", errors="replace")
 
-    def read_bytes(self, tenant_id: int, name: str, content_hash: str, rel: str) -> bytes:
+    def read_bytes(self, tenant_id: int, name: str, content_hash: str, rel: str, *, owner_user_id: int = 0) -> bytes:
         """Read a bundle file as raw bytes (binary-safe).
 
         ``read_text`` decodes utf-8 with ``errors="replace"`` and is lossy for
@@ -343,19 +613,19 @@ class SkillStore:
         copy-into-workspace path (skill_provisioning) needs faithful bytes, so it
         reads through here instead.
         """
-        target = self.materialize(tenant_id, name, content_hash) / _safe_rel_path(rel)
+        target = self.materialize(tenant_id, name, content_hash, owner_user_id=owner_user_id) / _safe_rel_path(rel)
         if not target.is_file():
             raise FileNotFoundError(str(target))
         return target.read_bytes()
 
-    def list_files(self, tenant_id: int, name: str, content_hash: str) -> list[dict]:
+    def list_files(self, tenant_id: int, name: str, content_hash: str, *, owner_user_id: int = 0) -> list[dict]:
         """Bundle file tree as [{path, size}], SKILL.md first, then sorted.
 
         Returns ``[]`` when the bundle cannot be resolved, matching the previous
         "missing directory" behaviour so callers keep degrading the same way.
         """
         try:
-            base = self.materialize(tenant_id, name, content_hash)
+            base = self.materialize(tenant_id, name, content_hash, owner_user_id=owner_user_id)
         except FileNotFoundError:
             return []
         entries = []
@@ -365,56 +635,72 @@ class SkillStore:
         entries.sort(key=lambda e: (e["path"] != SKILL_MD, e["path"]))
         return entries
 
-    def delete(self, tenant_id: int, name: str) -> bool:
+    def delete(self, tenant_id: int, name: str, *, owner_user_id: int = 0) -> bool:
         """Remove every stored version of a skill, plus its local cache.
 
         Deleting by prefix (rather than by a single hash) is what finally clears
         superseded versions: the skill is gone, so no concurrent writer can be
         publishing a version worth keeping.
         """
-        prefix = self._skill_prefix(tenant_id, name)
+        prefix = self._skill_prefix(tenant_id, name, owner_user_id)
         removed = False
         for obj in self.minio.minio_client_sync.list_objects(self._bucket(), prefix=prefix, recursive=True):
             self.minio.remove_object_sync(bucket_name=self._bucket(), object_name=obj.object_name)
             removed = True
-        local = self.root / str(tenant_id) / name
+        if owner_user_id:
+            local = self.root / "personal" / str(tenant_id) / str(owner_user_id) / name
+        else:
+            local = self.root / str(tenant_id) / name
         if local.exists():
             shutil.rmtree(local, ignore_errors=True)
             removed = True
         return removed
 
+    def delete_version(self, tenant_id: int, name: str, content_hash: str, *, owner_user_id: int = 0) -> None:
+        """Drop one unpublished version. Other hashes under the same name stay."""
+        key = self.object_key(tenant_id, name, content_hash, owner_user_id=owner_user_id)
+        self.minio.remove_object_sync(bucket_name=self._bucket(), object_name=key)
+        local = self.cache_dir(tenant_id, name, content_hash, owner_user_id=owner_user_id)
+        if local.exists():
+            shutil.rmtree(local, ignore_errors=True)
+
     # ---- materialization ----
-    def materialize(self, tenant_id: int, name: str, content_hash: str) -> Path:
+    def materialize(self, tenant_id: int, name: str, content_hash: str, *, owner_user_id: int = 0) -> Path:
         """Return the local directory holding this bundle version, fetching it if absent.
 
         A cache hit performs no network I/O at all: the directory name is the
         content hash, so its presence already proves the bytes are the right ones.
         """
-        dst = self.cache_dir(tenant_id, name, content_hash)
+        dst = self.cache_dir(tenant_id, name, content_hash, owner_user_id=owner_user_id)
         if (dst / SKILL_MD).is_file():
             return dst
-        key = self.object_key(tenant_id, name, content_hash)
-        data = self.minio.get_object_sync(bucket_name=self._bucket(), object_name=key)
+        key = self.object_key(tenant_id, name, content_hash, owner_user_id=owner_user_id)
+        try:
+            data = self.minio.get_object_sync(bucket_name=self._bucket(), object_name=key)
+        except Exception as exc:
+            # Real MinIO raises S3Error(NoSuchKey). The in-memory fake returns None.
+            # Callers (detail, file read, list) only recover from FileNotFoundError;
+            # letting the S3 error through turns a missing bundle into HTTP 500.
+            if getattr(exc, "code", None) != "NoSuchKey":
+                raise
+            raise FileNotFoundError(f"skill bundle object not found: {key}") from exc
         if data is None:
             raise FileNotFoundError(f"skill bundle object not found: {key}")
-        self._install_cache(dst, self._unpack_for_cache(unpack_zip_bytes(data), key))
+        self._install_cache(dst, self._unpack_for_cache(unpack_zip_bytes(data)))
         return dst
 
     @staticmethod
-    def _unpack_for_cache(files: dict[str, bytes], key: str) -> dict[str, bytes]:
-        """Re-apply the upload path's guards to bytes coming back from storage.
+    def _unpack_for_cache(files: dict[str, bytes]) -> dict[str, bytes]:
+        """Re-apply the upload path's traversal guard to bytes coming back from storage.
 
-        Materialization is a *second* write-to-disk path: the size cap lives in
-        ``skill_service._parse_upload`` and the traversal check in the old
-        ``write_bundle``, so neither protects this one. A corrupted or tampered
-        object must not be able to fill the disk or escape the cache directory.
+        Materialization is a *second* write-to-disk path: the traversal check lives in
+        ``write_bundle``, which never runs here. A corrupted or tampered object must
+        not be able to escape the cache directory. (Filling the disk is already ruled
+        out by ``unpack_zip_bytes``, which refuses past MAX_UNPACKED_CEILING before
+        decompressing anything.)
         """
-        total = 0
-        for rel, content in files.items():
+        for rel in files:
             _safe_rel_path(rel)
-            total += len(content)
-            if total > MAX_UNPACKED_SIZE:
-                raise ValueError(f"skill bundle {key} exceeds {MAX_UNPACKED_SIZE} bytes when unpacked")
         return files
 
     def _install_cache(self, dst: Path, files: dict[str, bytes]) -> None:

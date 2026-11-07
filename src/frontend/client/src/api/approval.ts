@@ -52,7 +52,16 @@ export interface ApprovalInstanceItem {
   update_time?: string;
 }
 
+export interface AppCurrentVisibility {
+  state: 'available' | 'unavailable' | 'deleted';
+  checked_at?: string;
+  owner_only?: boolean | null;
+  admin_implicit_access?: boolean;
+  subjects: { type: 'user' | 'department' | 'user_group'; id: string; name: string; userset_relation?: 'member' | 'admin' | 'subtree_member'; include_children?: boolean }[];
+}
+
 export interface ApprovalTaskDetail extends ApprovalTaskItem {
+  current_visibility?: AppCurrentVisibility;
   comment?: string | null;
   reason?: string | null;
   detail_snapshot?: Record<string, any>;
@@ -77,6 +86,7 @@ export interface ApprovalFlowNode {
 }
 
 export interface ApprovalInstanceDetail extends ApprovalInstanceItem {
+  current_visibility?: AppCurrentVisibility;
   reason?: string | null;
   granted_keys?: string[];
   revoked_keys?: string[];
@@ -147,6 +157,13 @@ function unwrapPaged<T>(response: any): { data: T[]; total: number } {
     data: Array.isArray(payload?.data) ? payload.data : [],
     total: Number(payload?.total ?? 0),
   };
+}
+
+/** Number of approval tasks still waiting on the current user. Drives the entry badge. */
+export async function getMyPendingApprovalCountApi(): Promise<number> {
+  const response = await request.get<ApiResponse<{ count: number }>>("/api/v1/approval/my-tasks/pending-count");
+  const payload = unwrapPayload<{ count: number }>(response);
+  return Number(payload?.count ?? 0);
 }
 
 export async function listMyApprovalTasksApi(): Promise<{ data: ApprovalTaskItem[]; total: number }> {

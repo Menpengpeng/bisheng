@@ -23,7 +23,16 @@ class CaptchaInput(BaseModel):
 
 class ChunkInput(BaseModel):
     knowledge_id: int
-    documents: list[Document]
+    documents: list[Document] = Field(..., min_length=1)
+
+    @field_validator("documents")
+    @classmethod
+    def first_document_names_the_file(cls, documents: list[Document]) -> list[Document]:
+        # documents[0].metadata.source becomes the stored file name.
+        source = (documents[0].metadata or {}).get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("documents[0].metadata.source is required and must be a non-empty file name")
+        return documents
 
 
 class BuildStatus(Enum):
@@ -142,7 +151,7 @@ class FlowGptsOnlineList(BaseModel):
     logo: str = None
     create_time: datetime = None
     update_time: datetime = None
-    flow_type: str = None  # flow: Skill assistant：gptsassistant
+    flow_type: str = None  # flow: Skill assistant: gptsassistant
     count: int = 0
 
 
@@ -228,6 +237,9 @@ class UploadFileResponse(BaseModel):
     repeat: bool = False  # Duplicate in Knowledge Base
     repeat_file_name: str | None = None  # Returns the file name of a duplicate file if it is a duplicate
     repeat_update_time: datetime | None = None  # Returns the update time of a duplicate file if it is a duplicate
+    # Poster frame for a video upload, so the chat bubble that shows the
+    # attachment has a thumbnail instead of a bare extension card.
+    cover_filepath: str | None = None
 
 
 class StreamData(BaseModel):
@@ -254,7 +266,8 @@ class CustomComponentCode(BaseModel):
 
 class AssistantCreateReq(BaseModel):
     name: str = Field(max_length=50, description="The assistant name.")
-    prompt: str = Field(min_length=20, max_length=1000, description="Helper Prompt")
+    # Optional: an empty prompt is written later in the config page, without auto-generation
+    prompt: str = Field("", max_length=1000, description="Helper Prompt")
     logo: str = Field(description="logoRelative address of the file")
 
 
@@ -263,7 +276,7 @@ class AssistantUpdateReq(BaseModel):
     name: str | None = Field("", description="The assistant name. Leave empty to not update")
     desc: str | None = Field("", description="Assistant description Leave empty to not update")
     logo: str | None = Field("", description="logoRelative address of the file, empty to not update")
-    prompt: str | None = Field("", description="Visible to Userprompt， Leave empty to not update")
+    prompt: str | None = Field("", description="Visible to Userprompt, Leave empty to not update")
     guide_word: str | None = Field("", description="Ice Breaker  Leave empty to not update")
     guide_question: list | None = Field([], description="Guided Question List, Leave empty to not update")
     model_name: str | None = Field("", description="Selected model name, Leave empty to not update")
@@ -396,10 +409,13 @@ class Icon(BaseModel):
 
 
 class WSModel(BaseModel):
+    realtime: bool = False
     key: str | None = None
     id: str
     name: str | None = None
     displayName: str | None = None
+    provider_id: str | None = None
+    provider_name: str | None = None
     # Optional one-line intro shown under the model name in the workspace
     # model picker; hidden when empty. Length capped to keep the dropdown tidy.
     description: str | None = Field(default=None, max_length=50)

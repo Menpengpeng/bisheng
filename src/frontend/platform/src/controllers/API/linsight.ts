@@ -8,6 +8,8 @@ export interface SkillBrief {
   display_name: string;
   description: string;
   enabled: boolean;
+  // Preselected in the end-user picker of every new conversation
+  default_checked: boolean;
   source: 'manual' | 'sop_migrated';
   create_time?: string;
   update_time?: string;
@@ -39,11 +41,25 @@ export interface SkillFormPayload {
   content: string;
 }
 
+export interface SkillUploadLimit {
+  max_size_bytes: number;
+  max_size_mb: number;
+  max_unpacked_bytes: number;
+  max_unpacked_mb: number;
+}
+
 const SKILL_BASE = '/api/v1/linsight/skill';
 
 // Business-error responses are handled by callers (silent mode) so validation
 // copy can be localized; see mapSkillError in the skill components.
 export const skillApi = {
+  /** Effective caps from 系统配置 (linsight.skill_upload_max_size_mb /
+   *  skill_unpacked_max_size_mb); the dialog pre-checks the upload cap and quotes both,
+   *  so its copy and the server agree on the numbers. */
+  getUploadLimit: (): Promise<SkillUploadLimit> => {
+    return axios.get(`${SKILL_BASE}/upload-limit`);
+  },
+
   getSkillList: (params: { keyword?: string; enabled?: boolean; page?: number; page_size?: number }): Promise<SkillPage> => {
     return axios.get(SKILL_BASE, { params });
   },
@@ -81,6 +97,10 @@ export const skillApi = {
 
   setSkillStatus: (name: string, enabled: boolean) => {
     return axios.patch(`${SKILL_BASE}/${encodeURIComponent(name)}/status`, { enabled });
+  },
+
+  setSkillDefaultChecked: (name: string, defaultChecked: boolean) => {
+    return axios.patch(`${SKILL_BASE}/${encodeURIComponent(name)}/default-checked`, { default_checked: defaultChecked });
   },
 
   deleteSkill: (name: string) => {

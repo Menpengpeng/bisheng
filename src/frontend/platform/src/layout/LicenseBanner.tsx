@@ -1,53 +1,57 @@
-import { getLicenseStatus, LicenseStatus } from "@/controllers/API/license";
-import { AlertTriangle } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Alert } from "@bisheng/ui";
+
+import { locationContext } from "@/contexts/locationContext";
+import {
+    getCommercialLicenseStatus,
+    getLicenseStatus,
+    reportGatewayLicense,
+    type CommercialLicenseItem,
+} from "@/controllers/API/license";
+import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-// Severity → styling. Only warning/critical/expired render a banner; normal/unknown render nothing.
-// expired/critical share red; warning is amber. See feature 037.
-const SEVERITY_STYLE: Record<string, string> = {
-    warning: "bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900",
-    critical: "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/40 dark:text-red-300 dark:border-red-900",
-    expired: "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/40 dark:text-red-300 dark:border-red-900",
-};
-
-const VISIBLE_SEVERITIES = ["warning", "critical", "expired"];
-
-// TODO(debug): TEMPORARY — force the banner visible so the license is not required
-// to be expired while debugging the page-height offset. Revert to `false` before shipping.
-const FORCE_DEBUG_VISIBLE = false;
+import { buildLicenseBannerCopy } from "./licenseBannerCopy";
+import { shouldFetchGatewayLicenseStatus } from "./licenseBannerGateway";
 
 /**
- * Persistent top banner that surfaces the gateway license expiry state.
+ * Persistent top banner for commercial license expiry.
  *
- * Caller (MainLayout) gates this to super admins; this component additionally renders nothing
- * unless the severity is warning/critical/expired (so normal/unknown/unavailable stay silent).
- * Status comes from the gateway via getLicenseStatus(); open-source deployments have no gateway,
- * so it resolves to null and the banner stays hidden.
- *
- * When visible it publishes its rendered height as the CSS custom property `--license-banner-h`
- * on :root, so viewport-based page heights (`calc(100vh - Npx)`) can subtract it. The property
- * defaults to `0px` whenever the banner is hidden, making that subtraction a no-op.
+ * Caller (MainLayout) gates this to platform super admins. On mount it reads
+ * the aggregated platform status first; Gateway `/api/license/status` is only
+ * called when `gateway.checked_at` is missing or older than one day. After a
+ * successful report it re-reads aggregation. Only expiring / expired rows
+ * render. Height is published as `--license-banner-h`.
  */
 export function LicenseBanner() {
     const { t } = useTranslation();
-    const [status, setStatus] = useState<LicenseStatus | null>(null);
+    const { appConfig } = useContext(locationContext);
+    const [licenses, setLicenses] = useState<CommercialLicenseItem[]>([]);
     const ref = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         let active = true;
-        getLicenseStatus().then((res) => {
-            if (active) setStatus(res);
-        });
+        const load = async () => {
+            let aggregated = await getCommercialLicenseStatus();
+            if (shouldFetchGatewayLicenseStatus(aggregated?.licenses, Date.now(), appConfig.isPro)) {
+                const gateway = await getLicenseStatus();
+                if (gateway) {
+                    await reportGatewayLicense(gateway);
+                    aggregated = await getCommercialLicenseStatus();
+                }
+            }
+            if (active) {
+                setLicenses(aggregated?.licenses ?? []);
+            }
+        };
+        void load();
         return () => {
             active = false;
         };
-    }, []);
+    }, [appConfig.isPro]);
 
-    const realVisible = Boolean(status && VISIBLE_SEVERITIES.includes(status.severity));
-    const visible = FORCE_DEBUG_VISIBLE || realVisible;
+    const message = buildLicenseBannerCopy(licenses, t);
+    const visible = Boolean(message);
 
-    // Publish / clear the banner height as a global CSS var for page-height calcs.
     useLayoutEffect(() => {
         const root = document.documentElement;
         if (visible && ref.current) {
@@ -56,25 +60,17 @@ export function LicenseBanner() {
             root.style.setProperty("--license-banner-h", "0px");
         }
         return () => root.style.setProperty("--license-banner-h", "0px");
-    }, [visible, status]);
+    }, [visible, message]);
 
     if (!visible) return null;
 
-    const severity = realVisible ? status!.severity : "expired";
-    const message = realVisible
-        ? severity === "expired"
-            ? t("license.expired")
-            : t(`license.${severity}`, { days: status!.days_remaining ?? 0 })
-        : t("license.expired"); // debug placeholder when the real license is not expired
-
     return (
-        <div
-            ref={ref}
-            role="alert"
-            className={`flex shrink-0 items-center justify-center gap-2 border-b px-4 py-2 text-sm font-medium ${SEVERITY_STYLE[severity]}`}
-        >
-            <AlertTriangle className="h-4 w-4 shrink-0" />
-            <span>{message}</span>
+        // Alert brings its own 8px margin and 12px radius, so the strip adds no
+        // padding of its own. `flex` keeps those margins inside the measured
+        // box — collapsed through a plain block they would leave
+        // `--license-banner-h` 16px short of what the strip actually occupies.
+        <div ref={ref} className="flex shrink-0 flex-col bg-[#f8f8f8] dark:bg-background-main">
+            <Alert live type="warning" description={message} />
         </div>
     );
 }

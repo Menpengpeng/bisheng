@@ -1,0 +1,525 @@
+"""Dynamic LLM factory for daily-chat ReAct.
+
+When an Image View model is passed in, pixels go to that model after retrieval.
+Its text is a note for the conversation model. The conversation model writes the
+user-facing reply and keeps its tools. view_image is bound only when no Image
+View model is provided.
+
+create_react_agent calls bind_tools once while compiling the graph. That call
+returns this wrapper unchanged. invoke / ainvoke then bind view_image and
+knowledge retrieval for the current turn, so the compile-time tool list is not
+frozen onto the chat model.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import Runnable
+from langchain_core.tools import BaseTool
+from loguru import logger
+
+from bisheng.common.image_view.annotate import ImageRegistry
+from bisheng.common.image_view.loop import (
+    _VISION_NOTE_PREFIX,
+    TOOL_NAME,
+    _ai_message_for_second_round,
+    _apply_suggested_ids,
+    _collect_ai,
+    _last_user_question,
+    _suggested_ids_for,
+    _synthetic_view_calls,
+    _view_calls,
+    failed_image_ids,
+    pixels_were_viewed,
+    prepare_vision_messages,
+    question_needs_pixels,
+)
+from bisheng.common.image_view.relocate import relocate_images_to_human
+from bisheng.common.image_view.tool import build_view_image_tool
+
+RETRIEVE_BEFORE_VIEW_RULES = (
+    "知识库文件不在代码执行器工作目录。"
+    "用户问知识库中的截图 / 界面 / 图片时，必须先调用 search_knowledge_bases，"
+    "不要用代码执行器查找或抽取这些 PDF。"
+    "检索返回的 markdown 图会带 ⟦img#N⟧，然后再调用 view_image。"
+)
+# Daily chat uses the Image View builtin model after retrieval, so the chat
+# model must not be told to call view_image.
+CONFIGURED_RETRIEVE_RULES = (
+    "知识库文件不在代码执行器工作目录。"
+    "用户问知识库中的截图 / 界面 / 图片时，必须先调用 search_knowledge_bases，"
+    "不要用代码执行器查找或抽取这些 PDF。"
+    "检索返回的 markdown 图会带 ⟦img#N⟧，看图由图片查看模型完成。"
+)
+_SYNTHETIC_RETRIEVE_ID = "search_kb_forced"
+# The image model only reports pixels. It must not answer the user or talk about tools.
+_VISION_OBSERVER_RULES = (
+    "你只负责看图，不是对用户说话的模型。"
+    "只写符合问题的画面，并把应展示的 ![](url) 原样单独成行。"
+    "不要回答生成文件、导出文档、调用工具这类要求，也不要说自己没有工具。"
+)
+_VISION_NOTE_TAIL = (
+    "以上是图片查看模型看完像素后的记录，不是给用户的回复。"
+    "请你回答用户。需要生成或导出文件时调用已有工具。"
+    "是否展示图片由你按用户的问题决定：要展示哪张，就把记录里它的 ![](url) 原样单独成行写进回答，"
+    "或者单独一行只写它的 img#N；不展示就都不写。"
+    "回答里说「图片如下」「这是第一张图片」时，必须紧接着写出对应的图片行，系统不会替你补图。"
+)
+
+
+def viewed_images_human_message(
+    viewed: list[tuple[str, str]],
+    registry: ImageRegistry | None = None,
+) -> HumanMessage:
+    """Pair each pixel block with the markdown line the answer may copy."""
+    # One caption immediately before its pixels. A single text block followed by
+    # every image makes the model count "第N张" against the wrong picture.
+    blocks: list[dict] = [{"type": "text", "text": "Viewed images:"}]
+    for image_id, data_uri in viewed:
+        entry = registry.get(image_id) if registry else None
+        url = (entry or {}).get("url") or ""
+        if url:
+            caption = (
+                f"{image_id}: the next image. Include ![]({url}) only when these pixels "
+                "answer the question; omit this picture when they do not."
+            )
+        else:
+            caption = f"{image_id}: the next image."
+        blocks.append({"type": "text", "text": caption})
+        blocks.append({"type": "image_url", "image_url": {"url": data_uri}})
+    return HumanMessage(content=blocks)
+
+
+def messages_from_model_input(inp: Any) -> list[BaseMessage]:
+    if isinstance(inp, dict):
+        return list(inp.get("messages") or inp.get("llm_input_messages") or [])
+    if isinstance(inp, list):
+        return list(inp)
+    return [inp]
+
+
+def _messages_from_state(state: Any) -> list[BaseMessage]:
+    if isinstance(state, dict):
+        return list(state.get("messages") or [])
+    return []
+
+
+def _already_viewed(messages: list[BaseMessage]) -> bool:
+    return pixels_were_viewed(messages)
+
+
+def _already_retrieved(messages: list[BaseMessage], tool_name: str) -> bool:
+    return any(isinstance(message, ToolMessage) and message.name == tool_name for message in messages)
+
+
+def _retrieve_query(messages: list[BaseMessage]) -> str:
+    return _last_user_question(messages).strip()
+
+
+def maybe_inject_retrieve(ai: AIMessage, messages: list[BaseMessage], retrieve_tool_name: str | None) -> AIMessage:
+    """Force search_knowledge_bases when the model goes to the sandbox instead."""
+    if not retrieve_tool_name:
+        return ai
+    if _already_retrieved(messages, retrieve_tool_name):
+        return ai
+    calls = list(ai.tool_calls or [])
+    if any(call.get("name") == retrieve_tool_name for call in calls):
+        return ai
+    query = _retrieve_query(messages)
+    if not query:
+        return ai
+    logger.info("image_view injecting retrieve tool={} query={!r}", retrieve_tool_name, query[:80])
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": retrieve_tool_name,
+                "args": {"knowledge_base_ids": [], "query": query},
+                "id": _SYNTHETIC_RETRIEVE_ID,
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def maybe_inject_view_image(ai: AIMessage, messages: list[BaseMessage], registry: ImageRegistry) -> AIMessage:
+    """Force / rewrite view_image when the question needs pixels and the model skipped or mis-picked."""
+    if _already_viewed(messages):
+        return ai
+    view_calls = _view_calls(ai)
+    needs_pixels = question_needs_pixels(_last_user_question(messages))
+    suggested = _suggested_ids_for(messages) if needs_pixels else []
+    if needs_pixels and suggested:
+        if view_calls:
+            view_calls = _apply_suggested_ids(view_calls, suggested, registry)
+        else:
+            injected = _synthetic_view_calls(suggested, registry)
+            if injected:
+                logger.info("image_view injecting view_image ids={}", injected[0]["args"]["image_ids"])
+                view_calls = injected
+        if view_calls:
+            return _ai_message_for_second_round(ai, view_calls)
+    if view_calls and not suggested and failed_image_ids(messages):
+        logger.info("image_view skip retry failed_ids={}", sorted(failed_image_ids(messages)))
+        return AIMessage(content=ai.content if isinstance(ai.content, str) else "")
+    if view_calls:
+        return _ai_message_for_second_round(ai, view_calls)
+    # Caption ranking is a preference. A question like "文档里有哪些图片" often
+    # shares no heading with the images; skipping the tool then answers from text.
+    if needs_pixels:
+        failed = failed_image_ids(messages)
+        fallback = [image_id for image_id in registry.ids() if image_id not in failed]
+        injected = _synthetic_view_calls(fallback, registry)
+        if injected:
+            logger.info(
+                "image_view injecting view_image ids={} source=registry",
+                injected[0]["args"]["image_ids"],
+            )
+            return _ai_message_for_second_round(ai, injected)
+    return ai
+
+
+class _VisionCallRunnable(Runnable):
+    """Relocate images, attach viewed pixels, optionally append rules, then call the bound LLM."""
+
+    def __init__(
+        self,
+        bound: Any,
+        extra_rules: bool,
+        registry: ImageRegistry,
+        hold_for_inject: bool,
+        retrieve_tool_name: str | None = None,
+        retrieve_hint: bool = False,
+        vision_llm: Any | None = None,
+        note_holder: Any | None = None,
+        react_view: bool = False,
+    ):
+        self._bound = bound
+        self._extra_rules = extra_rules
+        self._registry = registry
+        self._hold_for_inject = hold_for_inject
+        self._retrieve_tool_name = retrieve_tool_name
+        self._retrieve_hint = retrieve_hint
+        self._vision_llm = vision_llm
+        self._note_holder = note_holder
+        # Knowledge space and channel run a view_image loop. The image model
+        # reads pixels only after that tool returns; it does not replace the
+        # conversation model's turn.
+        self._react_view = react_view
+
+    def _prepare(self, inp: Any) -> list[BaseMessage]:
+        messages = messages_from_model_input(inp)
+        viewed = self._registry.pop_viewed()
+        if viewed:
+            messages = [*messages, viewed_images_human_message(viewed, self._registry)]
+        messages = relocate_images_to_human(messages)
+        if self._extra_rules:
+            messages = prepare_vision_messages(messages)
+        elif self._retrieve_hint:
+            rules = CONFIGURED_RETRIEVE_RULES if self._vision_llm is not None else RETRIEVE_BEFORE_VIEW_RULES
+            messages = [SystemMessage(content=rules), *messages]
+        return messages
+
+    def _should_use_configured_vision(self, messages: list[BaseMessage]) -> bool:
+        """Pixels go to the Image View model once retrieval has filled the registry."""
+        if self._react_view:
+            return False
+        if self._vision_llm is None or len(self._registry) == 0:
+            return False
+        if pixels_were_viewed(messages):
+            return False
+        return question_needs_pixels(_last_user_question(messages))
+
+    def _should_handoff_after_view(self, messages: list[BaseMessage]) -> bool:
+        """Knowledge / channel: the image model reads pixels only after view_image."""
+        if not self._react_view or self._vision_llm is None:
+            return False
+        if not pixels_were_viewed(messages):
+            return False
+        return not any(
+            isinstance(message, HumanMessage)
+            and isinstance(message.content, str)
+            and message.content.startswith(_VISION_NOTE_PREFIX)
+            for message in messages
+        )
+
+    async def _stream_vision(self, prepared: list[BaseMessage]) -> tuple[str, str]:
+        from bisheng.common.image_view.react_loop import _chunk_reasoning
+
+        parts: list[str] = []
+        reasoning_parts: list[str] = []
+        # Drop callbacks so this call does not show up as the user-facing stream.
+        async for chunk in self._vision_llm.astream(prepared, config={"callbacks": []}):
+            content = getattr(chunk, "content", "") or ""
+            if isinstance(content, str) and content:
+                parts.append(content)
+            thought = _chunk_reasoning(chunk)
+            if thought:
+                reasoning_parts.append(thought)
+        return "".join(parts), "".join(reasoning_parts)
+
+    def _clean_vision_note(self, messages: list[BaseMessage], raw: str) -> str:
+        from bisheng.common.image_view.annotate import render_image_id_lines
+        from bisheng.common.image_view.react_loop import (
+            _strip_picture_citations,
+            strip_picture_handles,
+            strip_view_narration,
+        )
+
+        question = _last_user_question(messages)
+        # Render id-only lines first: narration stripping drops bare ids.
+        rendered = render_image_id_lines(raw, self._registry)
+        cleaned = strip_picture_handles(_strip_picture_citations(strip_view_narration(rendered), question), question)
+        return (cleaned or "").strip()
+
+    async def _vision_observation(self, messages: list[BaseMessage]) -> str:
+        """Ask the image model what the pixels show. Not a user-facing answer."""
+        holder = self._note_holder
+        if holder is not None and holder._cached_vision_note is not None:
+            return holder._cached_vision_note
+        from bisheng.common.image_view.react_loop import _attach_viewed_pixels
+
+        prepared = await _attach_viewed_pixels(messages, self._registry)
+        prepared = [SystemMessage(content=_VISION_OBSERVER_RULES), *prepared]
+        raw, _ = await self._stream_vision(prepared)
+        note = self._clean_vision_note(messages, raw)
+        if holder is not None:
+            holder._cached_vision_note = note
+        return note
+
+    async def _messages_after_tool_view(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        """Turn view_image's pixels into a note, then let the conversation model answer."""
+        holder = self._note_holder
+        if holder is not None and holder._cached_vision_note is not None:
+            note = holder._cached_vision_note
+            self._registry.pop_viewed()
+        else:
+            viewed = self._registry.pop_viewed()
+            if not viewed:
+                return messages
+            prepared = [
+                SystemMessage(content=_VISION_OBSERVER_RULES),
+                *messages,
+                viewed_images_human_message(viewed, self._registry),
+            ]
+            raw, _ = await self._stream_vision(prepared)
+            note = self._clean_vision_note(messages, raw)
+            if holder is not None:
+                holder._cached_vision_note = note
+        body = note or "没有读到可用的图片说明。"
+        return [
+            *messages,
+            HumanMessage(content=f"{_VISION_NOTE_PREFIX}\n{body}\n\n{_VISION_NOTE_TAIL}"),
+        ]
+
+    async def _messages_with_vision_note(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        note = await self._vision_observation(messages)
+        logger.info("image_view handoff to chat model note_chars={}", len(note))
+        body = note or "没有读到可用的图片说明。"
+        return [
+            *messages,
+            HumanMessage(content=f"{_VISION_NOTE_PREFIX}\n{body}\n\n{_VISION_NOTE_TAIL}"),
+        ]
+
+    def _after_model(self, result: Any, messages: list[BaseMessage]) -> Any:
+        if not isinstance(result, AIMessage):
+            return result
+        # Daily chat with a configured image model already read the pixels.
+        # Injecting view_image here would replace the conversation model's tool
+        # call or final text. The knowledge / channel loop still needs the tool.
+        if self._vision_llm is None or self._react_view:
+            result = maybe_inject_view_image(result, messages, self._registry)
+        if self._retrieve_hint:
+            result = maybe_inject_retrieve(result, messages, self._retrieve_tool_name)
+        return result
+
+    def _bound_config(self, config):
+        if not self._hold_for_inject:
+            return config
+        if config is None:
+            return {"callbacks": []}
+        if isinstance(config, dict):
+            silent = dict(config)
+            silent["callbacks"] = []
+            return silent
+        return config
+
+    def invoke(self, inp: Any, config=None, **kwargs: Any):
+        messages = self._prepare(inp)
+        result = self._bound.invoke(messages, config=self._bound_config(config), **kwargs)
+        return self._after_model(result, messages)
+
+    async def ainvoke(self, inp: Any, config=None, **kwargs: Any):
+        messages = messages_from_model_input(inp)
+        if self._should_handoff_after_view(messages):
+            messages = await self._messages_after_tool_view(messages)
+            if hasattr(self._bound, "ainvoke"):
+                result = await self._bound.ainvoke(messages, config=config, **kwargs)
+            else:
+                result = self._bound.invoke(messages, config=config, **kwargs)
+            return self._after_model(result, messages)
+        if self._should_use_configured_vision(messages):
+            messages = await self._messages_with_vision_note(messages)
+            if hasattr(self._bound, "ainvoke"):
+                result = await self._bound.ainvoke(messages, config=config, **kwargs)
+            else:
+                result = self._bound.invoke(messages, config=config, **kwargs)
+            return self._after_model(result, messages)
+        messages = self._prepare(inp)
+        call_config = self._bound_config(config)
+        if hasattr(self._bound, "ainvoke"):
+            result = await self._bound.ainvoke(messages, config=call_config, **kwargs)
+        elif hasattr(self._bound, "astream"):
+            chunks: list[Any] = []
+            async for chunk in self._bound.astream(messages, config=call_config, **kwargs):
+                chunks.append(chunk)
+            result = _collect_ai(chunks)
+        else:
+            result = self._bound.invoke(messages, config=call_config, **kwargs)
+        return self._after_model(result, messages)
+
+    async def astream(self, inp: Any, config=None, **kwargs: Any):
+        messages = messages_from_model_input(inp)
+        if self._should_handoff_after_view(messages):
+            messages = await self._messages_after_tool_view(messages)
+            if hasattr(self._bound, "astream"):
+                async for chunk in self._bound.astream(messages, config=config, **kwargs):
+                    yield chunk
+                return
+            yield await self._bound.ainvoke(messages, config=config, **kwargs)
+            return
+        if self._should_use_configured_vision(messages):
+            messages = await self._messages_with_vision_note(messages)
+            if hasattr(self._bound, "astream"):
+                async for chunk in self._bound.astream(messages, config=config, **kwargs):
+                    yield chunk
+                return
+            yield await self._bound.ainvoke(messages, config=config, **kwargs)
+            return
+        messages = self._prepare(inp)
+        call_config = self._bound_config(config)
+        if not self._hold_for_inject:
+            async for chunk in self._bound.astream(messages, config=call_config, **kwargs):
+                yield chunk
+            return
+        chunks: list[Any] = []
+        async for chunk in self._bound.astream(messages, config=call_config, **kwargs):
+            chunks.append(chunk)
+        ai = _collect_ai(chunks)
+        injected = self._after_model(ai, messages)
+        if isinstance(injected, AIMessage) and injected.tool_calls:
+            yield injected
+            return
+        for chunk in chunks:
+            yield chunk
+
+
+class VisionToolBindWrapper(Runnable):
+    """Per-turn model factory.
+
+    With ``vision_llm`` (the Image View builtin model), pixels are sent to that
+    model after retrieval. The conversation model still writes the reply.
+    ``view_image`` is bound only when no vision model is provided.
+    """
+
+    def __init__(
+        self,
+        llm: Any,
+        registry: ImageRegistry,
+        base_tools: list[BaseTool],
+        *,
+        retrieve_tool_name: str | None = None,
+        vision_llm: Any | None = None,
+        react_view: bool = False,
+    ):
+        self._llm = llm
+        self._registry = registry
+        self._base_tools = list(base_tools)
+        self._view_tool = build_view_image_tool(registry)
+        self._retrieve_tool_name = retrieve_tool_name
+        self._vision_llm = vision_llm
+        self._react_view = react_view
+        self._cached_vision_note: str | None = None
+
+    def bind_tools(self, tools, **kwargs):
+        """Satisfy create_react_agent's compile-time bind without freezing tools."""
+        del tools, kwargs
+        return self
+
+    def _turn_runnable(self, inp: Any) -> _VisionCallRunnable:
+        messages = messages_from_model_input(inp)
+        return self({"messages": messages}, None)
+
+    def invoke(self, inp: Any, config=None, **kwargs: Any):
+        return self._turn_runnable(inp).invoke(inp, config, **kwargs)
+
+    async def ainvoke(self, inp: Any, config=None, **kwargs: Any):
+        return await self._turn_runnable(inp).ainvoke(inp, config, **kwargs)
+
+    async def astream(self, inp: Any, config=None, **kwargs: Any):
+        async for chunk in self._turn_runnable(inp).astream(inp, config, **kwargs):
+            yield chunk
+
+    def __call__(self, state, runtime):
+        messages = _messages_from_state(state)
+        needs_pixels = question_needs_pixels(_last_user_question(messages)) if messages else False
+        viewed = _already_viewed(messages)
+        bind_kwargs: dict[str, Any] = {}
+        retrieve_hint = False
+        configured_vision = self._vision_llm is not None and len(self._registry) > 0 and not self._react_view
+        if configured_vision:
+            tools = list(self._base_tools)
+            extra_rules = False
+        elif len(self._registry) > 0:
+            tools = [*self._base_tools, self._view_tool]
+            extra_rules = True
+            remaining = _suggested_ids_for(messages) if needs_pixels else []
+            exhausted = bool(failed_image_ids(messages)) and not remaining
+            if needs_pixels and not viewed and not exhausted:
+                bind_kwargs["tool_choice"] = {"type": "function", "function": {"name": TOOL_NAME}}
+                logger.info("image_view forcing tool_choice={}", TOOL_NAME)
+        else:
+            tools = list(self._base_tools)
+            extra_rules = False
+            retrieve_ready = bool(
+                self._retrieve_tool_name
+                and needs_pixels
+                and any(getattr(tool, "name", None) == self._retrieve_tool_name for tool in tools)
+                and not _already_retrieved(messages, self._retrieve_tool_name)
+            )
+            if retrieve_ready:
+                retrieve_hint = True
+                # Reasoning models (qwq-plus) reject a forced tool_choice. The
+                # Image View path still injects the search call after the reply.
+                if self._vision_llm is None:
+                    bind_kwargs["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": self._retrieve_tool_name},
+                    }
+                    logger.info("image_view forcing retrieve tool={}", self._retrieve_tool_name)
+                else:
+                    logger.info("image_view hint retrieve tool={}", self._retrieve_tool_name)
+            else:
+                logger.info(
+                    "image_view skip view_image registry_size=0 tools={} needs_pixels={}",
+                    [getattr(tool, "name", "") for tool in tools],
+                    needs_pixels,
+                )
+        bound = self._llm.bind_tools(tools, **bind_kwargs) if tools else self._llm
+        if configured_vision:
+            hold_for_inject = False
+        else:
+            hold_for_inject = (extra_rules and needs_pixels and not viewed) or retrieve_hint
+        return _VisionCallRunnable(
+            bound,
+            extra_rules=extra_rules,
+            registry=self._registry,
+            hold_for_inject=hold_for_inject,
+            retrieve_tool_name=self._retrieve_tool_name,
+            retrieve_hint=retrieve_hint,
+            vision_llm=self._vision_llm,
+            note_holder=self,
+            react_view=self._react_view,
+        )

@@ -36,7 +36,7 @@ from bisheng.permission.domain.services.visibility_projection_service import (
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_OWNED_RESOURCE_ALLOWLIST = frozenset({"workflow", "assistant", "tool"})
+SYSTEM_OWNED_RESOURCE_ALLOWLIST = frozenset({"workflow", "assistant", "tool", "linsight_skill"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +56,8 @@ class OwnerProjectionContext:
     operation_type: str = "RESOURCE_CREATE"
     copy_grants: tuple[GrantSnapshot, ...] = ()
     copy_deltas: tuple[ProjectionTupleDelta, ...] = ()
+    creation_grants: tuple[GrantSnapshot, ...] = ()
+    creation_deltas: tuple[ProjectionTupleDelta, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,22 +135,32 @@ class F048OwnerProjectionService:
             self._validate_system_owned(context)
             grant = None
             source = None
-            marker_relations = (
-                "visible",
-                *(f"system_{action}_marker" for action in context.system_action_codes if action != "visible"),
-            )
-            protected_deltas = tuple(
-                ProjectionTupleDelta(
-                    phase="STAGE",
-                    sequence=index,
-                    action="WRITE",
-                    user="user:*",
-                    relation=relation,
-                    object=(f"{context.target.resource_type}:{context.target.resource_id}"),
+            if context.target.resource_type in {"tool", "linsight_skill"}:
+                if len(context.creation_grants) != 1:
+                    raise PermissionInvalidResourceError()
+                protected_deltas = ()
+                visibility = self._visibility.compile(
+                    tenant_id=context.target.tenant_id,
+                    grants=context.creation_grants,
+                    existing_sources=(),
                 )
-                for index, relation in enumerate(dict.fromkeys(marker_relations))
-            )
-            visibility = None
+            else:
+                marker_relations = (
+                    "visible",
+                    *(f"system_{action}_marker" for action in context.system_action_codes if action != "visible"),
+                )
+                protected_deltas = tuple(
+                    ProjectionTupleDelta(
+                        phase="STAGE",
+                        sequence=index,
+                        action="WRITE",
+                        user="user:*",
+                        relation=relation,
+                        object=(f"{context.target.resource_type}:{context.target.resource_id}"),
+                    )
+                    for index, relation in enumerate(dict.fromkeys(marker_relations))
+                )
+                visibility = None
         else:
             grant, source, protected_deltas = self._protected_owner(context)
             visibility = self._visibility.compile(
@@ -158,6 +170,7 @@ class F048OwnerProjectionService:
             )
         all_deltas = merge_projection_deltas(
             context.copy_deltas,
+            context.creation_deltas,
             protected_deltas,
             visibility.deltas if visibility is not None else (),
         )
@@ -231,9 +244,10 @@ class F048OwnerProjectionService:
         context: OwnerProjectionContext,
         owner_grant: GrantSnapshot,
     ) -> tuple[GrantSnapshot, ...]:
-        if not context.copy_grants:
+        additional_grants = (*context.copy_grants, *context.creation_grants)
+        if not additional_grants:
             return (owner_grant,)
-        by_model = {grant.model.model_key: grant for grant in context.copy_grants}
+        by_model = {grant.model.model_key: grant for grant in additional_grants}
         by_model[owner_grant.model.model_key] = owner_grant
         return tuple(by_model[key] for key in sorted(by_model) if by_model[key].active and by_model[key].sources)
 
@@ -266,7 +280,20 @@ class F048OwnerProjectionService:
         if context.operation_type == "RESOURCE_CREATE":
             if context.copy_grants or context.copy_deltas:
                 raise PermissionInvalidResourceError()
+            if any(
+                grant.tenant_id != context.target.tenant_id
+                or grant.resource_type != context.target.resource_type
+                or grant.resource_id != context.target.resource_id
+                or any(
+                    source.protected or source.source_type not in {"CREATOR_GRANT", "TENANT"}
+                    for source in grant.sources
+                )
+                for grant in context.creation_grants
+            ):
+                raise PermissionInvalidResourceError()
             return
+        if context.creation_grants or context.creation_deltas:
+            raise PermissionInvalidResourceError()
         if context.operation_type != "RESOURCE_COPY" or context.system_owned:
             raise PermissionInvalidResourceError()
         if context.permission_mode not in {"INHERIT", "CUSTOM"}:

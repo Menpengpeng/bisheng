@@ -2,6 +2,7 @@ import axios from "../request";
 
 export const KNOWLEDGE_SPACE_FILE_PARSE_POLICY = "knowledge_space_file_parse";
 export const CHANNEL_ARTICLE_POLICY = "channel_article";
+export const WORKBENCH_CHAT_POLICY = "workbench_chat";
 
 export type SensitiveWordType = "builtin" | "custom";
 
@@ -26,12 +27,12 @@ export interface SensitiveWordPolicyPayload {
 }
 
 export function getSensitiveWordPolicyApi(businessType = KNOWLEDGE_SPACE_FILE_PARSE_POLICY) {
-    return axios.get(`/api/v1/sensitive-word-policies/${businessType}`);
+    return axios.get<unknown, SensitiveWordPolicy>(`/api/v1/sensitive-word-policies/${businessType}`);
 }
 
 export function updateSensitiveWordPolicyApi(
     data: SensitiveWordPolicyPayload,
     businessType = KNOWLEDGE_SPACE_FILE_PARSE_POLICY,
 ) {
-    return axios.put(`/api/v1/sensitive-word-policies/${businessType}`, data);
+    return axios.put<unknown, SensitiveWordPolicy>(`/api/v1/sensitive-word-policies/${businessType}`, data);
 }

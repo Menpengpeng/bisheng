@@ -30,7 +30,7 @@ type IconComponent = React.ComponentType<{ className?: string; 'aria-hidden'?: b
 
 interface TypeMeta {
   Icon: IconComponent;
-  /** Tinted surface (§4). Dark mode has no tint ramp yet — see the note below. */
+  /** Tinted surface (§4); the tint tokens carry their own dark values. */
   surface: string;
   iconColor: string;
   /** §9: only failures and warnings interrupt the screen reader. */
@@ -41,41 +41,39 @@ interface TypeMeta {
  * Four types, each with its own icon — never text-only, so the semantics survive
  * for users who can't separate the colors (§2).
  *
- * Dark mode: the `*-tint` tokens are light-mode values (功能色 dark ramp is still
- * open — 组件-Toast轻提示.md §12), and 主文字色 flips to near-white there, so the
- * tint would go unreadable. Until that decision lands, dark mode re-derives the
- * surface from the SAME functional token at low alpha — still token-driven, no
- * bare hex.
+ * Dark mode needs no per-type patches: the `*-tint` tokens (and the brand
+ * blue-50) resolve through the dark functional / brand ramps in tokens.css —
+ * deep saturated washes on #121212 — so the same classes serve both modes.
  */
 const TYPE_META: Record<ToastType, TypeMeta> = {
   success: {
     Icon: Filled.CheckCircle as IconComponent,
-    surface: 'bg-success-tint dark:bg-success/15',
+    surface: 'bg-success-tint',
     iconColor: 'text-success',
     assertive: false,
   },
   error: {
     Icon: Filled.CloseCircle as IconComponent,
-    surface: 'bg-danger-tint dark:bg-danger/15',
+    surface: 'bg-danger-tint',
     iconColor: 'text-danger',
     assertive: true,
   },
   warning: {
     Icon: Filled.Attention as IconComponent,
-    surface: 'bg-warning-tint dark:bg-warning/15',
+    surface: 'bg-warning-tint',
     iconColor: 'text-warning',
     assertive: true,
   },
   info: {
     Icon: Filled.Info as IconComponent,
-    surface: 'bg-blue-50 dark:bg-blue-500/15',
+    surface: 'bg-blue-50',
     iconColor: 'text-blue-main',
     assertive: false,
   },
 };
 
-/** §7 — one easing for every toast transition; faster than dialogs by design. */
-const EASE = 'ease-[cubic-bezier(0.2,0,0,1)]';
+/** §7 — one easing for every toast transition; faster than dialogs by design (preset `ease-notice`). */
+const EASE = 'ease-notice';
 
 function canHover(): boolean {
   // §6/§8: hovering pauses the countdown, but touch has no hover — there the
@@ -149,7 +147,7 @@ function ToastRow({ item, closeLabel }: { item: ToastItem; closeLabel: string })
               entered && !item.closing
                 ? 'translate-y-0 opacity-100 duration-200'
                 : '-translate-y-2 opacity-0',
-              item.closing ? 'duration-[160ms]' : 'duration-200',
+              item.closing ? 'duration-160' : 'duration-200',
             )}
             onMouseEnter={() => {
               if (canHover()) {
@@ -270,6 +268,7 @@ export function Toaster({ className, closeLabel = 'Close' }: ToasterProps) {
   // chrome or a dialog no matter how large its z-index is.
   return createPortal(
     <div
+      data-bisheng-notice=""
       className={cn(
         // Always top-center, 16px below the viewport edge, above everything —
         // a toast fired from inside a dialog has to be visible (§3). The exact

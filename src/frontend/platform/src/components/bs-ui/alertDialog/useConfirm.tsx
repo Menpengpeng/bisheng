@@ -1,9 +1,10 @@
 // @ts-strict-ignore
 
 import { TipIcon } from "@/components/bs-icons/tip"
+import { showApiError } from "@/controllers/request"
 import i18next from "i18next"
 import { X } from "lucide-react"
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { createRoot } from "react-dom/client"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "."
 
@@ -13,9 +14,13 @@ interface ConfirmParams {
     canelTxt?: string
     okTxt?: string
     showClose?: boolean
+    /** Acknowledge-only: hide Cancel so the user has a single way out. */
+    hideCancel?: boolean
+    /** Close only this confirmation when its owning view is invalidated. */
+    signal?: AbortSignal
     onClose?: () => void
     onCancel?: () => void
-    onOk?: (next) => void
+    onOk?: (next: () => void) => unknown
 }
 
 let openFn = (_: ConfirmParams) => { }
@@ -23,11 +28,17 @@ let openFn = (_: ConfirmParams) => { }
 function ConfirmWrapper() {
 
     const [open, setOpen] = useState(false)
+    const [pending, setPending] = useState(false)
+    const [revision, setRevision] = useState(0)
     const paramRef = useRef(null)
+    const settledRef = useRef(false)
 
     openFn = (params: ConfirmParams) => {
         paramRef.current = params
+        settledRef.current = false
+        setPending(false)
         setOpen(true)
+        setRevision(value => value + 1)
     }
 
     const close = () => {
@@ -35,34 +46,68 @@ function ConfirmWrapper() {
         setOpen(false)
     }
 
+    useEffect(() => {
+        const params = paramRef.current
+        const signal = params?.signal as AbortSignal | undefined
+        if (!open || !signal) return
+        const abort = () => {
+            if (paramRef.current !== params) return
+            params.onClose?.()
+            setOpen(false)
+        }
+        signal.addEventListener("abort", abort, { once: true })
+        if (signal.aborted) abort()
+        return () => signal.removeEventListener("abort", abort)
+    }, [open, revision])
+
+    const handleOkClick = () => {
+        if (settledRef.current) return
+        settledRef.current = true
+        setPending(true)
+        void Promise.resolve().then(() => paramRef.current?.onOk
+            ? paramRef.current.onOk(close)
+            : close()).catch(showApiError).finally(() => {
+                settledRef.current = false
+                setPending(false)
+            })
+    }
+
     const handleCancelClick = () => {
+        if (paramRef.current?.hideCancel) {
+            handleOkClick()
+            return
+        }
         paramRef.current?.onCancel?.()
         close()
     }
 
-    const handleOkClick = () => {
-        paramRef.current?.onOk
-            ? paramRef.current?.onOk?.(close)
-            : close()
-    }
-
     if (!paramRef.current) return null
-    const { title, desc, okTxt, canelTxt, showClose = true } = paramRef.current
+    const { title, desc, okTxt, canelTxt, showClose = true, hideCancel = false } = paramRef.current
 
     return (
-        <AlertDialog open={open} onOpenChange={setOpen}>
+        <AlertDialog
+            open={open}
+            onOpenChange={(next) => {
+                if (pending) return
+                if (!next && paramRef.current?.hideCancel) {
+                    handleOkClick()
+                    return
+                }
+                setOpen(next)
+            }}
+        >
             <AlertDialogContent>
                 <AlertDialogHeader className="relative">
                     <div><TipIcon /></div>
-                    {showClose && <X onClick={close} className="absolute right-0 top-[-0.5rem] cursor-pointer text-gray-400 hover:text-gray-600"></X>}
+                    {showClose && <X onClick={hideCancel ? handleOkClick : close} className="absolute right-0 top-[-0.5rem] cursor-pointer text-gray-400 hover:text-gray-600"></X>}
                     <AlertDialogTitle>{title}</AlertDialogTitle>
-                    <AlertDialogDescription className="text-popover-foreground">
+                    <AlertDialogDescription className="whitespace-pre-line text-popover-foreground">
                         {desc}
                     </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
-                    <AlertDialogCancel onClick={handleCancelClick} className="px-11">{canelTxt}</AlertDialogCancel>
-                    <AlertDialogAction onClick={handleOkClick} className="px-11">{okTxt}</AlertDialogAction>
+                    {!hideCancel && <AlertDialogCancel disabled={pending} onClick={handleCancelClick} className="px-11">{canelTxt}</AlertDialogCancel>}
+                    <AlertDialogAction disabled={pending} onClick={(event) => { event.preventDefault(); handleOkClick() }} className="px-11">{okTxt}</AlertDialogAction>
                 </AlertDialogFooter>
             </AlertDialogContent>
         </AlertDialog>
@@ -72,14 +117,14 @@ function ConfirmWrapper() {
 let confirmRoot: ReturnType<typeof createRoot> | null = null;
 
 (function () {
-    // 挂载组件
+    // Mount the singleton dialog host.
     let el = document.getElementById('confirm-wrap');
     if (!el) {
         el = document.createElement('div');
         el.id = 'confirm-wrap';
         document.body.append(el);
     }
-    // 统一使用 createRoot (React 18+)
+    // Reuse the React 18 root.
     if (!confirmRoot) {
         confirmRoot = createRoot(el);
     }
@@ -88,12 +133,14 @@ let confirmRoot: ReturnType<typeof createRoot> | null = null;
 
 
 const bsConfirm = (params: ConfirmParams) => {
-    const resource = i18next.getResourceBundle(i18next.language, 'bs')
-
+    // t(), not getResourceBundle(): the bundle is undefined whenever the active
+    // language has no loaded resources — a namespace still in flight, or a tag
+    // with no bundle to load at all. Reading .prompt off it threw and killed
+    // every confirm dialog, so deletes and cancels silently did nothing.
     openFn({
-        title: resource.prompt,
-        canelTxt: resource.cancel,
-        okTxt: resource.confirmButton,
+        title: i18next.t('prompt', { ns: 'bs', defaultValue: 'Confirmation' }),
+        canelTxt: i18next.t('cancel', { ns: 'bs', defaultValue: 'Cancel' }),
+        okTxt: i18next.t('confirmButton', { ns: 'bs', defaultValue: 'Confirm' }),
         ...params,
     })
 }

@@ -20,14 +20,12 @@ from bisheng.linsight.domain.models.linsight_skill import LinsightSkill
 from bisheng.linsight.domain.schemas.skill_schema import SkillCreateForm
 from bisheng.linsight.domain.services import skill_service as service_module
 from bisheng.linsight.domain.services.skill_service import SkillService
-from test.linsight.fixtures.fake_minio import FakeMinioStorage
-
 from bisheng.linsight.domain.services.skill_store import (
     MAX_BUNDLE_SIZE,
-    MAX_UNPACKED_SIZE,
     SKILL_MD,
     SkillStore,
 )
+from test.linsight.fixtures.fake_minio import FakeMinioStorage
 
 TENANT = 1
 USER = 7
@@ -56,12 +54,22 @@ class FakeSkillDao:
         return skill
 
     @classmethod
-    async def get_by_name(cls, name):
-        return cls.rows.get(name)
+    async def get_by_name(cls, name, owner_user_id=0, **kwargs):
+        row = cls.rows.get(name)
+        if row is not None and getattr(row, "owner_user_id", 0) != owner_user_id:
+            return None
+        return row
 
     @classmethod
-    async def get_by_display_name(cls, display_name):
-        return next((s for s in cls.rows.values() if s.display_name == display_name), None)
+    async def get_by_display_name(cls, display_name, owner_user_id=0, **kwargs):
+        return next(
+            (
+                s
+                for s in cls.rows.values()
+                if s.display_name == display_name and getattr(s, "owner_user_id", 0) == owner_user_id
+            ),
+            None,
+        )
 
     @classmethod
     async def get_page(cls, keyword=None, enabled=None, page=1, page_size=10):
@@ -81,6 +89,13 @@ class FakeSkillDao:
         if name not in cls.rows:
             return False
         cls.rows[name].enabled = enabled
+        return True
+
+    @classmethod
+    async def set_default_checked(cls, name, default_checked):
+        if name not in cls.rows:
+            return False
+        cls.rows[name].default_checked = default_checked
         return True
 
     @classmethod
@@ -169,28 +184,33 @@ class TestCreate:
         with pytest.raises(SkillValidationError, match="SKILL.md"):
             await service.create_from_upload(TENANT, USER, "x.zip", _zip_bytes({"readme.md": b"x"}))
 
-    async def test_oversize_rejected(self, service):
+    async def test_oversize_rejected(self, service, monkeypatch):
+        monkeypatch.setattr(service_module, "resolve_skill_upload_limit", AsyncMock(return_value=1024 * 1024))
         with pytest.raises(SkillFileTooLargeError):
-            await service.create_from_upload(TENANT, USER, "big.md", b"x" * (MAX_BUNDLE_SIZE + 1))
+            await service.create_from_upload(TENANT, USER, "big.md", b"x" * (1024 * 1024 + 1))
 
-    async def test_well_compressing_bundle_over_upload_limit_when_unpacked_accepted(self, service):
+    async def test_well_compressing_bundle_over_upload_limit_when_unpacked_accepted(self, service, monkeypatch):
         """Regression: an archive under the upload limit whose contents expand past it.
 
-        A pptx/font/image bundle compresses well — the .zip stays at a few MB while the
-        extracted files exceed 10MB. That used to be rejected as "file exceeds 10MB",
-        which reads as a bug on a 7MB file. Only the unpacked limit may reject it now.
+        A pptx/font/image bundle compresses well — the .zip stays small while the
+        extracted files exceed the upload cap. That used to be rejected as "file exceeds
+        the limit", which reads as a bug on a file under it. Only the unpacked limit may
+        reject it now.
         """
-        asset = b"x" * (MAX_BUNDLE_SIZE + 1)  # deflates to a few KB
+        upload_cap = 1024 * 1024
+        monkeypatch.setattr(service_module, "resolve_skill_upload_limit", AsyncMock(return_value=upload_cap))
+        asset = b"x" * (upload_cap + 1)  # deflates to a few KB
         data = _zip_bytes(
             {"demo-skill/SKILL.md": _md_bytes(), "demo-skill/assets/template.bin": asset},
             compression=zipfile.ZIP_DEFLATED,
         )
-        assert len(data) < MAX_BUNDLE_SIZE
+        assert len(data) < upload_cap
         detail = await service.create_from_upload(TENANT, USER, "demo-skill.zip", data)
         assert {f.path for f in detail.files} == {SKILL_MD, "assets/template.bin"}
 
-    async def test_unpacked_oversize_rejected(self, service):
-        asset = b"x" * (MAX_UNPACKED_SIZE + 1)
+    async def test_unpacked_oversize_rejected(self, service, monkeypatch):
+        monkeypatch.setattr(service_module, "resolve_skill_unpacked_limit", AsyncMock(return_value=1024 * 1024))
+        asset = b"x" * (1024 * 1024 + 1)
         data = _zip_bytes(
             {"demo-skill/SKILL.md": _md_bytes(), "demo-skill/assets/bomb.bin": asset},
             compression=zipfile.ZIP_DEFLATED,
@@ -198,6 +218,30 @@ class TestCreate:
         assert len(data) < MAX_BUNDLE_SIZE  # passes the upload gate, must trip the unpacked one
         with pytest.raises(SkillBundleTooLargeError):
             await service.create_from_upload(TENANT, USER, "demo-skill.zip", data)
+
+    async def test_unpacked_cap_follows_the_setting_on_replace_too(self, service, monkeypatch):
+        await service.create_from_upload(TENANT, USER, "demo-skill.md", _md_bytes())
+        monkeypatch.setattr(service_module, "resolve_skill_unpacked_limit", AsyncMock(return_value=1024 * 1024))
+        data = _zip_bytes(
+            {"demo-skill/SKILL.md": _md_bytes(), "demo-skill/assets/bomb.bin": b"x" * (1024 * 1024 + 1)},
+            compression=zipfile.ZIP_DEFLATED,
+        )
+        with pytest.raises(SkillBundleTooLargeError):
+            await service.update_from_upload(TENANT, "demo-skill", "demo-skill.zip", data)
+
+    async def test_corrupted_archive_is_a_validation_error(self, service):
+        data = bytearray(
+            _zip_bytes(
+                {"demo-skill/SKILL.md": _md_bytes(), "demo-skill/assets/a.bin": b"y" * 4096},
+                compression=zipfile.ZIP_DEFLATED,
+            )
+        )
+        # Flip a byte inside the deflated payload of a.bin: the directory still parses,
+        # reading the entry fails its CRC / inflate step.
+        payload_at = data.find(b"assets/a.bin") + len(b"assets/a.bin") + 4
+        data[payload_at] ^= 0xFF
+        with pytest.raises(SkillValidationError, match="corrupted zip archive"):
+            await service.create_from_upload(TENANT, USER, "demo-skill.zip", bytes(data))
 
     async def test_unsupported_extension_rejected(self, service):
         with pytest.raises(SkillValidationError, match="unsupported"):
@@ -272,12 +316,20 @@ class TestUpdateDelete:
         assert detail.display_name == "演示技能v3"
         assert {f.path for f in detail.files} == {SKILL_MD, "new.txt"}
 
-    async def test_update_upload_name_mismatch_rejected(self, service):
+    async def test_update_upload_keeps_skill_id_when_frontmatter_differs(self, service):
         await service.create_from_upload(TENANT, USER, "demo-skill.md", _md_bytes())
-        with pytest.raises(SkillValidationError, match="must equal"):
-            await service.update_from_upload(
-                TENANT, "demo-skill", "other.md", _md_bytes(name="other-name", display_name="别名")
-            )
+        detail = await service.update_from_upload(
+            TENANT,
+            "demo-skill",
+            "other.md",
+            _md_bytes(name="other-name", display_name="别名", description="replaced"),
+        )
+        assert detail.name == "demo-skill"
+        assert detail.display_name == "别名"
+        assert detail.description == "replaced"
+        assert detail.normalized_from is None
+        assert "name: demo-skill" in detail.source_text
+        assert "other-name" not in detail.source_text
 
     async def test_set_status_unknown_404(self, service):
         with pytest.raises(SkillNotFoundError):
@@ -297,12 +349,7 @@ class TestImportNameNormalization:
     the form-create path stays strict — the user typed that ID explicitly."""
 
     async def test_uppercase_name_normalized_on_upload(self, service):
-        md = (
-            b"---\n"
-            b"name: Presentations\n"
-            b"description: Create or edit PowerPoint decks.\n"
-            b"---\n\n# body\n"
-        )
+        md = b"---\nname: Presentations\ndescription: Create or edit PowerPoint decks.\n---\n\n# body\n"
         detail = await service.create_from_upload(TENANT, USER, "presentations.md", md)
         assert detail.name == "presentations"
         assert detail.display_name == "Presentations"
@@ -320,14 +367,7 @@ class TestImportNameNormalization:
         assert detail.normalized_from == "演示文稿"
 
     async def test_foreign_frontmatter_keys_survive_rewrite(self, service):
-        md = (
-            b"---\n"
-            b"name: My-Skill\n"
-            b"description: demo\n"
-            b"license: Apache-2.0\n"
-            b"allowed-tools: Bash, Read\n"
-            b"---\n\nbody"
-        )
+        md = b"---\nname: My-Skill\ndescription: demo\nlicense: Apache-2.0\nallowed-tools: Bash, Read\n---\n\nbody"
         detail = await service.create_from_upload(TENANT, USER, "s.md", md)
         text = detail.source_text
         assert "license: Apache-2.0" in text

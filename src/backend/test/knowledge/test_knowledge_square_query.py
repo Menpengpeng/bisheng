@@ -54,7 +54,7 @@ def _member(
 
 
 @pytest.mark.asyncio
-async def test_square_query_uses_numeric_join_key_for_member_business_id(monkeypatch):
+async def test_square_query_pins_an_explicit_collation_on_the_member_join_key(monkeypatch):
     from sqlalchemy.dialects import mysql
 
     captured = {}
@@ -80,10 +80,14 @@ async def test_square_query_uses_numeric_join_key_for_member_business_id(monkeyp
     )
 
     sql = str(captured["statement"].compile(dialect=mysql.dialect()))
-    assert "CAST(knowledge.id AS CHAR" not in sql
-    assert "COLLATE" not in sql
-    assert "CAST(space_channel_member.business_id AS SIGNED INTEGER)" in sql
-    assert "CAST(anon_1.business_id AS SIGNED INTEGER)" in sql
+    # The join key is built on the knowledge side (int -> CHAR) with an EXPLICIT
+    # collation, which outranks the member column's IMPLICIT one and so cannot
+    # raise MySQL 1267. Casting the member column to a number instead would defeat
+    # its index and force every channel row's UUID business_id through a numeric
+    # cast, so that shape is deliberately not used.
+    assert "CAST(knowledge.id AS CHAR) COLLATE utf8mb4_unicode_ci = space_channel_member.business_id" in sql
+    assert "CAST(knowledge.id AS CHAR) COLLATE utf8mb4_unicode_ci = anon_1.business_id" in sql
+    assert "CAST(space_channel_member.business_id AS SIGNED INTEGER)" not in sql
 
 
 @pytest.mark.asyncio
@@ -98,6 +102,11 @@ async def test_square_orders_unsubscribed_before_applied_then_by_unique_subscrib
         await connection.run_sync(SpaceChannelMember.__table__.create)
 
     now = datetime(2026, 1, 1)
+    unlisted_public = _space(6, now)
+    unlisted_public.is_released = False
+    unlisted_approval = _space(7, now)
+    unlisted_approval.is_released = False
+    unlisted_approval.auth_type = AuthTypeEnum.APPROVAL
     async with AsyncSession(engine, expire_on_commit=False) as session:
         session.add_all(
             [
@@ -106,6 +115,8 @@ async def test_square_orders_unsubscribed_before_applied_then_by_unique_subscrib
                 _space(3, now),
                 _space(4, now),
                 _space(5, now),
+                unlisted_public,
+                unlisted_approval,
                 _member(1, 7, MembershipStatusEnum.PENDING),
                 _member(1, 10),
                 _member(1, 10),

@@ -1,4 +1,5 @@
 // @ts-strict-ignore
+import i18next from "i18next";
 import request from "./request";
 import { resolveKnowledgeParseFailureMessage } from "./knowledgeParseFailureMessage";
 import { mapInitialPermissionResult } from "./permission";
@@ -123,6 +124,8 @@ export interface KnowledgeSpace {
 
     // Used only by the "square explore" UI
     isFollowed?: boolean;
+    /** Effective permission ids the current user holds on the space (from /info). */
+    permissionIds?: string[];
     isPending?: boolean;
     // join | joined | pending | rejected (square list & preview)
     squareStatus?: "join" | "joined" | "pending" | "rejected";
@@ -185,12 +188,12 @@ export interface KnowledgeFile {
     thumbnail?: string;
     errorMessage?: string;
     sensitiveCheck?: KnowledgeFileSensitiveCheck;
-    /** Number of successfully parsed files (folders only) */
-    successFileNum?: number;
-    /** Whether the folder contains at least one FAILED/VIOLATION child (folders only) */
+    /** Whether the folder contains at least one abnormal descendant (folders only) — drives batch retry */
     hasFailedFiles?: boolean;
-    /** Number of files in PROCESSING/WAITING/REBUILDING (folders only) */
-    processingFileNum?: number;
+    /** Creator-only signal that the folder contains an abnormal descendant */
+    hasAbnormalFiles?: boolean;
+    /** Whether the folder contains a PROCESSING/WAITING/REBUILDING descendant */
+    hasProcessingFiles?: boolean;
     /** Source of the file, e.g. 'channel' for subscription channel files */
     fileSource?: string;
     /** Path of the existing duplicate file (when status is DUPLICATE) */
@@ -212,6 +215,8 @@ export interface KnowledgeFile {
      * reads its fields, so it travels as the raw shape it arrived in.
      */
     _raw?: RawSpaceChild;
+    /** Diagnostic evidence only; never use it as display copy or retry payload. */
+    failureEvidence?: { remark?: unknown; errorMessage?: unknown };
 }
 
 // ─────────────────────────────────────────────
@@ -244,6 +249,7 @@ interface RawKnowledgeSpace {
     auto_tag_custom_tags?: string[] | null;
     is_pending?: boolean;
     is_followed?: boolean;
+    permission_ids?: string[];
     subscription_status?: string;
     initial_permission_result?: RawInitialPermissionResult | null;
     actions?: string[];
@@ -307,9 +313,7 @@ interface RawKnowledgeFile {
     update_time?: string;
     remark?: string;
     thumbnails?: string | null;
-    success_file_num?: number;
     file_num?: number;
-    processing_file_num?: number;
     tags?: Array<{ id: number; name: string }>;
 }
 
@@ -322,6 +326,15 @@ export interface UploadFileResponse {
     repeat: boolean;
     repeat_file_name: string | null;
     repeat_update_time: string | null;
+    /**
+     * Set when the space already holds a file with this name. The check is
+     * space-wide and name-only in practice: the backend compares
+     * `md5 OR file_name`, but `KnowledgeFile.md5` stores the upload's uuid
+     * object name, never a content hash, so the md5 branch can't match.
+     */
+    repeat?: boolean;
+    repeat_file_name?: string | null;
+    repeat_update_time?: string | null;
 }
 
 // ─────────────────────────────────────────────
@@ -356,6 +369,7 @@ function mapSpace(raw: RawKnowledgeSpace): KnowledgeSpace {
             : null,
         isPending: raw.is_pending ?? false,
         isFollowed: raw.is_followed ?? false,
+        permissionIds: Array.isArray(raw.permission_ids) ? raw.permission_ids : undefined,
         // Some detail endpoints may carry subscription_status; keep it if present.
         subscriptionStatus:
             (raw as any).subscription_status ??
@@ -472,79 +486,41 @@ function deriveFileType(raw: any): FileType {
 
 function formatSensitiveViolationMessage(hits: any[]): string {
     const words = hits
-        .map((item) => String(item?.word ?? "").trim())
+        .map((item) => typeof item?.word === "string" ? item.word.trim() : "")
         .filter(Boolean)
         .filter((word, index, arr) => arr.indexOf(word) === index);
 
     if (!words.length) {
-        return "您上传的文件包含违规内容，请修改后重试";
+        return String(i18next.t("com_knowledge.sensitive_violation_message"));
     }
 
-    return `您上传的文件包含违规内容：{${words.join(",")}}，请修改后重试`;
+    return String(i18next.t("com_knowledge.sensitive_violation_words", { words: `{${words.join(",")}}` }));
 }
 
 function formatMediaParseFailureMessage(parsed: any): string | undefined {
     return resolveKnowledgeParseFailureMessage(parsed);
 }
 
+function extractFileFailureEvidence(raw: { remark?: unknown; error_message?: unknown }): KnowledgeFile['failureEvidence'] {
+    if (raw.remark == null && raw.error_message == null) return undefined;
+    return { remark: raw.remark, errorMessage: raw.error_message };
+}
+
 export function extractKnowledgeFileError(raw: any): string | undefined {
-    const directMessage = raw?.error_message;
-    if (typeof directMessage === "string" && directMessage.trim()) {
-        return directMessage.trim();
-    }
-
     const remark = raw?.remark;
-    if (typeof remark !== "string" || !remark.trim()) {
-        return undefined;
-    }
-
-    const trimmedRemark = remark.trim();
+    if (!remark && !raw?.error_message) return undefined;
     try {
-        const parsed = JSON.parse(trimmedRemark);
-        if (parsed?.reason === "sensitive_check") {
-            return formatSensitiveViolationMessage(Array.isArray(parsed?.hits) ? parsed.hits : []);
+        const parsed = typeof remark === 'string' ? JSON.parse(remark) : remark;
+        if (parsed?.reason === 'sensitive_check') {
+            return formatSensitiveViolationMessage(Array.isArray(parsed.hits) ? parsed.hits : []);
         }
-        const mediaMessage = formatMediaParseFailureMessage(parsed);
-        if (mediaMessage) {
-            return mediaMessage;
-        }
-
-        const statusMessage = parsed?.status_message;
-        if (typeof statusMessage === "string" && statusMessage.trim()) {
-            const replacedMessage = statusMessage.replace(/\{([^{}]+)\}/g, (placeholder, key) => {
-                const value = parsed?.data?.data?.[key];
-                if (value === undefined || value === null) {
-                    return placeholder;
-                }
-                return String(value);
-            }).trim();
-
-            if (replacedMessage && replacedMessage !== statusMessage.trim()) {
-                return replacedMessage;
-            }
-        }
-
-        const nestedMessage =
-            parsed?.data?.exception ??
-            parsed?.exception ??
-            parsed?.message;
-
-        if (typeof nestedMessage === "string" && nestedMessage.trim()) {
-            return nestedMessage.trim();
-        }
-
-        if (typeof statusMessage === "string" && statusMessage.trim()) {
-            return statusMessage.trim();
-        }
-
-        if (typeof parsed?.old_name === "string" || typeof parsed?.new_name === "string") {
-            return undefined;
-        }
+        const registered = formatMediaParseFailureMessage(parsed ?? {});
+        if (registered) return registered;
+        if (typeof parsed?.old_name === 'string' || typeof parsed?.new_name === 'string') return undefined;
+        return String(i18next.t('api_errors.fallback'));
     } catch {
-        return trimmedRemark;
+        return String(i18next.t('api_errors.fallback'));
     }
-
-    return undefined;
 }
 
 export function extractKnowledgeFileSensitiveCheck(raw: any): KnowledgeFileSensitiveCheck | undefined {
@@ -647,10 +623,11 @@ function mapChild(raw: any, spaceId: string): KnowledgeFile {
         updatedAt: raw?.update_time ?? "",
         thumbnail: raw?.thumbnail ?? raw?.thumbnails,
         errorMessage: extractKnowledgeFileError(raw),
+        failureEvidence: extractFileFailureEvidence(raw),
         sensitiveCheck: extractKnowledgeFileSensitiveCheck(raw),
-        successFileNum: raw?.success_file_num !== undefined ? Number(raw.success_file_num) : undefined,
         hasFailedFiles: raw?.has_failed_files !== undefined ? Boolean(raw.has_failed_files) : undefined,
-        processingFileNum: raw?.processing_file_num !== undefined ? Number(raw.processing_file_num) : undefined,
+        hasAbnormalFiles: raw?.has_abnormal_files !== undefined ? Boolean(raw.has_abnormal_files) : undefined,
+        hasProcessingFiles: raw?.has_processing_files !== undefined ? Boolean(raw.has_processing_files) : undefined,
         fileSource: raw?.file_source,
         oldFileLevelPath: raw?.old_file_level_path,
         approvalRequestId: raw?.approval_request_id !== undefined ? Number(raw.approval_request_id) : undefined,
@@ -727,11 +704,9 @@ export function fileStatusToNumber(status: FileStatus): number {
     }
 }
 
-/** Backend `/children` filter for members: keep violation visible, exclude generic failed files. */
-export const SPACE_CHILDREN_STATUS_NUMS_EXCLUDE_FAILED: number[] = [1, 2, 4, 5, 6, 7];
-
 /** Backend `/children` filter: SUCCESS (2) only. Used for 广场预览 when user is not an active space member. */
 export const SPACE_CHILDREN_STATUS_SUCCESS_ONLY: number[] = [2];
+export const SPACE_CHILDREN_DEFAULT_PAGE_SIZE = 40;
 
 /** Map a raw knowledge file record to the frontend KnowledgeFile model */
 function mapRawFile(raw: RawKnowledgeFile): KnowledgeFile {
@@ -750,9 +725,8 @@ function mapRawFile(raw: RawKnowledgeFile): KnowledgeFile {
         updatedAt: raw.update_time || "",
         thumbnail: raw.thumbnails || undefined,
         errorMessage: extractKnowledgeFileError(raw),
+        failureEvidence: extractFileFailureEvidence(raw),
         sensitiveCheck: extractKnowledgeFileSensitiveCheck(raw),
-        successFileNum: raw.success_file_num,
-        processingFileNum: raw.processing_file_num,
     };
 }
 
@@ -1215,7 +1189,7 @@ export async function deleteSpaceApi(space_id: string): Promise<void> {
 export async function getFolderParentPathApi(
     spaceId: string,
     folderId: string
-     
+
 ): Promise<Array<{ id: string; name: string }>> {
     const res = await request.get<ApiResponse<any>>(
         `/api/v1/knowledge/space/${spaceId}/folders/${folderId}/parent`
@@ -1261,8 +1235,8 @@ export async function listKnowledgeFolders(params: {
     parent_id?: string | number | null;
     /**
      * Status filter — must mirror what the right-side file panel sends so the
-     * tree and the panel stay consistent. For MEMBER-role users this should be
-     * SPACE_CHILDREN_STATUS_NUMS_EXCLUDE_FAILED; omit for admins/creators.
+     * tree and the panel stay consistent. Omit it unless the user picked a status:
+     * hiding other people's parse failures is the server's job, not a query param.
      */
     file_status?: number[];
 }): Promise<{ items: KnowledgeFolderNode[]; total: number }> {
@@ -1321,7 +1295,12 @@ export async function getSpaceChildrenApi(params: {
 }): Promise<{ data: KnowledgeFile[]; page_size: number; has_more: boolean; next_cursor: string | null }> {
     const { space_id, ...queryParams } = params;
     if (!space_id) {
-        return { data: [], page_size: queryParams.page_size ?? 20, has_more: false, next_cursor: null };
+        return {
+            data: [],
+            page_size: queryParams.page_size ?? SPACE_CHILDREN_DEFAULT_PAGE_SIZE,
+            has_more: false,
+            next_cursor: null,
+        };
     }
     const res = await request.get<ApiResponse<any>>(
         `/api/v1/knowledge/space/${space_id}/children`,
@@ -1341,7 +1320,7 @@ export async function getSpaceChildrenApi(params: {
     const list = extractList<RawSpaceChild>(payload);
     return {
         data: list.map(raw => mapChild(raw, space_id)),
-        page_size: Number(payload?.page_size ?? queryParams.page_size ?? 20),
+        page_size: Number(payload?.page_size ?? queryParams.page_size ?? SPACE_CHILDREN_DEFAULT_PAGE_SIZE),
         has_more: !!payload?.has_more,
         next_cursor: payload?.next_cursor ?? null,
     };
@@ -1457,38 +1436,7 @@ export async function deleteFolderApi(space_id: string, folder_id: string): Prom
 // API functions — File management
 // ─────────────────────────────────────────────
 
-/**
- * Step 1: Upload a file to the server and get back its server path
- * Returns the upload response containing file_path to use in addFilesApi
- */
-export async function uploadFileToServerApi(
-    space_id: string,
-    file: File,
-    /**
-     * Explicit filename for the multipart part. Defaults to `file.name`.
-     * Pass this when uploading Files from a `<input webkitdirectory>` picker —
-     * Chromium otherwise uses `file.webkitRelativePath` (e.g. `Docs/a.pdf`)
-     * as the multipart filename, which the backend persists verbatim.
-     */
-    filename?: string,
-): Promise<UploadFileResponse> {
-    const formData = new FormData();
-    formData.append("file", file, filename ?? file.name);
-    const res = await request.postMultiPart(`/api/v1/knowledge/upload/${space_id}`, formData) as ApiResponse<UploadFileResponse> & { message?: string; msg?: string };
-    if (res?.status_code !== undefined && res.status_code !== 200) {
-        // Preserve status_code and data so the caller can render the localized
-        // backend message via i18n (e.g. api_errors.19403 with used_gb/quota_gb)
-        // instead of falling through to a generic "upload failed" toast.
-        const err = new Error(res.status_message || res.message || res.msg || "upload file failed");
-        (err as any).statusCode = res.status_code;
-        (err as any).errorData = res.data;
-        throw err;
-    }
-    if (!res?.data?.file_path) {
-        throw new Error("upload file failed: missing file path");
-    }
-    return res.data;
-}
+export { uploadFileToServerApi } from "./knowledgeUpload";
 
 /**
  * Step 2: Register uploaded file paths into a knowledge space
@@ -1500,7 +1448,7 @@ export async function addFilesApi(
     const res = await request.post(
         `/api/v1/knowledge/space/${space_id}/files`,
         data,
-        { showError: true }
+        { showError: false }
     ) as ApiResponse<RawSpaceChild[]> & { message?: string; msg?: string };
     if (res?.status_code !== undefined && res.status_code !== 200) {
         throw new Error(res.status_message || res.message || res.msg || "register files failed");

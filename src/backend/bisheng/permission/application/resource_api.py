@@ -5,21 +5,34 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from collections import defaultdict
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
+from uuid import uuid4
+
+from loguru import logger
 
 from bisheng.common.errcode.permission import (
     PermissionDeniedError,
+    PermissionInvalidResourceError,
     PermissionVersionConflictError,
 )
 from bisheng.permission.application.resource_authorization import (
     ResourceAuthorizationRegistry,
 )
 from bisheng.permission.application.runtime import F048PermissionRuntime
+from bisheng.permission.domain.repositories.grant_repository import (
+    GrantRepository,
+    ResourcePermissionModeRepository,
+)
 from bisheng.permission.domain.schemas import (
+    GrantMutationChange,
+    GrantMutationOperation,
     GrantMutationRequest,
     PermissionModeApplyRequest,
     PermissionModeDraftRequest,
+    VerifiedPermissionTarget,
 )
 from bisheng.permission.domain.services.grant_service import (
     CanonicalGrantChange,
@@ -93,6 +106,62 @@ def _decode_cursor(value: str) -> dict[str, object]:
     return payload
 
 
+class GrantChangeListenerPort(Protocol):
+    """Business-owned subscriber to a successful grant mutation.
+
+    Implementations live in the module that owns the resource type, so this
+    layer never learns a business audit namespace (``app.*`` and friends). A
+    listener **must not raise**: it runs after the mutation has already been
+    committed and projected, so an exception here would report a failure for
+    work that succeeded.
+    """
+
+    async def on_grants_changed(
+        self,
+        *,
+        actor: PermissionActor,
+        target: VerifiedPermissionTarget,
+        request: GrantMutationRequest,
+        result,
+        roster_before: Mapping[int, tuple[str, str]],
+        roster_complete: bool,
+    ) -> None: ...
+
+
+class GrantChangeListenerRegistry:
+    """Explicit resource_type → listener registry, wired at the composition root.
+
+    An instance rather than a module-level dict, and populated by the
+    composition root rather than by an import side effect: otherwise whether the
+    hook is installed depends on module import order, and the failure mode is a
+    silently missing audit trail with no error anywhere.
+    """
+
+    def __init__(self) -> None:
+        self._listeners: dict[str, GrantChangeListenerPort] = {}
+
+    def register(self, resource_type: str, listener: GrantChangeListenerPort) -> None:
+        normalized = resource_type.strip().lower()
+        if not normalized:
+            raise ValueError("resource_type must not be empty")
+        if normalized in self._listeners:
+            raise ValueError(f"grant change listener already registered: {normalized}")
+        self._listeners[normalized] = listener
+
+    def get(self, resource_type: str) -> GrantChangeListenerPort | None:
+        return self._listeners.get(resource_type.strip().lower())
+
+    def registered_types(self) -> frozenset[str]:
+        return frozenset(self._listeners)
+
+
+#: One page is enough to name the subjects a REMOVE addresses: protected rows
+#: aside, a roster long enough to overflow this is already past what the dialog
+#: renders. Beyond it the record says so (``roster_truncated``) rather than
+#: paying for a full scan on every revocation.
+_ROSTER_SNAPSHOT_PAGE_SIZE = 50
+
+
 class F048ResourcePermissionApi:
     """Coordinate verified resources without loading business rows itself."""
 
@@ -102,10 +171,12 @@ class F048ResourcePermissionApi:
         resources: ResourceAuthorizationRegistry,
         runtime: F048PermissionRuntime,
         subjects: PermissionSubjectDirectoryPort,
+        grant_listeners: GrantChangeListenerRegistry | None = None,
     ) -> None:
         self._resources = resources
         self._runtime = runtime
         self._subjects = subjects
+        self._grant_listeners = grant_listeners or GrantChangeListenerRegistry()
 
     async def get_grantable_models(
         self,
@@ -136,6 +207,174 @@ class F048ResourcePermissionApi:
             for model in models
         ]
 
+    async def list_service_account_grants(
+        self,
+        *,
+        tenant_id: int,
+        service_account_id: int,
+        include_absent_resources: bool = False,
+    ) -> list[dict]:
+        """List the account's active grants.
+
+        Resource deletion only closes the permission gate and keeps the grant
+        roster, so a grant can point at a resource that no longer exists. Those
+        rows grant nothing and cannot be edited, so the list hides them.
+        Account deletion passes ``include_absent_resources`` to revoke them too.
+        """
+
+        rows = await GrantRepository().alist_active_subject_grants(
+            tenant_id=tenant_id,
+            subject_type="service_account",
+            subject_id=str(service_account_id),
+        )
+        resources = tuple(dict.fromkeys((grant.resource_type, grant.resource_id) for _assignee, grant in rows))
+        names = await self._subjects.resource_display_names(resources) if resources else {}
+        if not include_absent_resources:
+            absent = await self._absent_resources(resource for resource in resources if resource not in names)
+            rows = [
+                (assignee, grant) for assignee, grant in rows if (grant.resource_type, grant.resource_id) not in absent
+            ]
+        catalog = await self._runtime.current_catalog()
+        model_names = {item.snapshot.model_key: item.name for item in catalog.models}
+        return [
+            {
+                "resource_type": grant.resource_type,
+                "resource_id": grant.resource_id,
+                "resource_name": names.get((grant.resource_type, grant.resource_id), grant.resource_id),
+                "model_key": grant.model_key,
+                "model_name": model_names.get(grant.model_key, grant.model_key),
+                "assignee_id": str(assignee.id),
+                "assignee_version": assignee.version,
+                "source_type": assignee.source_type,
+                "granted_at": assignee.create_time,
+                "protected": assignee.protected,
+                "editable": not assignee.protected,
+            }
+            for assignee, grant in rows
+        ]
+
+    async def revoke_service_account_grants(
+        self,
+        *,
+        tenant_id: int,
+        service_account_id: int,
+        actor: PermissionActor,
+    ) -> list[dict]:
+        """Remove every grant for a service account before its lifecycle deletion."""
+
+        grants = await self.list_service_account_grants(
+            tenant_id=tenant_id,
+            service_account_id=service_account_id,
+            include_absent_resources=True,
+        )
+        grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        for grant in grants:
+            grouped[(grant["resource_type"], grant["resource_id"])].append(grant)
+        for (resource_type, resource_id), resource_grants in grouped.items():
+            for offset in range(0, len(resource_grants), 50):
+                batch = resource_grants[offset : offset + 50]
+                try:
+                    context = await self.get_context(
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        actor=actor,
+                    )
+                except PermissionInvalidResourceError:
+                    # 25022 also covers cross-tenant and unauthorizable states.
+                    # Only a business-confirmed absence may skip the resource
+                    # check; every other case keeps the deletion blocked.
+                    if not await self._resources.confirm_absent(
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                    ):
+                        raise
+                    await self._runtime.remove_absent_resource_sources(
+                        actor=actor,
+                        tenant_id=tenant_id,
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        assignees=tuple((int(grant["assignee_id"]), int(grant["assignee_version"])) for grant in batch),
+                        idempotency_key=f"sa-delete-{service_account_id}-{uuid4().hex}",
+                    )
+                    continue
+                await self.mutate_grants(
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    actor=actor,
+                    request=GrantMutationRequest(
+                        idempotency_key=f"sa-delete-{service_account_id}-{uuid4().hex}",
+                        expected_resource_version=context["resource_version"],
+                        expected_catalog_release_id=context["catalog_release_id"],
+                        changes=tuple(
+                            GrantMutationChange(
+                                op=GrantMutationOperation.REMOVE,
+                                assignee_id=grant["assignee_id"],
+                                expected_assignee_version=grant["assignee_version"],
+                            )
+                            for grant in batch
+                        ),
+                    ),
+                )
+        return grants
+
+    async def _absent_resources(
+        self,
+        resources,
+    ) -> set[tuple[str, str]]:
+        """Return the resources whose business Service confirms they are gone.
+
+        This only filters a display list, so a probe error keeps the row.
+        """
+
+        absent: set[tuple[str, str]] = set()
+        for resource_type, resource_id in resources:
+            try:
+                if await self._resources.confirm_absent(
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                ):
+                    absent.add((resource_type, resource_id))
+            except Exception:  # display-only probe; keep the row
+                logger.warning(
+                    "Could not confirm resource absence for grant list resource={}:{}",
+                    resource_type,
+                    resource_id,
+                )
+        return absent
+
+    async def list_grantable_resources(
+        self,
+        *,
+        tenant_id: int,
+        resource_type: str | None,
+        keyword: str | None,
+    ) -> list[dict]:
+        rows = await ResourcePermissionModeRepository().alist_current_resources(
+            tenant_id=tenant_id,
+            resource_type=resource_type,
+        )
+        rows = [row for row in rows if row.resource_type not in {"folder", "knowledge_file"}]
+        resources = tuple((row.resource_type, row.resource_id) for row in rows)
+        names = await self._subjects.resource_display_names(resources) if resources else {}
+        normalized = (keyword or "").strip().casefold()
+        result = []
+        for row in rows:
+            name = names.get((row.resource_type, row.resource_id))
+            if name is None:
+                continue
+            if normalized and normalized not in name.casefold() and normalized not in row.resource_id.casefold():
+                continue
+            result.append(
+                {
+                    "resource_type": row.resource_type,
+                    "resource_id": row.resource_id,
+                    "resource_name": name,
+                    "mode": row.mode,
+                    "resource_version": row.version,
+                }
+            )
+        return result[:200]
+
     async def get_context(
         self,
         *,
@@ -149,11 +388,39 @@ class F048ResourcePermissionApi:
             actor,
             "visible",
         )
-        await self._require_visible(actor, target)
+        can_manage = await self._can_manage(actor, target)
+        if not can_manage:
+            # A manager -- the owner, a granted manager, or an admin via the
+            # identity short-circuit in check_action -- may always load the
+            # permission context to render the management dialog. Everyone
+            # else must be able to SEE the resource, which keeps the
+            # read-only view for viewers. Gating on visibility ALONE wrongly
+            # excluded admins: `visible` is deliberately not expanded for
+            # super / tenant admins (see check_visible), so an admin who did
+            # not own the resource got 19000 opening its authorization dialog
+            # -- the sibling list_grants already gates on manage_permission,
+            # not visibility. (F048 hosted-app authorization via the UI.)
+            await self._require_visible(actor, target)
         mode = await self._runtime.current_mode(target)
         catalog = await self._runtime.current_catalog()
         can_manage = await self._can_manage(actor, target)
+        sharing = {}
+        if can_manage and resource_type in {"tool", "linsight_skill"}:
+            grant_context = await self._runtime.build_grant_context(actor=actor, target=target)
+            shared = self._runtime.tenant_use_grant(target, catalog)
+            sharing = {
+                "tenant_id": str(target.tenant_id),
+                "all_members_model_key": shared.grant.model.model_key,
+                "all_members_sources": [
+                    {"assignee_id": str(source.source_id), "assignee_version": source.version}
+                    for grant in grant_context.grants
+                    if grant.active
+                    for source in grant.sources
+                    if source.active and source.subject_type == "tenant"
+                ],
+            }
         return {
+            **sharing,
             "mode": mode.mode,
             "parent_type": target.parent_type,
             "parent_id": target.parent_id,
@@ -171,6 +438,8 @@ class F048ResourcePermissionApi:
         actor: PermissionActor,
         cursor: str | None,
         page_size: int,
+        keyword: str = "",
+        subject_type: str | None = None,
     ) -> dict:
         target = await self._target(
             resource_type,
@@ -184,12 +453,27 @@ class F048ResourcePermissionApi:
             target=target,
             catalog_release_id=catalog.release_id,
         )
-        selected, has_more = await self._runtime.list_permission_sources_page(
-            actor=actor,
-            target=target,
-            after_id=after_id,
-            limit=page_size,
-        )
+        if keyword.strip() or subject_type:
+            from .roster_search import search_source_page
+
+            selected, has_more = await search_source_page(
+                runtime=self._runtime,
+                subjects=self._subjects,
+                actor=actor,
+                target=target,
+                after_id=after_id,
+                page_size=page_size,
+                keyword=keyword,
+                subject_type=subject_type,
+                model_names={item.snapshot.model_key: item.name for item in catalog.models},
+            )
+        else:
+            selected, has_more = await self._runtime.list_permission_sources_page(
+                actor=actor,
+                target=target,
+                after_id=after_id,
+                limit=page_size,
+            )
         names = await self._subjects.display_names(
             tuple(dict.fromkeys((row.subject_type, row.subject_id) for row in selected))
         )
@@ -201,6 +485,9 @@ class F048ResourcePermissionApi:
         )
         parent_names = await self._subjects.resource_display_names(parents) if parents else {}
         model_names = {item.snapshot.model_key: item.name for item in catalog.models}
+        model_states = {item.snapshot.model_key: item.snapshot.active for item in catalog.models}
+        if any(row.model_key not in model_states for row in selected):
+            raise PermissionVersionConflictError(msg="Permission Catalog changed while reading sources")
         data = [
             {
                 "assignee_id": str(row.source_id),
@@ -217,7 +504,7 @@ class F048ResourcePermissionApi:
                         row.model_key,
                     ),
                     "level": row.model_level,
-                    "active": True,
+                    "active": model_states[row.model_key],
                 },
                 "source": {
                     "type": row.source_type,
@@ -266,18 +553,6 @@ class F048ResourcePermissionApi:
             actor,
             "visible",
         )
-        if await self._public_preset_tool(resource_type, resource_id):
-            mode = await self._runtime.mode_for_target(target)
-            projection_degraded = mode.projection_state != "CURRENT" or mode.version != target.resource_version
-            actions = await self._runtime.effective_actions(resource_type) if actor.super_admin else ()
-            return {
-                "mode": mode.mode,
-                "actions": list(actions),
-                "sources": [],
-                "roster_complete": False,
-                "projection_state": mode.projection_state,
-                "projection_degraded": projection_degraded,
-            }
         await self._require_visible(actor, target)
         mode = await self._runtime.mode_for_target(target)
         projection_degraded = mode.projection_state != "CURRENT" or mode.version != target.resource_version
@@ -339,11 +614,19 @@ class F048ResourcePermissionApi:
         actor: PermissionActor,
         request: GrantMutationRequest,
     ) -> dict:
+        """Apply grant changes."""
         target = await self._target(
             resource_type,
             resource_id,
             actor,
             "manage_permission",
+        )
+        listener = self._grant_listeners.get(resource_type)
+        roster_before, roster_complete = await self._roster_snapshot(
+            actor=actor,
+            target=target,
+            request=request,
+            listener=listener,
         )
         add_count = sum(change.op.value == "ADD" for change in request.changes)
         source_ids = iter(await self._runtime.allocate_source_ids(add_count))
@@ -351,6 +634,8 @@ class F048ResourcePermissionApi:
         for change in request.changes:
             source = None
             if change.subject is not None:
+                if change.subject.type == "tenant" and resource_type not in {"tool", "linsight_skill"}:
+                    raise PermissionInvalidResourceError()
                 source = await self._subjects.canonical_source(
                     tenant_id=target.tenant_id,
                     source_id=next(source_ids),
@@ -369,6 +654,7 @@ class F048ResourcePermissionApi:
                     target_model_key=change.target_model_key,
                 )
             )
+        manageable = await self._runtime.manageable_model_keys(actor=actor, target=target)
         result = await self._runtime.mutate_grants(
             actor=actor,
             target=target,
@@ -399,17 +685,60 @@ class F048ResourcePermissionApi:
                 "scope": "LOCAL",
                 "inherited_from": None,
                 "protected": source.protected,
-                "editable": not source.protected,
+                "editable": not source.protected and grant.model.model_key in manageable,
             }
             for grant in result.grants
-            if grant.active and grant.model.active
+            if grant.active
             for source in grant.sources
             if source.active
         ]
+        if listener is not None:
+            await listener.on_grants_changed(
+                actor=actor,
+                target=target,
+                request=request,
+                result=result,
+                roster_before=roster_before,
+                roster_complete=roster_complete,
+            )
         return {
             "resource_version": result.resource_version,
             "items": items,
         }
+
+    async def _roster_snapshot(
+        self,
+        *,
+        actor: PermissionActor,
+        target: VerifiedPermissionTarget,
+        request: GrantMutationRequest,
+        listener: GrantChangeListenerPort | None,
+    ) -> tuple[dict[int, tuple[str, str]], bool]:
+        """``{source_id: (subject_type, subject_id)}`` read **before** the mutation.
+
+        There is no way to recover it afterwards. A REMOVE/MOVE request carries
+        only ``assignee_id`` plus a version — never the subject — and the result
+        cannot fill the gap either: ``remove_source`` drops the revoked source
+        row outright instead of marking it inactive, so the returned grants
+        contain no trace of who lost access. Without this snapshot the audit
+        record would read ``removed: [{assignee_id: 8143}]``, which no
+        investigator can use.
+
+        Paid for only when something actually needs it: no listener, or a
+        request that only adds, and this returns immediately. ADD carries its
+        own subject.
+        """
+        if listener is None:
+            return {}, True
+        if not any(change.op.value in ("REMOVE", "MOVE") for change in request.changes):
+            return {}, True
+        selected, has_more = await self._runtime.list_permission_sources_page(
+            actor=actor,
+            target=target,
+            after_id=0,
+            limit=_ROSTER_SNAPSHOT_PAGE_SIZE,
+        )
+        return {row.source_id: (row.subject_type, row.subject_id) for row in selected}, not has_more
 
     async def create_mode_draft(
         self,
@@ -487,19 +816,6 @@ class F048ResourcePermissionApi:
             actor=actor,
             action=action,
         )
-
-    async def _public_preset_tool(self, resource_type: str, resource_id: str) -> bool:
-        if resource_type.strip().lower() != "tool":
-            return False
-        port_for = getattr(self._resources, "port_for", None)
-        if port_for is None:
-            return False
-        port = port_for(resource_type)
-        load_permission_record = getattr(port, "load_permission_record", None)
-        if load_permission_record is None:
-            return False
-        record = await load_permission_record(resource_id=resource_id)
-        return bool(record and getattr(record, "preset", False) and getattr(record, "system_allowlisted", False))
 
     async def _explanation(
         self,

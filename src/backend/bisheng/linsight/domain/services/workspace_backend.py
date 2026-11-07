@@ -39,12 +39,13 @@ replace-decoded mojibake with ``encoding="utf-8"`` silently fed U+FFFD to the
 model and let ``edit`` corrupt originals.
 
 **Storage growth (known trade-off).** ``seed_workspace_from_previous`` copies
-``uploads/`` forward on every follow-up turn, so an original is duplicated once
-per turn (server-side copy — no app-side bytes, but real stored bytes). Skipping
-originals is NOT an option: the code interpreter's cross-turn access depends on
-them. Reclaim belongs to ops — a MinIO lifecycle rule on the ``workspace/``
-prefix — not to this module; the seed logs its byte volume so the growth is
-visible rather than silent.
+``uploads/`` and ``large_tool_results/`` forward on every follow-up turn, so
+those objects are duplicated once per turn (server-side copy — no app-side
+bytes, but real stored bytes). Skipping them is NOT an option: the code
+interpreter's cross-turn access depends on them, and the prompt forbids
+re-running the call that produced an offloaded dump. Reclaim belongs to ops
+— a MinIO lifecycle rule on the ``workspace/`` prefix — not to this module;
+the seed logs its byte volume so the growth is visible rather than silent.
 """
 
 from __future__ import annotations
@@ -52,7 +53,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import html
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -108,7 +111,22 @@ WORKSPACE_PREFIX = "workspace"
 UPLOADS_DIR = "uploads"
 OUTPUT_DIR = "output"
 SCRATCH_DIR = "scratch"
+# FilesystemMiddleware offloads oversized tool payloads here. The file tools
+# advertise `/large_tool_results/<call_id>` and the prompt forbids re-running
+# the producing call — so a follow-up turn (and the code interpreter) must
+# still see the same objects.
+LARGE_TOOL_RESULTS_DIR = "large_tool_results"
 MANIFEST_NAME = "manifest.json"
+# Where the platform copies this run's skill bundles at task start (canonical
+# name: ``skill_provisioning.WORKSPACE_SKILLS_DIR``, duplicated here as a literal
+# so a storage backend does not pull in the domain-service import chain — the
+# same trade-off ``domain/utils.SKILLS_ZONE`` already makes).
+SKILLS_DIR = "skills"
+
+# Marker prefix on the refusal returned for any model write into ``skills/``.
+# Exported so tests (and any future tool-layer guard) can assert on the refusal
+# without pinning the whole sentence.
+SKILLS_READONLY_ERROR_PREFIX = "[read-only]"
 
 # Extensions deepagents' ``_EXTENSION_TO_FILE_TYPE`` classifies as ``image`` — the
 # ONE multimodal shape mainstream OpenAI-compatible endpoints accept. Reading one
@@ -150,6 +168,58 @@ _CHAR_PAGE_NOTICE = (
     "{total} pages of {size} characters each. Use offset/limit to page through it — "
     "offset counts pages, not source lines.]\n"
 )
+
+
+# F069 P2 (design decision 8, AC-23): an html deliverable is baked at the
+# write boundary — ``[S3]`` runs become ``<sup>[n]</sup>`` and a references
+# section is appended. The section carries this attribute so a second write of
+# already-baked content is returned byte-identical.
+HTML_REFERENCES_ATTR = "data-f069-references"
+# baked runs / section, restored before re-baking an already-baked html deliverable
+_HTML_BAKED_SUP_RE = re.compile(r'<sup data-f069-h="([^"]*)">.*?</sup>', re.S)
+_HTML_REFERENCES_SECTION_RE = re.compile(rf"\n?<section {HTML_REFERENCES_ATTR}>.*?</section>\n?", re.S)
+# Text nodes only: comments, whole ``<script>`` / ``<style>`` / ``<pre>`` /
+# ``<code>`` elements and every tag (with its attributes) are copied verbatim.
+_HTML_SKIP_RE = re.compile(
+    r"<!--.*?-->|<(script|style|pre|code)\b[^>]*>.*?</\1\s*>|<[^>]*>",
+    re.S | re.I,
+)
+_CJK_RE = re.compile(r"[一-鿿]")
+
+
+def _is_skills_path(rel_path: str) -> bool:
+    """True when a workspace-relative path lands inside the provisioned skills subtree.
+
+    The separator is part of the test on purpose: a root-level ``skills-notes.md``
+    is an ordinary file the agent may write, and a bare ``startswith`` would
+    silently refuse it.
+    """
+    return rel_path == SKILLS_DIR or rel_path.startswith(SKILLS_DIR + "/")
+
+
+def _skills_readonly_error(file_path: str) -> str:
+    """Refusal text for a model write into ``skills/``.
+
+    Bilingual and routed, same contract as the binary-read hint: the model has to
+    learn both that this path is closed and where the write actually belongs,
+    otherwise it retries the same call or invents another way in.
+
+    Why this is a hard refusal rather than a prompt line: the bundle is
+    platform-provided content the model is meant to OBEY. A run was observed
+    overwriting ``skills/bisheng-pptx/SKILL.md`` with a doc it made up (inventing a
+    ``bisheng_pptx`` module that does not exist), reading its own fabrication back
+    a step later, and following it to a text file named ``.pptx``. The rewritten
+    copy is also what lands in the session snapshot, so the investigation
+    afterwards reads the invention and blames the skill.
+    """
+    return (
+        f"{SKILLS_READONLY_ERROR_PREFIX} `{file_path}` 属于平台提供的技能包，只读，不能写入或修改。"
+        f"技能怎么做以它自带的 SKILL.md 为准（用 read_file 读，需要时传 limit=1000 一次读完）；"
+        f"产出请写到 output/ 下，中间结果写 scratch/。\n"
+        f"{SKILLS_READONLY_ERROR_PREFIX} `{file_path}` is inside a platform-provided skill bundle and is "
+        f"read-only. Its SKILL.md is the source of truth for how the skill works — read it, do not rewrite "
+        f"it. Write deliverables under output/ and intermediate files under scratch/."
+    )
 
 
 @dataclass
@@ -231,6 +301,25 @@ def normalize_workspace_path(path: str, file_dir: str | None = None) -> str:
             raise ValueError(f"path traversal is not allowed: {path!r}")
         parts.append(seg)
     return "/".join(parts)
+
+
+def _grep_terms(pattern: str) -> tuple[str, ...]:
+    """Literal terms a grep ``pattern`` matches; a line matching any one is a hit.
+
+    The framework's grep is literal, but models keep writing ``A|B|C`` to search
+    several keywords at once (10-29 on 106: 5 of 7 greps in one session, every one
+    "No matches" although each keyword was in the file). Splitting on ``|`` makes
+    that one call work instead of costing a failed round plus a retry. Nothing else
+    is treated as regex — ``.``, ``(``, ``[`` stay literal.
+
+    The whole pattern is always kept as a term, so every line the literal match
+    found is still found. If any segment is blank (``| col |`` table rows,
+    ``a || b``), the ``|`` is clearly literal and the pattern is not split.
+    """
+    parts = [p.strip() for p in pattern.split("|")]
+    if len(parts) < 2 or not all(parts):
+        return (pattern,)
+    return (pattern, *dict.fromkeys(parts))
 
 
 def _decode_workspace_text(data: bytes, rel_path: str = "") -> str | None:
@@ -356,12 +445,13 @@ async def seed_workspace_from_previous(
     minio,
     src_svid: str,
     dst_svid: str,
-    zones: tuple[str, ...] = (OUTPUT_DIR, UPLOADS_DIR),
+    zones: tuple[str, ...] = (OUTPUT_DIR, UPLOADS_DIR, LARGE_TOOL_RESULTS_DIR),
 ) -> int:
     """Cross-turn continuity: server-side copy a prior session-version's
-    deliverables (``output/``) and sources (``uploads/``) into a new version's
-    workspace, so a follow-up turn (e.g. "convert the report to HTML") can read
-    and build on the previous turn's output.
+    deliverables (``output/``), sources (``uploads/``), and offloaded tool
+    dumps (``large_tool_results/``) into a new version's workspace, so a
+    follow-up turn (e.g. "convert the report to HTML") can read and build on
+    the previous turn's output.
 
     Each version's workspace is cumulative (a turn seeds from its immediate
     predecessor, which already inherited *its* predecessor), so copying just the
@@ -435,7 +525,7 @@ class WorkspaceBackend(FilesystemBackend):
         file_dir: local cache directory (per-task; safe to clear).
     """
 
-    def __init__(self, svid: str, minio, file_dir: str) -> None:
+    def __init__(self, svid: str, minio, file_dir: str, citation_scope=None) -> None:
         if not _DEEPAGENTS_AVAILABLE:
             # TODO(Wave2): align with deepagents FilesystemBackend once the
             # dependency is installed in this environment.
@@ -448,6 +538,18 @@ class WorkspaceBackend(FilesystemBackend):
         self.svid = str(svid)
         self.minio = minio
         self.file_dir = file_dir
+        # F069 P1: the run's ``LinsightCitationScope``. While it is active
+        # (``enabled`` and a non-empty handle table) every markdown write
+        # converts the model's short handles (``[S3]``) into the private-use
+        # citation markers the rest of the platform understands. ``None`` keeps
+        # the F047 contract: markdown is only unescaped.
+        self.citation_scope = citation_scope
+        # F076: which skill row owns each copied directory. Empty means an older
+        # session or a caller that does not track skills; reads are not checked.
+        # The enabled flag is loaded on each read, not copied here, so a disable
+        # or delete during the run is visible. ``skill_row_enabled`` is a test seam.
+        self.skill_snapshot: list[dict] | None = None
+        self.skill_row_enabled = None
         os.makedirs(self.file_dir, exist_ok=True)
 
     # -- key / cache helpers ------------------------------------------------
@@ -469,14 +571,40 @@ class WorkspaceBackend(FilesystemBackend):
     def _cache_path(self, rel_path: str) -> Path:
         return Path(self.file_dir) / rel_path
 
-    def _not_found_error(self, file_path: str) -> str:
+    def _skill_matches(self, rel_path: str) -> list[str]:
+        """Workspace paths ``/skills/<name>/<rel_path>`` that exist, for the not-found hint.
+
+        A SKILL.md lists its supporting files relative to its own folder
+        (``references/rules.md``); the model kept reading them from the workspace
+        root. Listing goes through MinIO, the authoritative store, so a task
+        resumed on another node gets the same answer. Only runs after a miss.
+        """
+        if not rel_path or rel_path.startswith(f"{SKILLS_DIR}/"):
+            return []
+        listed = self.ls(f"/{SKILLS_DIR}")
+        matches = []
+        for entry in listed.entries or []:
+            parts = entry["path"].lstrip("/").split("/", 2)
+            if len(parts) == 3 and parts[0] == SKILLS_DIR and parts[2] == rel_path:
+                matches.append(entry["path"])
+        return sorted(matches)
+
+    def _not_found_error(self, file_path: str, skill_matches: list[str] | None = None) -> str:
         """ "File not found" plus, when warranted, WHY the path could not resolve.
 
         A bare "File 'X' not found" was actively unhelpful for the most common
         failure: handing back a code-interpreter host path. Naming the two
         namespaces is what lets the model fix it in one step instead of retrying
-        the same path.
+        the same path. ``skill_matches`` names the skill folders that do hold the
+        file; it is only a hint — the read never switches to another path.
         """
+        if skill_matches:
+            candidates = ", ".join(f"'{path}'" for path in skill_matches)
+            return (
+                f"File '{file_path}' not found. Relative paths inside a skill's SKILL.md are "
+                f"rooted at that skill's own folder, not the workspace root — the file exists at "
+                f"{candidates}. Retry with that path."
+            )
         _, stripped = strip_executor_host_prefix((file_path or "").strip(), self.file_dir)
         if stripped:
             rel = normalize_workspace_path(file_path, file_dir=self.file_dir)
@@ -554,21 +682,239 @@ class WorkspaceBackend(FilesystemBackend):
             return bytes(content)
         return str(content).encode("utf-8")
 
+    @staticmethod
+    def _is_markdown_path(rel: str) -> bool:
+        return rel.lower().endswith((".md", ".markdown"))
+
+    def _citation_handles_active(self) -> bool:
+        """True when the F069 short-handle contract applies to this run."""
+        scope = self.citation_scope
+        if scope is None or not getattr(scope, "enabled", False):
+            return False
+        return bool(getattr(scope, "handles", None))
+
+    def _convert_citation_handles(self, text: str, note: bool = True) -> str:
+        """``[S3]`` -> private-use marker via the scope's handle table.
+
+        Never raises: the write boundary sits inside a tool call and a tool
+        exception kills the whole task (F047 design §2), so any failure returns
+        ``text`` unchanged. ``note=False`` skips the audit bookkeeping — used
+        when converting an ``edit`` argument only to locate it on disk, so the
+        same unknown handle is not counted twice.
+        """
+        if not text or not self._citation_handles_active():
+            return text
+        try:
+            from bisheng.citation.domain.services.citation_handle_service import (
+                attach_web_url_markers,
+                convert_handles_to_markers,
+            )
+
+            result = convert_handles_to_markers(text, self.citation_scope.handles)
+            if note:
+                note_conversion = getattr(self.citation_scope, "note_conversion", None)
+                if note_conversion is not None:
+                    note_conversion(result.converted, result.unknown)
+            return attach_web_url_markers(result.text, getattr(self.citation_scope, "entries", None))
+        except Exception:
+            logger.opt(exception=True).warning(
+                "[linsight-citation] svid={} handle conversion failed, writing text unconverted", self.svid
+            )
+            return text
+
+    @staticmethod
+    def _is_html_path(rel: str) -> bool:
+        return rel.lower().endswith((".html", ".htm"))
+
+    def _bake_html_citation_bytes(self, data: bytes) -> bytes:
+        """F069 P2 write boundary for html deliverables (design decision 8, AC-23).
+
+        Never raises and never touches the bytes when the scope is inactive,
+        the content is not UTF-8, or the baking fails — an html write is a tool
+        call and an exception here would kill the whole task.
+        """
+        if not self._citation_handles_active():
+            return data
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+        try:
+            baked = self._bake_html_citation_handles(text)
+        except Exception:
+            logger.opt(exception=True).warning(
+                "[linsight-citation] svid={} html citation baking failed, writing text unbaked", self.svid
+            )
+            return data
+        if baked == text:
+            return data
+        return baked.encode("utf-8")
+
+    def _bake_html_citation_handles(self, text: str) -> str:
+        """``[S3]`` runs -> ``<sup>[n]</sup>`` plus a references section before ``</body>``.
+
+        Numbers are per file, assigned by first appearance and unique per
+        distinct handle; a run is rewritten only when every handle in it is
+        known (a run with an unknown handle stays literal and the unknown
+        handle is reported). Text inside comments, ``<script>`` / ``<style>`` /
+        ``<pre>`` / ``<code>`` elements and inside tags is never rewritten.
+        Already-baked content (carries ``HTML_REFERENCES_ATTR``) is first
+        restored — baked ``<sup data-f069-h="S3,S7">`` runs become ``[S3][S7]``
+        again and the old section is dropped — then baked afresh, so an
+        ``edit`` that adds a handle later still gets numbered and re-baking is
+        idempotent. Nothing is appended when no handle was numbered.
+        """
+        if not text or "[" not in text:
+            return text
+        from bisheng.citation.domain.services.citation_handle_service import _HANDLE_RE, _RUN_RE
+
+        if HTML_REFERENCES_ATTR in text:
+            text = _HTML_BAKED_SUP_RE.sub(lambda m: "".join(f"[{h}]" for h in m.group(1).split(",") if h), text)
+            text = _HTML_REFERENCES_SECTION_RE.sub("", text)
+
+        scope = self.citation_scope
+        handles: dict = scope.handles
+        numbers: dict[str, int] = {}  # handle -> per-file number, by first appearance
+        unknown: list[str] = []
+        numbered_runs = 0
+
+        def _replace(match: re.Match[str]) -> str:
+            nonlocal numbered_runs
+            seen: list[str] = []
+            for handle in _HANDLE_RE.findall(match.group(0)):
+                if handle not in seen:
+                    seen.append(handle)
+            known = [h for h in seen if h in handles]
+            missing = [h for h in seen if h not in handles]
+            for h in missing:
+                if h not in unknown:
+                    unknown.append(h)
+            if not known:
+                return match.group(0)
+            for h in known:
+                if h not in numbers:
+                    numbers[h] = len(numbers) + 1
+            numbered_runs += 1
+            # the handles ride along in a data attribute so a later re-bake can restore them
+            sup = f'<sup data-f069-h="{",".join(known)}">' + "".join(f"[{numbers[h]}]" for h in known) + "</sup>"
+            # an unknown handle stays literal after the baked run (same as markdown)
+            return sup + "".join(f"[{h}]" for h in missing)
+
+        out: list[str] = []
+        last = 0
+        for skip in _HTML_SKIP_RE.finditer(text):
+            if skip.start() > last:
+                out.append(_RUN_RE.sub(_replace, text[last : skip.start()]))
+            out.append(skip.group(0))
+            last = skip.end()
+        if last < len(text):
+            out.append(_RUN_RE.sub(_replace, text[last:]))
+
+        note_conversion = getattr(scope, "note_conversion", None)
+        if note_conversion is not None:
+            note_conversion(numbered_runs, unknown)
+        if not numbers:
+            return text
+
+        by_handle = {e.get("handle"): e for e in (getattr(scope, "entries", None) or []) if isinstance(e, dict)}
+        items: list[str] = []
+        for handle, _number in sorted(numbers.items(), key=lambda kv: kv[1]):
+            entry = by_handle.get(handle) or {}
+            items.append(f"<li>{html.escape(self._html_reference_line(handle, entry))}</li>")
+        heading = "参考资料" if _CJK_RE.search(text) else "References"
+        section = (
+            f"\n<section {HTML_REFERENCES_ATTR}><h2>{heading}</h2><ol>\n" + "\n".join(items) + "\n</ol></section>\n"
+        )
+        baked = "".join(out)
+        idx = baked.lower().rfind("</body>")
+        if idx < 0:
+            return baked + section
+        return baked[:idx] + section + baked[idx:]
+
+    def _html_reference_line(self, handle: str, entry: dict) -> str:
+        """One appendix line: rag/temp -> ``《title》 · loc``; web -> ``title`` (key as fallback)."""
+        key = str(entry.get("key") or self.citation_scope.handles.get(handle) or handle)
+        type_value = entry.get("type")
+        type_name = str(getattr(type_value, "value", type_value) or "").lower()
+        title = str(entry.get("title") or "").strip() or key
+        loc = str(entry.get("loc") or "").strip()
+        if type_name == "web":
+            return title
+        return f"《{title}》 · {loc}" if loc else f"《{title}》"
+
+    def _canonicalize_citation_bytes(self, rel: str, data: bytes) -> bytes:
+        """Bring the citation spelling of a markdown write onto the canonical form.
+
+        1. Rewrite escaped ``\\ue200`` sequences to real PUA chars — write_file
+           JSON often stores the six-character escape while the preview and
+           ``extract_citation_ids_from_text`` only recognize U+E200/E201/E202.
+        2. (F069, scope active) convert the model's short handles ``[S3]`` into
+           markers; unknown handles stay literal and are reported to the scope.
+
+        html deliverables (``.html`` / ``.htm``) take the F069 P2 path instead
+        (``_bake_html_citation_bytes``): handles become superscripts plus an
+        appended references section. Other files (``.txt`` / ``.py`` …) are
+        returned as-is.
+        """
+        if self._is_html_path(rel):
+            return self._bake_html_citation_bytes(data)
+        if not self._is_markdown_path(rel):
+            return data
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+        from bisheng.citation.domain.services.citation_prompt_helper import unescape_citation_markers
+
+        fixed = unescape_citation_markers(text)
+        fixed = self._convert_citation_handles(fixed)
+        if fixed == text:
+            return data
+        return fixed.encode("utf-8")
+
+    # Pre-F069 name; kept so an out-of-tree caller of the old spelling still works.
+    _normalize_markdown_citation_bytes = _canonicalize_citation_bytes
+
     # -- write --------------------------------------------------------------
     def write(self, file_path: str, content) -> WriteResult:
         rel = self._ws_rel(file_path)
-        data = self._to_bytes(content)
+        if _is_skills_path(rel):
+            logger.warning("[linsight-skills-readonly] svid={} refused write to {}", self.svid, rel)
+            return WriteResult(error=_skills_readonly_error(file_path))
+        data = self._canonicalize_citation_bytes(rel, self._to_bytes(content))
         # cache first (fast local), then write-through to MinIO (truth).
         self._cache_write(rel, data)
         self._minio_put_sync(rel, data)
         return WriteResult(path="/" + rel)
 
     # -- read ---------------------------------------------------------------
+    def _skill_enabled_sync(self, skill_id: int) -> bool | None:
+        if self.skill_row_enabled is not None:
+            return self.skill_row_enabled(skill_id)
+        from bisheng.linsight.domain.services.skill_runtime_guard import load_skill_enabled_sync
+
+        return load_skill_enabled_sync(skill_id)
+
+    async def _skill_enabled(self, skill_id: int) -> bool | None:
+        if self.skill_row_enabled is not None:
+            enabled = self.skill_row_enabled(skill_id)
+            if hasattr(enabled, "__await__"):
+                return await enabled
+            return enabled
+        from bisheng.linsight.domain.services.skill_runtime_guard import load_skill_enabled
+
+        return await load_skill_enabled(skill_id)
+
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         rel = self._ws_rel(file_path)
+        from bisheng.linsight.domain.services.skill_runtime_guard import refuse_workspace_read
+
+        refusal = refuse_workspace_read(rel, self.skill_snapshot, self._skill_enabled_sync)
+        if refusal:
+            return ReadResult(error=refusal)
         data = self._materialize(rel)
         if data is None:
-            return ReadResult(error=self._not_found_error(file_path))
+            return ReadResult(error=self._not_found_error(file_path, self._skill_matches(rel)))
         text = _decode_workspace_text(data, rel)
         if text is None:
             # Binary: offset/limit are meaningless here (slicing bytes by "lines"
@@ -619,6 +965,10 @@ class WorkspaceBackend(FilesystemBackend):
         replace_all: bool = False,
     ) -> EditResult:
         rel = self._ws_rel(file_path)
+        # ``aedit`` delegates here, so this single guard covers both surfaces.
+        if _is_skills_path(rel):
+            logger.warning("[linsight-skills-readonly] svid={} refused edit of {}", self.svid, rel)
+            return EditResult(error=_skills_readonly_error(file_path))
         data = self._materialize(rel)
         if data is None:
             return EditResult(error=self._not_found_error(file_path))
@@ -634,6 +984,16 @@ class WorkspaceBackend(FilesystemBackend):
                     f"(doing so would corrupt it). Regenerate it with the code interpreter instead."
                 )
             )
+        if self._is_markdown_path(rel) and self._citation_handles_active():
+            # The disk already holds markers while the model still remembers the
+            # ``[S3]`` it wrote (design §5 #5): convert the arguments first so
+            # ``old_string`` locates the marker text. If the converted form is
+            # not on disk (the model quoted an already-literal passage) fall
+            # back to the verbatim argument.
+            converted_old = self._convert_citation_handles(old_string, note=False)
+            if converted_old != old_string and converted_old in text:
+                old_string = converted_old
+            new_string = self._convert_citation_handles(new_string, note=False)
         if old_string not in text:
             return EditResult(error=f"old_string not found in '{file_path}'")
         if replace_all:
@@ -646,7 +1006,7 @@ class WorkspaceBackend(FilesystemBackend):
                 )
             occurrences = 1
             new_text = text.replace(old_string, new_string, 1)
-        new_data = new_text.encode("utf-8")
+        new_data = self._canonicalize_citation_bytes(rel, new_text.encode("utf-8"))
         self._cache_write(rel, new_data)
         self._minio_put_sync(rel, new_data)
         return EditResult(path="/" + rel, occurrences=occurrences)
@@ -711,6 +1071,7 @@ class WorkspaceBackend(FilesystemBackend):
         prefix = f"/{WORKSPACE_PREFIX}/{self.svid}/"
         matches: list = []
 
+        terms = _grep_terms(pattern)
         skipped_large = 0
         skipped_binary = 0
         for entry in ls_res.entries or []:
@@ -734,7 +1095,7 @@ class WorkspaceBackend(FilesystemBackend):
                 skipped_binary += 1
                 continue
             for lineno, line in enumerate(text.splitlines(), start=1):
-                if pattern in line:
+                if any(term in line for term in terms):
                     matches.append(GrepMatch(path=full, line=lineno, text=line))
         if skipped_large or skipped_binary:
             # Never let a bounded scan look like a complete one.
@@ -781,7 +1142,10 @@ class WorkspaceBackend(FilesystemBackend):
     # -- async surface (write-through truth uses real async MinIO) ----------
     async def awrite(self, file_path: str, content) -> WriteResult:
         rel = self._ws_rel(file_path)
-        data = self._to_bytes(content)
+        if _is_skills_path(rel):
+            logger.warning("[linsight-skills-readonly] svid={} refused write to {}", self.svid, rel)
+            return WriteResult(error=_skills_readonly_error(file_path))
+        data = self._canonicalize_citation_bytes(rel, self._to_bytes(content))
         await asyncio.to_thread(self._cache_write, rel, data)
         await self.minio.put_object(
             bucket_name=self._bucket(),
@@ -792,6 +1156,11 @@ class WorkspaceBackend(FilesystemBackend):
 
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         rel = self._ws_rel(file_path)
+        from bisheng.linsight.domain.services.skill_runtime_guard import arefuse_workspace_read
+
+        refusal = await arefuse_workspace_read(rel, self.skill_snapshot, self._skill_enabled)
+        if refusal:
+            return ReadResult(error=refusal)
         data = await asyncio.to_thread(self._cache_read, rel)
         if data is None:
             try:
@@ -811,7 +1180,8 @@ class WorkspaceBackend(FilesystemBackend):
             if data is not None:
                 await asyncio.to_thread(self._cache_write, rel, data)
         if data is None:
-            return ReadResult(error=self._not_found_error(file_path))
+            matches = await asyncio.to_thread(self._skill_matches, rel)
+            return ReadResult(error=self._not_found_error(file_path, matches))
         text = _decode_workspace_text(data, rel)
         if text is None:
             # Same contract as the sync path: binary is decided whole, never sliced.

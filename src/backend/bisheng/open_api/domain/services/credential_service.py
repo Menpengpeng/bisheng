@@ -1,0 +1,411 @@
+"""Credential issuance, revocation, cache invalidation, and bookkeeping."""
+
+from __future__ import annotations
+
+import hashlib
+import secrets
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
+
+from loguru import logger
+from redis.exceptions import RedisError
+
+from bisheng.common.errcode.open_api import (
+    ApiCredentialNotFoundError,
+    OpenApiDelegateConfigurationInvalidError,
+    OpenApiDelegateExclusiveScopeError,
+    OpenApiExtensionScopeNotDeployedError,
+    OpenApiUnknownScopeError,
+    PersonalTokenScopeInvalidError,
+    PersonalTokenTtlExceededError,
+)
+from bisheng.core.cache.redis_manager import get_redis_client
+from bisheng.core.context.tenant import get_current_tenant_id
+from bisheng.database.models.audit_log import AuditLogDao
+from bisheng.database.models.tenant import ROOT_TENANT_ID
+from bisheng.open_api.domain.models.api_credential import (
+    CREDENTIAL_SUBJECT_KINDS,
+    HOSTED_APP_TOKEN_PREFIX,
+    KEY_SECRET_LENGTH,
+    PERSONAL_TOKEN_PREFIX,
+    SERVICE_ACCOUNT_KEY_PREFIX,
+    SUBJECT_KIND_HOSTED_APP,
+    SUBJECT_KIND_NATURAL_PERSON,
+    SUBJECT_KIND_SERVICE_ACCOUNT,
+    ApiCredential,
+)
+from bisheng.open_api.domain.repositories.credential_repository import CredentialRepository
+from bisheng.open_api.domain.schemas.credential import (
+    KeyIssuedResponse,
+    KeyIssueRequest,
+    KeyItem,
+    KeyPage,
+    KeyUpdateRequest,
+)
+from bisheng.open_api.domain.scopes import (
+    DELEGATE_SCOPE_CODE,
+    LOCAL_DEV_TOOLKIT_SCOPE_CODES,
+    OPEN_API_SCOPE_CODES,
+    issuable_scope_codes,
+)
+from bisheng.open_api.domain.services.delegate_scope_service import DelegateScopeService
+
+CREDENTIAL_CACHE_KEY = "oapi:cred:{}"
+LAST_USED_THROTTLE_KEY = "oapi:cred:lastused:{}"
+LAST_USED_THROTTLE_SECONDS = 60
+
+#: ``operator_id`` for an action no natural person triggered — the platform's
+#: system-trigger convention. ``AuditLogDao.ainsert_v2`` recognises it and
+#: resolves ``operator_name`` to ``'system'`` instead of looking up a user row
+#: that does not exist; its docstring pairs it with
+#: ``operator_tenant_id = ROOT_TENANT_ID``.
+SYSTEM_OPERATOR_ID = 0
+
+
+@dataclass(frozen=True)
+class AuditOperator:
+    """The whole of what :meth:`CredentialService._audit` reads off an operator.
+
+    Human-triggered management routes hand that parameter a ``UserPayload``,
+    which carries these two attributes among many. The audit path wants none of
+    the rest, so a caller with no logged-in user behind it has no reason to
+    fabricate a login payload — it passes :data:`SYSTEM_AUDIT_OPERATOR`.
+    """
+
+    user_id: int
+    tenant_id: int
+
+
+#: Operator for credentials the platform issues and revokes on its own, with no
+#: human in the loop — today the hosted application's runtime credential (F055
+#: AC-58 / PRD-1 GOV-08). ``tenant_id`` is only the fallback: ``_audit`` prefers
+#: the ambient tenant whenever a request or a publish established one.
+SYSTEM_AUDIT_OPERATOR = AuditOperator(user_id=SYSTEM_OPERATOR_ID, tenant_id=ROOT_TENANT_ID)
+
+
+def hash_token(plaintext: str) -> str:
+    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+
+
+def credential_prefix(subject_kind: str) -> str:
+    if subject_kind == SUBJECT_KIND_SERVICE_ACCOUNT:
+        return SERVICE_ACCOUNT_KEY_PREFIX
+    if subject_kind == SUBJECT_KIND_NATURAL_PERSON:
+        return PERSONAL_TOKEN_PREFIX
+    if subject_kind == SUBJECT_KIND_HOSTED_APP:
+        return HOSTED_APP_TOKEN_PREFIX
+    raise ValueError(f"unsupported credential subject kind: {subject_kind!r}")
+
+
+class CredentialService:
+    @classmethod
+    def validate_scopes(cls, scopes: list[str]) -> list[str]:
+        """Issue- and edit-time scope policy; both paths hand the full new list here.
+
+        Issuability is read per call (``open_platform.enabled`` gates the
+        extension scopes), and ``delegate`` is refused together with any local
+        development toolkit scope (伴生 PRD §4.2.4 / AC-48, INV-31) — validating
+        the complete list on edit is what stops "issue first, then edit it in".
+        """
+        issuable = issuable_scope_codes()
+        for scope in scopes:
+            if scope not in OPEN_API_SCOPE_CODES:
+                raise OpenApiUnknownScopeError()
+            if scope not in issuable:
+                raise OpenApiExtensionScopeNotDeployedError()
+        if DELEGATE_SCOPE_CODE in scopes and not LOCAL_DEV_TOOLKIT_SCOPE_CODES.isdisjoint(scopes):
+            raise OpenApiDelegateExclusiveScopeError()
+        return list(scopes)
+
+    @classmethod
+    async def issue(
+        cls,
+        *,
+        tenant_id: int,
+        subject_kind: str,
+        subject_id: int,
+        request: KeyIssueRequest,
+        created_by: int | None,
+        audit_operator=None,
+    ) -> KeyIssuedResponse:
+        if subject_kind not in CREDENTIAL_SUBJECT_KINDS:
+            raise ValueError(f"unsupported credential subject kind: {subject_kind!r}")
+        scopes = cls.validate_scopes(request.scopes)
+        delegate_entries = await cls._delegate_entries(
+            tenant_id=tenant_id,
+            subject_kind=subject_kind,
+            scopes=scopes,
+            entries=request.delegate_scopes,
+        )
+        if subject_kind == SUBJECT_KIND_NATURAL_PERSON:
+            await cls._validate_personal_token(scopes=scopes, expires_at=request.expires_at, tenant_id=tenant_id)
+        prefix = credential_prefix(subject_kind)
+        secret = secrets.token_urlsafe(32)
+        if len(secret) != KEY_SECRET_LENGTH:  # pragma: no cover - Python contract guard
+            raise RuntimeError("unexpected token_urlsafe output length")
+        plaintext = f"{prefix}{secret}"
+        row = await CredentialRepository.create_with_delegate_entries(
+            ApiCredential(
+                tenant_id=tenant_id,
+                subject_kind=subject_kind,
+                subject_id=subject_id,
+                name=request.name,
+                key_prefix=prefix,
+                last4=plaintext[-4:],
+                token_hash=hash_token(plaintext),
+                scopes=scopes,
+                expires_at=request.expires_at,
+                created_by=created_by,
+            ),
+            delegate_entries,
+        )
+        if audit_operator is not None:
+            # ``issue``, not ``create``: that is the name registered in
+            # ``_UI_VISIBLE_V2_ACTIONS``, in the platform log filter and in the
+            # three ``bs.json`` copies. Written under any other name the row
+            # lands in the table and the audit page can never show it — the
+            # 「写了查不到」 failure F056 AC-25 / AC-27 exist to prevent.
+            await cls._audit(audit_operator, "open_api.api_key.issue", row)
+        item = await cls._to_item(row)
+        return KeyIssuedResponse(**item.model_dump(), plaintext=plaintext)
+
+    @classmethod
+    async def issue_in_transaction(
+        cls, *, session, tenant_id, subject_kind, subject_id, request, created_by, audit_operator=None
+    ):
+        """Trusted candidate issuance; ordinary public issuance retains its behavior."""
+        if subject_kind != SUBJECT_KIND_HOSTED_APP:
+            raise OpenApiDelegateConfigurationInvalidError()
+        scopes = cls.validate_scopes(request.scopes)
+        entries = await cls._delegate_entries(
+            tenant_id=tenant_id, subject_kind=subject_kind, scopes=scopes, entries=request.delegate_scopes
+        )
+        prefix = credential_prefix(subject_kind)
+        plaintext = prefix + secrets.token_urlsafe(32)
+        row = await CredentialRepository.create_in_transaction(
+            session,
+            ApiCredential(
+                tenant_id=tenant_id,
+                subject_kind=subject_kind,
+                subject_id=subject_id,
+                name=request.name,
+                key_prefix=prefix,
+                last4=plaintext[-4:],
+                token_hash=hash_token(plaintext),
+                scopes=scopes,
+                expires_at=request.expires_at,
+                created_by=created_by,
+            ),
+            entries,
+            audit_operator=audit_operator,
+        )
+        # Hosted apps cannot have delegate entries. Build the DTO from flushed data.
+        return KeyIssuedResponse(**KeyItem.from_row(row).model_dump(), plaintext=plaintext)
+
+    @classmethod
+    async def list_by_subject(cls, subject_kind: str, subject_id: int) -> list[KeyItem]:
+        rows = await CredentialRepository.list_by_subject(subject_kind, subject_id)
+        moment = datetime.now()
+        return [await cls._to_item(row, now=moment) for row in rows]
+
+    @classmethod
+    async def list_by_subject_page(cls, subject_kind: str, subject_id: int, *, page: int, page_size: int) -> KeyPage:
+        moment = datetime.now()
+        rows, total, active_count = await CredentialRepository.list_by_subject_page(
+            subject_kind, subject_id, page=page, page_size=page_size, now=moment
+        )
+        return KeyPage(
+            data=[await cls._to_item(row, now=moment) for row in rows],
+            total=total,
+            active_count=active_count,
+        )
+
+    @classmethod
+    async def get_row(cls, subject_kind: str, subject_id: int, credential_id: int) -> ApiCredential:
+        row = await CredentialRepository.get(credential_id)
+        if row is None or row.subject_kind != subject_kind or row.subject_id != subject_id:
+            raise ApiCredentialNotFoundError()
+        return row
+
+    @classmethod
+    async def update(
+        cls,
+        subject_kind: str,
+        subject_id: int,
+        credential_id: int,
+        request: KeyUpdateRequest,
+        *,
+        audit_operator=None,
+    ) -> KeyItem:
+        row = await cls.get_row(subject_kind, subject_id, credential_id)
+        if request.name is not None:
+            row.name = request.name
+        if request.scopes is not None:
+            row.scopes = cls.validate_scopes(request.scopes)
+        if "expires_at" in request.model_fields_set:
+            row.expires_at = request.expires_at
+        if row.subject_kind == SUBJECT_KIND_NATURAL_PERSON:
+            await cls._validate_personal_token(
+                scopes=list(row.scopes or []),
+                expires_at=row.expires_at,
+                tenant_id=row.tenant_id,
+            )
+        current_entries = await DelegateScopeService.response_entries(row.id)
+        if "delegate" not in (row.scopes or []):
+            requested_entries = []
+        else:
+            requested_entries = request.delegate_scopes if request.delegate_scopes is not None else current_entries
+        delegate_entries = await cls._delegate_entries(
+            tenant_id=row.tenant_id,
+            subject_kind=row.subject_kind,
+            scopes=list(row.scopes or []),
+            entries=requested_entries,
+        )
+        await CredentialRepository.save_with_delegate_entries(row, delegate_entries)
+        await cls.invalidate_cache((row.token_hash,))
+        if audit_operator is not None:
+            await cls._audit(audit_operator, "open_api.api_key.update", row)
+        return await cls._to_item(row)
+
+    @classmethod
+    async def revoke(
+        cls,
+        subject_kind: str,
+        subject_id: int,
+        credential_id: int,
+        *,
+        reason: str,
+        audit_operator=None,
+    ) -> KeyItem:
+        row = await cls.get_row(subject_kind, subject_id, credential_id)
+        if row.revoked_at is None:
+            row.revoked_at = datetime.now()
+            row.revoke_reason = reason
+            await CredentialRepository.save(row)
+        await cls.invalidate_cache((row.token_hash,))
+        if audit_operator is not None:
+            await cls._audit(audit_operator, "open_api.api_key.revoke", row)
+        return await cls._to_item(row)
+
+    @classmethod
+    async def revoke_by_subject(
+        cls,
+        subject_kind: str,
+        subject_id: int,
+        *,
+        reason: str,
+        audit_operator=None,
+    ) -> int:
+        all_rows = await CredentialRepository.list_by_subject(subject_kind, subject_id)
+        revoked = await CredentialRepository.revoke_subject(subject_kind, subject_id, reason=reason)
+        await cls.invalidate_cache(row.token_hash for row in all_rows)
+        if audit_operator is not None:
+            for row in revoked:
+                await cls._audit(audit_operator, "open_api.api_key.revoke", row)
+        return len(revoked)
+
+    @classmethod
+    async def invalidate_subject_cache(cls, subject_kind: str, subject_id: int) -> int:
+        rows = await CredentialRepository.list_by_subject(subject_kind, subject_id)
+        return await cls.invalidate_cache(row.token_hash for row in rows)
+
+    @classmethod
+    async def invalidate_cache(cls, token_hashes: Iterable[str]) -> int:
+        redis = await get_redis_client()
+        deleted = 0
+        for token_hash in token_hashes:
+            deleted += bool(await redis.adelete(CREDENTIAL_CACHE_KEY.format(token_hash)))
+        return deleted
+
+    @classmethod
+    async def touch_last_used(cls, credential_id: int) -> bool:
+        try:
+            redis = await get_redis_client()
+            acquired = await redis.asetNx(
+                LAST_USED_THROTTLE_KEY.format(credential_id),
+                1,
+                expiration=LAST_USED_THROTTLE_SECONDS,
+            )
+        except (RedisError, OSError) as exc:
+            logger.warning("open_api last_used throttle unavailable for credential {}: {}", credential_id, exc)
+            return False
+        if not acquired:
+            return False
+        return await CredentialRepository.touch_last_used(credential_id, used_at=datetime.now())
+
+    @classmethod
+    async def revoke_runtime_binding(cls, session, binding, operation, *, reason):
+        """Revoke and audit a runtime generation inside the caller's UoW."""
+        return await CredentialRepository.revoke_runtime_binding(session, binding, operation, reason=reason)
+
+    @staticmethod
+    async def _audit(operator, action: str, row: ApiCredential) -> None:
+        """Record one credential event. Best effort, by design.
+
+        Every caller reaches here *after* the credential row is already
+        committed — the key is minted, or the revocation is durable. Letting an
+        audit failure out would therefore turn a completed mutation into a 500,
+        and on the issuance path it would take the plaintext with it, since it
+        is returned exactly once and stored nowhere. Same shape and same reason
+        as ``app_publish.release_audit`` and ``approval_outbox_service``.
+        """
+        try:
+            await AuditLogDao.ainsert_v2(
+                tenant_id=row.tenant_id,
+                operator_id=operator.user_id,
+                operator_tenant_id=get_current_tenant_id() or operator.tenant_id,
+                action=action,
+                target_type="api_credential",
+                target_id=str(row.id),
+                object_name=row.name,
+                metadata={
+                    "credential_id": row.id,
+                    "subject_kind": row.subject_kind,
+                    "subject_id": row.subject_id,
+                    "scopes": list(row.scopes or []),
+                    "key_mask": row.key_mask,
+                    **await CredentialRepository.audit_app_metadata(row),
+                },
+            )
+        except Exception:
+            logger.exception("open_api.credential_audit_failed action={} credential_id={}", action, row.id)
+
+    @staticmethod
+    async def _to_item(row: ApiCredential, *, now: datetime | None = None) -> KeyItem:
+        item = KeyItem.from_row(row, now=now)
+        return item.model_copy(update={"delegate_scopes": await DelegateScopeService.response_entries(row.id)})
+
+    @staticmethod
+    async def _delegate_entries(
+        *,
+        tenant_id: int,
+        subject_kind: str,
+        scopes: list[str],
+        entries,
+    ) -> tuple[tuple[str, int], ...]:
+        has_delegate = "delegate" in scopes
+        if subject_kind != SUBJECT_KIND_SERVICE_ACCOUNT and (has_delegate or entries):
+            raise OpenApiDelegateConfigurationInvalidError()
+        if has_delegate != bool(entries):
+            raise OpenApiDelegateConfigurationInvalidError()
+        if not has_delegate:
+            return ()
+        return await DelegateScopeService.validate_entries(tenant_id=tenant_id, entries=entries)
+
+    @staticmethod
+    async def _validate_personal_token(
+        *,
+        scopes: list[str],
+        expires_at: datetime | None,
+        tenant_id: int,
+    ) -> None:
+        if scopes != ["knowledge:read"]:
+            raise PersonalTokenScopeInvalidError()
+        from datetime import timedelta
+
+        from bisheng.open_api.domain.services.tenant_setting_service import TenantSettingService
+
+        policy = await TenantSettingService.get_policy(tenant_id)
+        if expires_at is None or expires_at > datetime.now() + timedelta(days=policy.ttl_days):
+            raise PersonalTokenTtlExceededError()

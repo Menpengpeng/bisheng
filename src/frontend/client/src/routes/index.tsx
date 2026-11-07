@@ -24,6 +24,9 @@ import { appsSectionLinkTarget } from '@/layouts/appModuleNavPaths';
 import { canOpenWorkbench } from '@/utils/platformAccess';
 import { LoadingIcon } from '~/components/ui/icon/Loading';
 
+import { usePrefersMobileLayout } from '~/hooks';
+import { squareTypePath } from '~/pages/square/squarePaths';
+
 // Route-level code splitting (ledger #27): only the primary landing path
 // (login + main layout + chat home) ships in the entry chunk; every other
 // page loads on first navigation.
@@ -33,6 +36,9 @@ const AppChatEntry = lazy(() => import('@/pages/appChat/AppChatEntry'));
 const AgentCenter = lazy(() => import('@/pages/apps'));
 const ExplorePlaza = lazy(() => import('@/pages/apps/explore'));
 const Share = lazy(() => import('@/pages/share'));
+const SkillCenterPage = lazy(() =>
+  import('~/pages/skills/SkillCenterPage').then((module) => ({ default: module.SkillCenterPage })),
+);
 const Sop = lazy(() => import('@/components/Sop'));
 const Subscription = lazy(() => import('~/pages/Subscription'));
 const Knowledge = lazy(() => import('~/pages/knowledge'));
@@ -51,6 +57,11 @@ const ArticlePage = lazy(() => import('~/pages/Subscription/Article/ArticlePage'
 const DevLogin = lazy(() => import('~/pages/DevLogin'));
 const StandaloneChatPage = lazy(() => import('~/pages/standaloneChat/StandaloneChatPage'));
 const MediaPlaybackPage = lazy(() => import('~/pages/media/MediaPlaybackPage'));
+const SettingsPage = lazy(() => import('~/pages/settings/SettingsPage'));
+const SquarePage = lazy(() =>
+  import('~/pages/square/SquarePage').then((module) => ({ default: module.SquarePage })),
+);
+const CapabilityCenterPage = lazy(() => import('~/pages/capabilities/CapabilityCenterPage').then(module => ({ default: module.CapabilityCenterPage })));
 
 function RouteLoading() {
   return (
@@ -106,6 +117,12 @@ function HomeEntryRedirect() {
   return <Navigate to="/menu-unavailable" replace />;
 }
 
+/** 应用广场: desktop has it as a tab of 广场; mobile keeps the standalone page. */
+function AppsExploreRoute() {
+  const isMobile = usePrefersMobileLayout();
+  return isMobile ? <ExplorePlaza /> : <Navigate to={squareTypePath('apps')} replace />;
+}
+
 const AuthLayout = () => (
   <AuthContextProvider>
     <AliveScope>
@@ -124,24 +141,6 @@ const baseConfig = {
   //@ts-ignore
   basename: __APP_ENV__.BASE_URL
 }
-
-// DEV-ONLY component gallery for the UI unification effort (docs-ui-refactor/).
-// `import.meta.env.DEV` is statically false in production builds, so both the lazy
-// import and the route below are tree-shaken out — the gallery never ships to users.
-const GalleryApp = import.meta.env.DEV
-  ? lazy(() => import('~/pages/_gallery/GalleryApp'))
-  : null;
-
-const devGalleryRoutes = import.meta.env.DEV && GalleryApp
-  ? [{
-      path: '/gallery',
-      element: (
-        <Suspense fallback={null}>
-          <GalleryApp />
-        </Suspense>
-      ),
-    }]
-  : [];
 
 export const router = createBrowserRouter([
   {
@@ -165,6 +164,12 @@ export const router = createBrowserRouter([
             element: <Root />,
             children: [
               { index: true, element: <HomeEntryRedirect /> },
+              {
+                path: 'c/skills',
+                element: (
+                  <MenuApprovalPluginGate pluginId="home">{suspended(<SkillCenterPage />)}</MenuApprovalPluginGate>
+                ),
+              },
               {
                 path: 'c/media-playback',
                 element: (
@@ -224,7 +229,20 @@ export const router = createBrowserRouter([
             path: 'apps/explore',
             element: suspended(
               <MenuApprovalPluginGate pluginId="apps">
-                <ExplorePlaza />
+                <AppsExploreRoute />
+              </MenuApprovalPluginGate>
+            ),
+          },
+          // 广场 — every module's discover view behind one entry (tabs follow the module
+          // grants, so the page needs no plugin gate of its own).
+          { path: 'square', element: suspended(<SquarePage />) },
+          { path: 'capabilities', element: suspended(<MenuApprovalPluginGate pluginId="home"><CapabilityCenterPage /></MenuApprovalPluginGate>) },
+          {
+            // Skill entry follows the home module grant.
+            path: 'skills',
+            element: suspended(
+              <MenuApprovalPluginGate pluginId="home">
+                <SkillCenterPage />
               </MenuApprovalPluginGate>
             ),
           },
@@ -275,6 +293,8 @@ export const router = createBrowserRouter([
             </MenuApprovalPluginGate>
           )},
           { path: 'knowledge/share/:spaceId', element: suspended(<Knowledge />) },
+          // Personal settings + 消息与审批, merged into one routed page (no plugin gate — always available).
+          { path: 'settings/:section?', element: suspended(<SettingsPage />) },
           { path: 'menu-unavailable', element: <MenuUnavailablePage /> },
         ],
       },
@@ -294,7 +314,6 @@ export const router = createBrowserRouter([
   { path: 'chat/flow/:flowId', element: suspended(<StandaloneChatPage mode="guest" flowType="workflow" />), errorElement: <RouteErrorBoundary /> },
   { path: 'chat/assistant/:flowId', element: suspended(<StandaloneChatPage mode="guest" flowType="assistant" />), errorElement: <RouteErrorBoundary /> },
   { path: '/html', element: suspended(<WebView />) },
-  ...devGalleryRoutes,
   { path: '/__dev/login', element: suspended(<DevLogin />) },
   { path: '/404', element: <Page404 /> },
   { path: '/403', element: <Page403 /> },

@@ -1,3 +1,4 @@
+import { refreshChannelState } from "./hooks/useChannelStateRefresh";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { TransitionEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -10,6 +11,7 @@ import { LoadingIcon } from "~/components/ui/icon/Loading";
 import { cn } from "~/utils";
 import { EmptyStateIllustration } from "~/components/illustrations";
 import { ChannelSquareCard } from "../ChannelSquareCard";
+import { ChannelSquareTabs } from "./ChannelSquareTabs";
 import { SERIF_FONT_STACK } from "./ArticleList/ChannelSwitcher";
 
 type DiscoverStatus = "join" | "joined" | "pending" | "private";
@@ -64,7 +66,7 @@ const mapRecommendItem = (item: any): DiscoverChannel | null => {
     return {
         id: String(rawId),
         title: String(item.name ?? item.title ?? ""),
-        description: String(item.description ?? item.desc ?? "") || "暂无简介",
+        description: String(item.description ?? item.desc ?? ""),
         creator: String(item.creator ?? item.creator_name ?? ""),
         creatorAvatars: avatars,
         articleCount: Number(item.article_count ?? 0),
@@ -90,9 +92,6 @@ export function ChannelDiscoveryHome({
     const queryClient = useQueryClient();
     const [paused, setPaused] = useState(false);
     const [joiningId, setJoiningId] = useState<string | null>(null);
-    // Optimistic subscribe status overrides, keyed by channel id (the list itself is
-    // derived from the query so a cached remount paints the carousel immediately).
-    const [statusOverrides, setStatusOverrides] = useState<Record<string, DiscoverStatus>>({});
     // Infinite loop carousel. The track renders the ranked list three times; `pos`
     // is the track index of the centered card and only ever increases. It starts in
     // the MIDDLE copy so the left/right neighbours are always populated (initial
@@ -122,9 +121,8 @@ export function ChannelDiscoveryHome({
         const list: any[] = (payload?.data || payload?.list || []) as any[];
         return list
             .map(mapRecommendItem)
-            .filter((c): c is DiscoverChannel => c !== null)
-            .map((c) => (statusOverrides[c.id] ? { ...c, status: statusOverrides[c.id] } : c));
-    }, [data, statusOverrides]);
+            .filter((c): c is DiscoverChannel => c !== null);
+    }, [data]);
 
     // Carousel only on PC with enough public channels (otherwise the empty illustration).
     const count = channels.length;
@@ -191,8 +189,6 @@ export function ChannelDiscoveryHome({
             (async () => {
                 try {
                     setJoiningId(channelId);
-                    const nextStatus: DiscoverStatus = target.visibility === "public" ? "joined" : "pending";
-                    setStatusOverrides((prev) => ({ ...prev, [channelId]: nextStatus }));
                     const res: any = await subscribeManagerChannelApi({ channel_id: channelId });
                     const statusCode = res?.status_code ?? res?.code;
                     if (statusCode && statusCode !== 200) {
@@ -200,22 +196,17 @@ export function ChannelDiscoveryHome({
                     }
                     showToast({
                         message:
-                            target.visibility === "public"
-                                ? localize("subscribe_success") || "订阅成功"
-                                : localize("com_subscription.apply_sent") || "申请已发送",
+                            (res?.data ?? res) === "subscribed"
+                                ? localize("subscribe_success")
+                                : localize("com_subscription.apply_sent"),
                         severity: NotificationSeverity.SUCCESS,
                     });
                     // Refresh background channel lists so the page auto-selects the new channel
                     // and leaves this empty state.
-                    queryClient.invalidateQueries({ queryKey: ["channels", "subscribed"] });
-                    queryClient.invalidateQueries({ queryKey: ["channels"] });
+                    await refreshChannelState(queryClient);
                 } catch {
-                    // Roll back on failure (interceptor surfaces the toast).
-                    setStatusOverrides((prev) => {
-                        const next = { ...prev };
-                        delete next[channelId];
-                        return next;
-                    });
+                    // Re-read the server after a failed operation; the request interceptor reports the error.
+                    await refreshChannelState(queryClient);
                 } finally {
                     setJoiningId(null);
                 }
@@ -243,15 +234,40 @@ export function ChannelDiscoveryHome({
                 </div>
             );
         }
-        // Match the content-view header title (ChannelSwitcher): same px-10/pt-5 offset,
-        // 32px bold serif #212121.
+        // Match the content-view header (ChannelSwitcher): same px-10/pt-5 offsets,
+        // borderless action on the left, centered 32px bold serif title. With no
+        // channel to show, the title keeps the module name (资讯订阅) and only the
+        // 创建频道 action remains (nothing to switch to).
         return (
-            <h1
-                className="shrink-0 px-10 pt-5 pb-4 text-[32px] font-bold leading-[40px] text-text-1"
-                style={{ fontFamily: SERIF_FONT_STACK }}
-            >
-                {menuNames.channel}
-            </h1>
+            <div className="shrink-0 px-10 pt-5 pb-4">
+                <div className="relative flex h-10 w-full min-w-0 items-center gap-6">
+                    {/* -ml-2 cancels the button's own px-2 so the label sits optically
+                        flush with the 40px content edge (same as the channel page). */}
+                    <button
+                        type="button"
+                        onClick={onCreateChannel}
+                        className="-ml-2 flex shrink-0 items-center gap-1 rounded-md px-2 py-[5px] text-sm leading-[22px] text-text-2 outline-none transition-colors fine-pointer:hover:bg-fill-1 fine-pointer:hover:text-text-1"
+                    >
+                        <Outlined.Plus className="size-4 shrink-0" />
+                        <span>{localize("com_subscription.create_channel")}</span>
+                    </button>
+                    {/* Absolute pane-midpoint centering — the discovery page never opens a
+                        side detail pane, so the title always sits on the true center. */}
+                    <h1
+                        className="pointer-events-none absolute left-1/2 top-1/2 max-w-[clamp(96px,calc(100%-480px),600px)] -translate-x-1/2 -translate-y-1/2 truncate text-[32px] font-bold leading-[40px] text-text-1"
+                        style={{ fontFamily: SERIF_FONT_STACK }}
+                    >
+                        {menuNames.channel}
+                    </h1>
+                    <div className="min-w-0 flex-1" aria-hidden />
+                    {/* Invisible clone of the persistent 频道/广场 toggle (overlaid at the
+                        row's right edge by Subscription/index) — reserves its width so the
+                        centered title keeps a real 24px gap to it. */}
+                    <div className="invisible shrink-0" aria-hidden>
+                        <ChannelSquareTabs active="channel" />
+                    </div>
+                </div>
+            </div>
         );
     };
 

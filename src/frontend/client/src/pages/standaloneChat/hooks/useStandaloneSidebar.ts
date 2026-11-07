@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { useRecoilState, useRecoilValue, useSetRecoilState } from 'recoil';
 import type { AppConversation, AppItem, ConversationGroup } from '~/@types/app';
 import { getAppConversationsApi, getAssistantDetailApi, getFlowApi } from '~/api/apps';
@@ -15,6 +14,7 @@ import { chatsState, runningState } from '~/pages/appChat/store/atoms';
 import { closeAppChatWebSocket } from '~/pages/appChat/useWebsocket';
 import { standaloneChatIdState } from '../store/atoms';
 import type { StandaloneChatContextValue } from '../StandaloneChatContext';
+import { resolveGuestAccessState, type GuestAccessState } from '../guestAccessError';
 import {
   getLocalConversations,
   addLocalConversation,
@@ -39,7 +39,6 @@ const FLOW_TYPE_WORKFLOW = 10;
 export function useStandaloneSidebar(ctx: StandaloneChatContextValue) {
   const { mode, flowType, flowId, apiVersion } = ctx;
   const localize = useLocalize();
-  const navigate = useNavigate();
   const isGuest = mode === 'guest';
   const numericFlowType = flowType === 'assistant' ? FLOW_TYPE_ASSISTANT : FLOW_TYPE_WORKFLOW;
 
@@ -52,7 +51,10 @@ export function useStandaloneSidebar(ctx: StandaloneChatContextValue) {
   const setRunning = useSetRecoilState(runningState);
 
   const [loading, setLoading] = useState(false);
+  const [listError, setListError] = useState<unknown>(null);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  // Guest-only: whether the share link still resolves to something usable.
+  const [accessState, setAccessState] = useState<GuestAccessState>('loading');
   const initializedRef = useRef(false);
   // Snapshot of latest conversations for draft-preservation in async callbacks
   const conversationsRef = useRef<AppConversation[]>(conversations);
@@ -88,6 +90,7 @@ export function useStandaloneSidebar(ctx: StandaloneChatContextValue) {
       }));
       const merged = preserveDrafts(convos);
       setConversations(merged);
+      setListError(null);
       return merged;
     }
 
@@ -107,10 +110,11 @@ export function useStandaloneSidebar(ctx: StandaloneChatContextValue) {
       }));
       const merged = preserveDrafts(list);
       setConversations(merged);
+      setListError(null);
       return merged;
-    } catch {
-      console.error('Failed to fetch standalone conversations');
-      return [];
+    } catch (error) {
+      setListError(error);
+      throw error;
     } finally {
       setLoading(false);
     }
@@ -208,26 +212,20 @@ export function useStandaloneSidebar(ctx: StandaloneChatContextValue) {
 
   // Fetch flow-level info (name, logo, description)
   useEffect(() => {
-    console.log('[standalone] flow detail effect:', { flowId, numericFlowType, apiVersion });
     if (!flowId) return;
     (async () => {
       try {
-        console.log('[standalone] fetching flow detail...');
         const res = numericFlowType === FLOW_TYPE_ASSISTANT
           ? await getAssistantDetailApi(flowId, undefined, true, apiVersion)
           : await getFlowApi(flowId, apiVersion, undefined, true);
-        console.log('[standalone] flow detail response:', res);
-        // Auth-mode standalone chat: surface a dedicated 403 page when the
-        // current user has no permission. Guest mode keeps the silent fallback
-        // because passwordless links may legitimately hit non-200 transient
-        // responses without warranting a hard redirect.
-        if (res?.status_code === 403 && mode === 'auth') {
-          navigate('/403', { replace: true });
+        if (res?.status_code !== 200) {
+          // A 200 envelope can still carry a policy denial.
+          if (mode === 'guest') setAccessState(resolveGuestAccessState(res));
           return;
         }
-        if (res?.status_code !== 200) return;
         const data = res.data;
         if (!data) return;
+        setAccessState('ok');
         setCurrentApp({
           id: data.id ?? flowId,
           name: data.name ?? '',
@@ -237,24 +235,29 @@ export function useStandaloneSidebar(ctx: StandaloneChatContextValue) {
           user_id: data.user_id ?? '',
         } as AppItem);
       } catch (err) {
+        // Guests used to get a blank, unresponsive chat box here: the rejection
+        // was logged and swallowed. Deliberate denials now surface as a state
+        // page; everything else still falls through so a flaky request does not
+        // take the page down.
+        if (mode === 'guest') setAccessState(resolveGuestAccessState(err));
         console.error('[standalone] Failed to fetch app detail:', err);
       }
     })();
-  }, [flowId, numericFlowType, apiVersion, mode, navigate, setCurrentApp]);
+  }, [flowId, numericFlowType, apiVersion, mode, setCurrentApp]);
 
-  // Initialize conversation state on first load.
-  // Guest mode should always land on an active chat so passwordless pages do
-  // not look "empty" on first visit.
+  const retryConversations = async () => {
+    const list = await fetchConversations();
+    if (!initializedRef.current) {
+      if (list.length > 0) setActiveChatId(list[0].id);
+      initializedRef.current = true;
+      setHistoryLoaded(true);
+    }
+  };
+
+  // Only a successful list can complete initialization or select a conversation.
   useEffect(() => {
     if (initializedRef.current || !flowId) return;
-    initializedRef.current = true;
-
-    fetchConversations().then((list) => {
-      if (list.length > 0) {
-        setActiveChatId(list[0].id);
-      }
-      setHistoryLoaded(true);
-    });
+    void retryConversations().catch(() => { /* The sidebar owns the failed-list state. */ });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flowId]);
 
@@ -294,6 +297,9 @@ export function useStandaloneSidebar(ctx: StandaloneChatContextValue) {
     groups,
     loading,
     historyLoaded,
+    listError,
+    retryConversations,
+    accessState,
     activeChatId,
     sidebarVisible,
     fetchConversations,

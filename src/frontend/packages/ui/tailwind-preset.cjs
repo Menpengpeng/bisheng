@@ -7,9 +7,15 @@ const plugin = require('tailwindcss/plugin');
  *   presets: [require('@bisheng/ui/tailwind-preset')],
  *   content: [..., '../packages/ui/src/** / *.{ts,tsx}']
  *
- * Values are seeded verbatim from client/tailwind.config.cjs so adopting the
- * preset changes nothing visually. Keep the two in sync until client fully
- * migrates onto the preset (then delete the duplicated keys there).
+ * client adopted this preset and deleted its duplicated theme keys — verified by
+ * diffing the fully-resolved theme AND the compiled CSS before/after (identical
+ * but for the order of the two pointer variants, which the preset now owns).
+ * platform also consumes the preset, retaining app-specific legacy keys while
+ * its component families migrate in batches.
+ *
+ * The CSS custom properties this file points at have a single definition too —
+ * src/styles/tokens.css, which client loads from its entry. Change a token value
+ * there and both the app and the docs site follow; there is no second copy.
  *
  * @type {Partial<import('tailwindcss').Config>}
  */
@@ -86,6 +92,12 @@ module.exports = {
         'btn-disabled-border': 'rgb(var(--btn-disabled-border) / <alpha-value>)',
         'btn-disabled-bg': 'rgb(var(--btn-disabled-bg) / <alpha-value>)',
         'btn-disabled-text': 'rgb(var(--btn-disabled-text) / <alpha-value>)',
+        // Tooltip surface (组件-Tooltip文字提示.md §3) — solid, dark in BOTH
+        // color modes (see tokens.css for why it is not the gray ramp).
+        tooltip: 'rgb(var(--tooltip-bg) / <alpha-value>)',
+        // Switch semantic tokens (组件-Switch开关.md §4) — OFF track + its hover.
+        'switch-off': 'rgb(var(--switch-off-bg) / <alpha-value>)',
+        'switch-off-hover': 'rgb(var(--switch-off-bg-hover) / <alpha-value>)',
         // Arco semantic layer (基础-色彩规范.md §2/§3/§7) — primitives are
         // intentionally NOT wired so components can't bypass semantic names.
         'text-1': 'rgb(var(--text-1) / <alpha-value>)',
@@ -116,12 +128,31 @@ module.exports = {
           active: 'rgb(var(--danger-active) / <alpha-value>)',
           tint: 'rgb(var(--danger-tint) / <alpha-value>)',
         },
+        // Tag frozen exceptions (基础-色彩规范 §4) — `bg-tag-approving-tint
+        // text-tag-approving` and the skill pair. Same DEFAULT/tint shape as
+        // the functional colors above; these two never follow the brand theme.
+        'tag-approving': {
+          DEFAULT: 'rgb(var(--tag-approving) / <alpha-value>)',
+          tint: 'rgb(var(--tag-approving-tint) / <alpha-value>)',
+        },
+        'tag-skill': {
+          DEFAULT: 'rgb(var(--tag-skill) / <alpha-value>)',
+          tint: 'rgb(var(--tag-skill-tint) / <alpha-value>)',
+        },
+        // Citation badge, web source (组件-Badge徽标.md §2) — the same frozen
+        // purple under its own use-name; never follows the brand theme either.
+        'citation-web': {
+          DEFAULT: 'rgb(var(--citation-web) / <alpha-value>)',
+          tint: 'rgb(var(--citation-web-tint) / <alpha-value>)',
+        },
       },
       // Radius token scale (rounded-md/lg used by Button sizes: 6/8px).
       borderRadius: {
         lg: 'var(--radius)',
         md: 'calc(var(--radius) - 2px)',
         sm: 'calc(var(--radius) - 4px)',
+        // Top rung of the ladder (design-token.cjs RADIUS); Tailwind stops at 3xl.
+        '4xl': '2rem',
       },
       // Two shadow tiers only (基础-圆角与阴影规范.mdx §2.1): `shadow-popup` for
       // click-away overlays (dropdown, popover, toast), `shadow-modal` for
@@ -146,7 +177,34 @@ module.exports = {
         toast: 'var(--z-toast)',
         tooltip: 'var(--z-tooltip)',
       },
+      // Transition motion for the notice family (组件-Toast轻提示.md §7 /
+      // 组件-Notification通知提醒.md §7). Declared as theme values rather than
+      // written inline as `duration-[240ms]` / `ease-[cubic-bezier(…)]`: client
+      // also loads tailwindcss-animate, which registers its own `duration-*` /
+      // `ease-*` (animation-duration / animation-timing-function), so an
+      // ARBITRARY value matches two utilities and Tailwind silently drops it —
+      // the transition then runs at the 150ms default with the default curve.
+      // Named values compile on both sides without ambiguity.
+      transitionDuration: {
+        160: '160ms',
+        240: '240ms',
+      },
+      transitionTimingFunction: {
+        // The one easing every toast / notification transition uses.
+        notice: 'cubic-bezier(0.2, 0, 0, 1)',
+      },
       keyframes: {
+        // Tooltip motion (组件-Tooltip文字提示.md 落地 §7): 150ms fade in,
+        // 100ms fade out. Fade only — a tooltip that also moves reads as a
+        // panel sliding in rather than a label appearing.
+        'tooltip-in': {
+          from: { opacity: '0' },
+          to: { opacity: '1' },
+        },
+        'tooltip-out': {
+          from: { opacity: '1' },
+          to: { opacity: '0' },
+        },
         'modal-overlay-in': {
           from: { opacity: '0' },
           to: { opacity: '1' },
@@ -166,8 +224,34 @@ module.exports = {
           from: { opacity: '1' },
           to: { opacity: '0' },
         },
+        // Select / Dropdown panel motion (组件-Select选择器.md §8): fade in while
+        // sliding 4px in from the trigger's side, fade out in place. `translate`
+        // (the standalone property), not `transform`, so it never fights a
+        // positioning transform.
+        'popup-in-down': {
+          from: { opacity: '0', translate: '0 -4px' },
+          to: { opacity: '1', translate: '0 0' },
+        },
+        'popup-in-up': {
+          from: { opacity: '0', translate: '0 4px' },
+          to: { opacity: '1', translate: '0 0' },
+        },
+        'popup-in-right': {
+          from: { opacity: '0', translate: '-4px 0' },
+          to: { opacity: '1', translate: '0 0' },
+        },
+        'popup-in-left': {
+          from: { opacity: '0', translate: '4px 0' },
+          to: { opacity: '1', translate: '0 0' },
+        },
+        'popup-out': {
+          from: { opacity: '1' },
+          to: { opacity: '0' },
+        },
       },
       animation: {
+        'tooltip-in': 'tooltip-in 150ms cubic-bezier(0.2, 0, 0, 1)',
+        'tooltip-out': 'tooltip-out 100ms cubic-bezier(0.2, 0, 0, 1)',
         // Modal / dialog motion (组件-Modal弹窗.md §6): 200ms in (fade + 96%→100%),
         // 160ms out (fade ONLY — shrinking on exit reads as "it went back
         // somewhere"). Same curve both ways.
@@ -175,10 +259,26 @@ module.exports = {
         'modal-overlay-out': 'modal-overlay-out 160ms cubic-bezier(0.2, 0, 0, 1)',
         'modal-content-in': 'modal-content-in 200ms cubic-bezier(0.2, 0, 0, 1)',
         'modal-content-out': 'modal-content-out 160ms cubic-bezier(0.2, 0, 0, 1)',
+        // Same 150 / 100ms pair as the tooltip.
+        'popup-in-down': 'popup-in-down 150ms cubic-bezier(0.2, 0, 0, 1)',
+        'popup-in-up': 'popup-in-up 150ms cubic-bezier(0.2, 0, 0, 1)',
+        'popup-in-right': 'popup-in-right 150ms cubic-bezier(0.2, 0, 0, 1)',
+        'popup-in-left': 'popup-in-left 150ms cubic-bezier(0.2, 0, 0, 1)',
+        'popup-out': 'popup-out 100ms cubic-bezier(0.2, 0, 0, 1)',
       },
     },
   },
   plugins: [
+    plugin(({ addUtilities }) => {
+      // Shared exception to native scrollbars: hide them without disabling scrolling.
+      addUtilities({
+        '.no-scrollbar, .scrollbar-hide': {
+          'scrollbar-width': 'none',
+          '-ms-overflow-style': 'none',
+          '&::-webkit-scrollbar': { display: 'none', width: '0', height: '0' },
+        },
+      });
+    }),
     plugin(({ addVariant }) => {
       // Primary input: mouse + hover vs touch / coarse pointer.
       addVariant('fine-pointer', '@media (hover: hover) and (pointer: fine)');

@@ -4,11 +4,22 @@
  * (MinIO share url → backend resolve → blob save), same behaviour as the
  * legacy task flow but kept here so P5 can delete the Sop components.
  */
+import i18next from 'i18next';
 import { getLinsightFileDownloadApi } from '~/api/chat/data-service';
+import { type ChatCitation, resolveCitationDetails } from '~/api/chatApi';
+import {
+    bakeCitationsForExport,
+    createCitationDetailMap,
+    stripCitationHandles,
+    stripCitationMarkers,
+    transformPrivateCitations,
+} from '~/components/Chat/Messages/Content/citationUtils';
 import { getShareTokenFromPath } from '~/utils/shareToken';
 
 /** Output file shape of `output_result.final_files` (= store `file_list`). */
 export interface ArtifactFile {
+    /** Original uploaded attachment URL, already authorized by the conversation. */
+    directUrl?: string;
     file_id: string;
     file_name: string;
     file_url: string;
@@ -27,16 +38,41 @@ export interface ArtifactFile {
      * markdown. Absent on legacy entries → falls back to markdown.
      */
     previewAsImage?: boolean;
+    /**
+     * An uploaded SPREADSHEET that lands in the workspace as the original
+     * workbook (`ingest_mode: 'spreadsheet_original'`), with no markdown view.
+     * The user previews and downloads the workbook itself.
+     */
+    previewAsOriginal?: boolean;
+    /**
+     * The task turn (session version) this file belongs to. The conversation
+     * workspace merges files from every turn, while its panel holds only the
+     * latest turn's id; the backend authorizes a file against the version that
+     * produced it (`owned_file_key`), so an earlier turn's file must resolve
+     * with its own id. Absent → the caller's versionId (single-turn surfaces).
+     */
+    versionId?: string;
 }
 
-export type PreviewKind = 'markdown' | 'text' | 'image' | 'document' | 'unsupported';
+/** The version to resolve `file` against: its own turn, else the caller's. */
+export function artifactVersionId(file: ArtifactFile, fallback: string): string {
+    return file.versionId || fallback;
+}
+
+export type PreviewKind = 'markdown' | 'text' | 'image' | 'document' | 'slides' | 'unsupported';
 
 const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'];
 // Rich file types rendered inline by the shared FilePreview viewer (pdfjs /
-// mammoth / xlsx). Explicitly excludes `doc` (legacy binary mammoth can't parse)
-// and `ppt`/`pptx` (need a backend pptx→pdf conversion) — those stay 'unsupported'
-// so they keep the "download to view" fallback.
-const DOCUMENT_EXTS = ['pdf', 'docx', 'xls', 'xlsx', 'csv'];
+// mammoth / xlsx). Explicitly excludes `doc` (legacy binary mammoth can't parse),
+// which stays 'unsupported' and keeps the "download to view" fallback.
+const DOCUMENT_EXTS = ['pdf', 'docx', 'xls', 'xlsx', 'csv', 'html', 'htm'];
+// F111: slide decks are previewed through a backend pptx→pdf conversion
+// (see useSlidesPreview), then rendered by the same PDF viewer.
+const SLIDES_EXTS = ['ppt', 'pptx'];
+// Deliverable extensions whose bytes are markdown TEXT - the only artifacts
+// fetchArtifactBlob decodes (to strip citation markers); everything else is
+// handed out as raw bytes.
+const MARKDOWN_EXTS = ['md', 'markdown'];
 
 export function getFileExtension(fileName: string): string {
     const lastDot = fileName?.lastIndexOf('.') ?? -1;
@@ -50,6 +86,7 @@ export function getPreviewKind(fileName: string): PreviewKind {
     if (ext === 'txt') return 'text';
     if (IMAGE_EXTS.includes(ext)) return 'image';
     if (DOCUMENT_EXTS.includes(ext)) return 'document';
+    if (SLIDES_EXTS.includes(ext)) return 'slides';
     return 'unsupported';
 }
 
@@ -61,6 +98,7 @@ export function getPreviewKind(fileName: string): PreviewKind {
 export function getArtifactPreviewKind(file: ArtifactFile): PreviewKind {
     // Image uploads with a persisted original preview as the picture itself.
     if (file.previewAsImage) return 'image';
+    if (file.previewAsOriginal) return getPreviewKind(file.file_name);
     if (file.source === 'upload') return 'markdown';
     return getPreviewKind(file.file_name);
 }
@@ -105,13 +143,16 @@ export function toUploadedArtifacts(files: any[] | undefined): ArtifactFile[] {
             // persisted it (`original_file_path`); otherwise fall back to the
             // parsed-markdown wrapper (legacy entries / non-image files).
             const previewAsImage = IMAGE_EXTS.includes(getFileExtension(name)) && !!f.original_file_path;
+            const previewAsOriginal =
+                !previewAsImage && f.ingest_mode === 'spreadsheet_original' && !!f.original_file_path;
             return {
                 file_id: f.file_id,
                 file_name: name,
-                file_url: previewAsImage ? f.original_file_path : f.markdown_file_path,
+                file_url: previewAsImage || previewAsOriginal ? f.original_file_path : f.markdown_file_path,
                 file_md5: f.file_md5,
                 source: 'upload' as const,
                 previewAsImage,
+                previewAsOriginal,
             };
         });
 }
@@ -142,27 +183,50 @@ function getWorkspaceArtifactKey(file: ArtifactFile): string {
  * replacing an older entry at the same workspace path.
  */
 export function collectConversationWorkspaceFiles(
-    snapshots: Array<WorkspaceArtifactSnapshot | null | undefined>,
+    turns: Array<{ versionId: string; snapshot: WorkspaceArtifactSnapshot | null | undefined }>,
 ): ArtifactFile[] {
     const collected = new Map<string, ArtifactFile>();
 
-    const addFiles = (files: ArtifactFile[] | undefined) => {
+    // Tag each file with the turn that produced it, so preview / download resolve
+    // it against that version rather than the latest one (see ArtifactFile.versionId).
+    const addFiles = (files: ArtifactFile[] | undefined, versionId: string) => {
         for (const file of files || []) {
             if (!file?.file_name || !file?.file_url) continue;
-            collected.set(getWorkspaceArtifactKey(file), file);
+            collected.set(getWorkspaceArtifactKey(file), { ...file, versionId });
         }
     };
 
-    for (const snapshot of snapshots) {
+    for (const { versionId, snapshot } of turns) {
         if (!snapshot) continue;
-        addFiles(toUploadedArtifacts(snapshot.files));
+        addFiles(toUploadedArtifacts(snapshot.files), versionId);
         for (const round of snapshot.history || []) {
-            addFiles(round.file_list);
+            addFiles(round.file_list, versionId);
         }
-        addFiles(snapshot.file_list);
+        addFiles(snapshot.file_list, versionId);
     }
 
     return Array.from(collected.values());
+}
+
+export type WorkspaceLoadState = 'loading' | 'failed' | 'ready';
+
+/**
+ * Whether every task turn of the conversation has its detail in the store.
+ * A turn that is neither loaded nor marked failed is still loading; without
+ * this the workspace shows its empty state during the cold load.
+ */
+export function getWorkspaceLoadState(
+    versionIds: string[],
+    loadedIds: { has: (id: string) => boolean },
+    failedIds: { has: (id: string) => boolean },
+): WorkspaceLoadState {
+    let failed = false;
+    for (const id of versionIds) {
+        if (loadedIds.has(id)) continue;
+        if (!failedIds.has(id)) return 'loading';
+        failed = true;
+    }
+    return failed ? 'failed' : 'ready';
 }
 
 /**
@@ -326,7 +390,7 @@ export function isHtmlArtifact(file: ArtifactFile): boolean {
  * when we are on a share route, or a share recipient's HTML report 403s.
  */
 export function openHtmlArtifactViewer(file: ArtifactFile, versionId: string): void {
-    const params = new URLSearchParams({ url: file.file_url, vid: versionId || '' });
+    const params = new URLSearchParams({ url: file.file_url, vid: artifactVersionId(file, versionId) || '' });
     const shareToken = getShareTokenFromPath();
     if (shareToken) {
         params.set('share', shareToken);
@@ -369,32 +433,142 @@ export function applyHtmlViewerTabIdentity(htmlContent: string): void {
     }
 }
 
-/** Download the original artifact file ("save as" action). */
-export async function downloadArtifactFile(file: ArtifactFile, versionId: string): Promise<void> {
-    const url = await resolveArtifactUrl(file.file_url, versionId);
-    const response = await fetch(url);
-    if (!response.ok) {
-        throw new Error(`Failed to download file: ${response.status}`);
+/** Options shared by the download and the knowledge-space save. */
+export interface ArtifactBlobOptions {
+  /**
+   * F069 P2: the run's `output_result.citations` — the seed the preview badges
+   * were resolved from. Given, the markdown export bakes citations into `[n]`
+   * plus a reference list instead of stripping them.
+   */
+  citations?: ChatCitation[] | null;
+}
+
+/** Old (P1) behaviour: drop every span, id included, then unresolved handles. */
+function stripCitationsForExport(text: string): string {
+  return stripCitationHandles(stripCitationMarkers(text));
+}
+
+/**
+ * Bake the citations of a markdown deliverable for export (F069 P2, design
+ * decision 8): no new endpoint — the details come from the run's citation
+ * seed plus the resolve cache the preview already warmed (`resolveCitationDetails`
+ * answers from memory for those). Ids nothing can resolve are dropped, and
+ * when nothing at all resolves (seed absent, resolve failing or forbidden,
+ * AC-22) the P1 strip is applied so the export never fails or leaks an id.
+ * Text without a marker is returned exactly as the P1 path returned it.
+ */
+export async function prepareMarkdownForExport(
+  text: string,
+  citations?: ChatCitation[] | null,
+): Promise<string> {
+  const { citationMap } = transformPrivateCitations(text);
+  const citationIds = Array.from(new Set(Object.values(citationMap).map((data) => data.citationId)));
+  if (!citationIds.length) {
+    return stripCitationsForExport(text);
+  }
+  const details = createCitationDetailMap(citations);
+  const missingIds = citationIds.filter((citationId) => !details[citationId]);
+  if (missingIds.length) {
+    try {
+      const resolved = await resolveCitationDetails(missingIds);
+      resolved.forEach((detail) => {
+        if (detail?.citationId) details[detail.citationId] = detail;
+      });
+    } catch (e) {
+      // AC-22: a failed resolve degrades to stripping, it never blocks the export.
+      console.warn('[artifactUtils] citation resolve for export failed, stripping markers:', e);
     }
-    const data = await response.blob();
-    // A user-uploaded non-image source is stored as its PARSED MARKDOWN, so the
-    // bytes fetched here are markdown regardless of the original extension —
-    // download it as `<name>.md`. Image uploads and model-generated outputs keep
-    // their real name/content.
-    const isUploadMarkdown = file.source === 'upload' && !file.previewAsImage;
-    const downloadName = isUploadMarkdown
-        ? `${file.file_name.replace(/\.[^./\\]+$/, '')}.md`
-        : file.file_name;
-    // CSV needs a UTF-8 BOM so Excel opens it with the right encoding
-    const blob =
-        !isUploadMarkdown && getFileExtension(file.file_name) === 'csv'
-            ? new Blob([new Uint8Array([0xef, 0xbb, 0xbf]), data], { type: 'text/csv;charset=utf-8;' })
-            : data;
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = downloadName;
-    link.click();
-    URL.revokeObjectURL(link.href);
+  }
+  if (!citationIds.some((citationId) => details[citationId])) {
+    return stripCitationsForExport(text);
+  }
+  return bakeCitationsForExport(text, details, i18next.t('com_linsight_export_references'));
+}
+
+/**
+ * Decode a markdown artifact and bake (or drop) its citation markers.
+ *
+ * Task-mode deliverables carry citations as private-use-area spans
+ * `\ue200<sourceId>[\ue201<sourceId>...]\ue202` (see citationUtils). The in-app
+ * preview (PreviewBody -> Markdown) parses those into badges and must keep
+ * seeing them - it fetches the object itself (usePreviewSource) and never comes
+ * through here. As a FILE, though, the span is just invisible wrapper chars
+ * around a bare `knowledgesearch_xxx:0` id, so the local download and the
+ * knowledge-space save hand out the markdown with every span replaced: baked
+ * into `[n]` plus a reference list when the source details are known
+ * (prepareMarkdownForExport, F069 P2), removed outright otherwise - the same
+ * rule clipboard copy applies via stripCitationMarkers. A short handle the
+ * backend could not resolve (`[S99]`, F069) stays literal in the file the
+ * model wrote; the saved copy drops those too (stripCitationHandles) - only
+ * here, the copy path and the preview keep them. Decoded with Response.text()
+ * so the result is a proper UTF-8 text blob.
+ */
+async function readCitationFreeMarkdown(
+  response: Response,
+  citations?: ChatCitation[] | null,
+): Promise<Blob> {
+  const text = await response.text();
+  return new Blob([await prepareMarkdownForExport(text, citations)], {
+    type: 'text/markdown;charset=utf-8',
+  });
+}
+
+/**
+ * Resolve, fetch and name an artifact's real bytes.
+ *
+ * Shared by the local download and the save-to-knowledge-space flow so the
+ * name rule can't drift between them: a user-uploaded non-image source is
+ * stored as its PARSED MARKDOWN, so the bytes are markdown regardless of the
+ * original extension and the name must become `<stem>.md`. Image uploads and
+ * model-generated outputs keep their real name/content.
+ *
+ * Markdown payloads (`.md` / `.markdown` outputs and those parsed uploads) are
+ * returned with citation markers stripped (readCitationFreeMarkdown); every
+ * other file is passed through as raw bytes, so binary artifacts (docx / pdf /
+ * images / csv) are never decoded or altered.
+ */
+export async function fetchArtifactBlob(
+  file: ArtifactFile,
+  versionId: string,
+  options?: ArtifactBlobOptions,
+): Promise<{ blob: Blob; fileName: string }> {
+  const url = file.directUrl || await resolveArtifactUrl(file.file_url, artifactVersionId(file, versionId));
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download file: ${response.status}`);
+  }
+  const isUploadMarkdown = file.source === 'upload' && !file.previewAsImage && !file.previewAsOriginal;
+  const isMarkdown = isUploadMarkdown || MARKDOWN_EXTS.includes(getFileExtension(file.file_name));
+  const blob = isMarkdown
+    ? await readCitationFreeMarkdown(response, options?.citations)
+    : await response.blob();
+  return {
+    blob,
+    fileName: isUploadMarkdown
+      ? `${file.file_name.replace(/\.[^./\\]+$/, '')}.md`
+      : file.file_name,
+  };
+}
+
+/** Download the original artifact file ("save as" action). */
+export async function downloadArtifactFile(
+  file: ArtifactFile,
+  versionId: string,
+  options?: ArtifactBlobOptions,
+): Promise<void> {
+  const { blob: data, fileName } = await fetchArtifactBlob(file, versionId, options);
+  // CSV needs a UTF-8 BOM so Excel opens it with the right encoding. Download
+  // only — a BOM prepended to a file entering knowledge-base parsing would
+  // corrupt its first cell, so it stays out of fetchArtifactBlob.
+  const blob =
+    fileName === file.file_name && getFileExtension(file.file_name) === 'csv'
+      ? new Blob([new Uint8Array([0xef, 0xbb, 0xbf]), data], { type: 'text/csv;charset=utf-8;' })
+      : data;
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(link.href);
 }
 
 /** Save an exported blob (md → pdf/docx) with the converted extension. */

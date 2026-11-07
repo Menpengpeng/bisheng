@@ -1,9 +1,14 @@
 // @ts-strict-ignore
+import { getCitationAccessScope } from './citationScope';
+import { hydrateStreamChatCitations } from './hydrateStreamChatCitations';
 /**
  * Direct API calls for the AI chat system.
  */
+import { isApiError, normalizeApiError } from "@bisheng/api-client";
+import { readCitationFailure } from "~/api/citationFailure";
 import http from "~/api/request";
 import { normalizeHistoryMediaFiles } from "~/utils/mediaAttachmentUtils";
+import { getShareTokenFromPath } from "~/utils/shareToken";
 
 // --- Endpoints ---
 const API = {
@@ -28,38 +33,10 @@ const API = {
 };
 
 // --- Types ---
-export interface ChatCitationItem {
-    itemId?: string;
-    chunkId?: string;
-    chunkIndex?: number;
-    content?: string;
-    snippet?: string;
-    title?: string;
-    bbox?: string | null;
-    page?: number;
-    [key: string]: any;
-}
+export type { ChatCitation, ChatCitationItem } from '@bisheng/chat/citations';
+import type { ChatCitation } from '@bisheng/chat/citations';
 
-export interface ChatCitation {
-    citationId: string;
-    type: string;
-    itemId?: string | null;
-    sourcePayload?: {
-        url?: string;
-        title?: string;
-        snippet?: string;
-        source?: string;
-        sourceUrl?: string;
-        previewUrl?: string;
-        downloadUrl?: string;
-        knowledgeName?: string;
-        documentName?: string;
-        items?: ChatCitationItem[];
-        [key: string]: any;
-    };
-    [key: string]: any;
-}
-
+function citationCacheKey(id: string, scope = getCitationAccessScope()) { return JSON.stringify([scope,id]); }
 const citationDetailMemoryCache: Record<string, ChatCitation> = {};
 const citationResolveRequestCache: Record<string, Promise<ChatCitation[]>> = {};
 
@@ -342,45 +319,93 @@ export async function deleteConversation(
     await http.delete(API.deleteConversation(conversationId));
 }
 
+/** F054/F062: why a requested citation came back without a payload. */
+export type CitationUnresolvedReason = "forbidden" | "expired";
+
+const citationReasonCache: Record<string, CitationUnresolvedReason> = {};
+
+export function getCitationUnresolvedReason(citationId: string): CitationUnresolvedReason | undefined {
+    return citationReasonCache[citationCacheKey(citationId)];
+}
+
+function citationReasonFromPayload(value: unknown): CitationUnresolvedReason {
+    const payload = readCitationFailure(value);
+    const reason = payload.data?.reason ?? payload.reason;
+    if (reason === "expired") {
+        return "expired";
+    }
+    return "forbidden";
+}
+
+function throwCitationResolveError(citationId: string, payload: unknown, cause: unknown = payload, scope = getCitationAccessScope()): never {
+    const reason = citationReasonFromPayload(payload);
+    citationReasonCache[citationCacheKey(citationId, scope)] = reason;
+    const error = normalizeApiError(cause, { message: reason === "expired" ? "citation expired" : "citation forbidden", envelope: payload });
+    throw Object.assign(error, { citationForbidden: reason !== "expired", citationExpired: reason === "expired" });
+}
+
+function citationShareHeaders(): { headers: { "share-token": string } } | undefined {
+    // Share-page reads of a workflow conversation carry the token so a
+    // recipient can open that chat's temporary-knowledge-base sources.
+    const token = getShareTokenFromPath();
+    return token ? { headers: { "share-token": token } } : undefined;
+}
+
 export async function getCitationDetail(citationId: string): Promise<ChatCitation> {
-    if (canUseCachedCitationDetail(citationDetailMemoryCache[citationId])) {
-        return citationDetailMemoryCache[citationId];
+    const scope = getCitationAccessScope();
+    if (canUseCachedCitationDetail(citationDetailMemoryCache[citationCacheKey(citationId, scope)])) {
+        return citationDetailMemoryCache[citationCacheKey(citationId, scope)];
     }
 
-    const res = await http.get<any>(API.citationDetail(citationId));
-    // 404 = the citation is not found OR the viewer lacks view_file permission for
-    // the underlying RAG document (admins/owners see it, others don't). Surface it
-    // as a typed error so the marker shows "no permission" and stays un-clickable
-    // instead of the generic "no source detail".
-    if (res?.status_code === 404 || res?.data?.status_code === 404) {
-        const err: any = new Error('citation forbidden');
-        err.citationForbidden = true;
-        throw err;
+    try {
+        const res = await http.get<ChatCitation & { status_code?: number; data?: ChatCitation & { status_code?: number } }>(API.citationDetail(citationId), citationShareHeaders());
+        // 404 = not found, no permission, or the temp object is gone. Read `reason`
+        // so expired and forbidden stay distinct (F054/F062).
+        if (res?.status_code === 404 || res?.data?.status_code === 404) {
+            throwCitationResolveError(citationId, res, res, scope);
+        }
+        const detail = res?.data ?? res;
+        if (detail?.citationId) {
+            citationDetailMemoryCache[citationCacheKey(detail.citationId, scope)] = detail;
+            delete citationReasonCache[citationCacheKey(detail.citationId, scope)];
+        }
+        citationDetailMemoryCache[citationCacheKey(citationId, scope)] = detail;
+        return detail;
+    } catch (error: unknown) {
+        const failure = readCitationFailure(error);
+        if (failure.citationForbidden || failure.citationExpired) {
+            throw error;
+        }
+        const status = failure.status_code || failure.response?.data?.status_code;
+        if (status === 404) {
+            throwCitationResolveError(citationId, isApiError(error) ? error : error?.response?.data ?? error, error, scope);
+        }
+        throw error;
     }
-    const detail = res?.data ?? res;
-    if (detail?.citationId) {
-        citationDetailMemoryCache[detail.citationId] = detail;
-    }
-    citationDetailMemoryCache[citationId] = detail;
-    return detail;
 }
 
 export async function resolveCitationDetails(citationIds: string[]): Promise<ChatCitation[]> {
+    const scope = getCitationAccessScope();
     const uniqueCitationIds = Array.from(new Set(
         citationIds.filter((citationId) => citationId && !citationId.startsWith("citation:")),
-    )).filter((citationId) => !canUseCachedCitationDetail(citationDetailMemoryCache[citationId]));
+    )).filter((citationId) => !canUseCachedCitationDetail(citationDetailMemoryCache[citationCacheKey(citationId, scope)]));
 
     if (!uniqueCitationIds.length) {
         return citationIds
-            .map((citationId) => citationDetailMemoryCache[citationId])
+            .map((citationId) => citationDetailMemoryCache[citationCacheKey(citationId, scope)])
             .filter(Boolean);
     }
 
-    const requestKey = uniqueCitationIds.slice().sort().join("|");
+    const requestKey = citationCacheKey(uniqueCitationIds.slice().sort().join("|"), scope);
     if (!citationResolveRequestCache[requestKey]) {
-        citationResolveRequestCache[requestKey] = http.post(API.citationResolve(), {
-            citationIds: uniqueCitationIds,
-        }).then((res) => {
+        const shareHeaders = citationShareHeaders();
+        citationResolveRequestCache[requestKey] = http.post(
+            API.citationResolve(),
+            { citationIds: uniqueCitationIds },
+            shareHeaders
+                ? { headers: { "Content-Type": "application/json", ...shareHeaders.headers } }
+                : undefined,
+        ).then((res) => {
             const payload = res?.data ?? res;
             const items = Array.isArray(payload?.items)
                 ? payload.items
@@ -389,7 +414,14 @@ export async function resolveCitationDetails(citationIds: string[]): Promise<Cha
                     : [];
             items.forEach((detail) => {
                 if (detail?.citationId) {
-                    citationDetailMemoryCache[detail.citationId] = detail;
+                    citationDetailMemoryCache[citationCacheKey(detail.citationId, scope)] = detail;
+                    delete citationReasonCache[citationCacheKey(detail.citationId, scope)];
+                }
+            });
+            const unresolved = Array.isArray(payload?.unresolved) ? payload.unresolved : [];
+            unresolved.forEach((entry) => {
+                if (entry?.citationId && entry?.reason) {
+                    citationReasonCache[citationCacheKey(entry.citationId, scope)] = entry.reason;
                 }
             });
             return items;
@@ -400,7 +432,7 @@ export async function resolveCitationDetails(citationIds: string[]): Promise<Cha
 
     const resolvedItems = await citationResolveRequestCache[requestKey];
     return citationIds
-        .map((citationId) => citationDetailMemoryCache[citationId])
+        .map((citationId) => citationDetailMemoryCache[citationCacheKey(citationId, scope)])
         .filter(Boolean)
         .concat(resolvedItems.filter((detail) => detail?.citationId && !citationIds.includes(detail.citationId)));
 }
@@ -465,7 +497,7 @@ export async function getChannelChatHistory(
     const res = await http.get(`/api/v1/channel/chat/messages/${articleDocId}`);
     const items: StreamHistoryItem[] = res?.data ?? [];
     // Channel API returns oldest-first, no need to reverse
-    return items.map(parseStreamHistoryItem);
+    return hydrateStreamChatCitations(items.map(parseStreamHistoryItem), resolveCitationDetails);
 }
 
 /** Clear channel article chat history */
@@ -538,6 +570,7 @@ export function parseStreamHistoryItem(raw: StreamHistoryItem): ChatMessage {
         error: false,
         flow_name: raw.flow_name,
         liked: raw.liked,
+        citations: Array.isArray(raw.citations) ? raw.citations : null,
     };
 }
 
@@ -565,7 +598,7 @@ export async function getFileChatHistory(
     );
     const items: StreamHistoryItem[] = Array.isArray(res?.data) ? res.data : [];
     // Backend returns newest-first; reverse for chronological order
-    return items.reverse().map(parseStreamHistoryItem);
+    return hydrateStreamChatCitations(items.reverse().map(parseStreamHistoryItem), resolveCitationDetails);
 }
 
 /** Delete single-file chat history */
@@ -677,7 +710,7 @@ export async function getFolderChatHistory(
     );
     const items: StreamHistoryItem[] = Array.isArray(res?.data) ? res.data : [];
     // Backend returns newest-first; reverse for chronological order
-    return items.reverse().map(parseStreamHistoryItem);
+    return hydrateStreamChatCitations(items.reverse().map(parseStreamHistoryItem), resolveCitationDetails);
 }
 
 /**

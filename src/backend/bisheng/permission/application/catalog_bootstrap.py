@@ -31,7 +31,6 @@ import logging
 from datetime import UTC, datetime
 from hashlib import sha256
 
-from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
@@ -39,6 +38,7 @@ from bisheng.core.context.tenant import bypass_tenant_filter
 from bisheng.core.database import get_async_db_session
 from bisheng.core.openfga.authorization_model_f048 import (
     MODEL_VERSION,
+    TECHNICAL_MARKER_SUBJECTS,
     get_authorization_model_f048,
     required_relations_checksum,
 )
@@ -112,18 +112,20 @@ def _catalog_tuples(
             "object": object_key,
         }
 
-    add("user:*", "active", catalog)
+    for subject in TECHNICAL_MARKER_SUBJECTS:
+        add(subject, "active", catalog)
     for model in model_release.models:
         release = f"permission_model_release:{release_key}~{model.model_key}"
         add(release, "release", f"permission_model:{model.model_key}")
         add(catalog, "catalog", release)
-        add("user:*", "enabled_marker", release)
-        for action_code in model.action_codes:
-            add("user:*", f"{action_code}_marker", release)
-        if "manage_permission" in model.action_codes and model.derived_level is not None:
-            upper = model.derived_level if model.allow_same_level else model.derived_level - 1
-            for level in range(1, max(upper, 0) + 1):
-                add("user:*", f"grant_level_{level}_marker", release)
+        for subject in TECHNICAL_MARKER_SUBJECTS:
+            add(subject, "enabled_marker", release)
+            for action_code in model.action_codes:
+                add(subject, f"{action_code}_marker", release)
+            if "manage_permission" in model.action_codes and model.derived_level is not None:
+                upper = model.derived_level if model.allow_same_level else model.derived_level - 1
+                for level in range(1, max(upper, 0) + 1):
+                    add(subject, f"grant_level_{level}_marker", release)
     return list(tuples.values())
 
 
@@ -180,14 +182,18 @@ async def _seed_control_plane(
                     return
 
                 auth_release = (
-                    await session.execute(
-                        select(AuthorizationModelRelease).where(
-                            AuthorizationModelRelease.environment == environment,
-                            AuthorizationModelRelease.store_id == store_id,
-                            AuthorizationModelRelease.model_id == model_id,
+                    (
+                        await session.execute(
+                            select(AuthorizationModelRelease).where(
+                                AuthorizationModelRelease.environment == environment,
+                                AuthorizationModelRelease.store_id == store_id,
+                                AuthorizationModelRelease.model_id == model_id,
+                            )
                         )
                     )
-                ).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 if auth_release is None:
                     auth_release = AuthorizationModelRelease(
                         environment=environment,
@@ -355,3 +361,78 @@ async def seed_initial_permission_catalog(
         model_id,
     )
     return True
+
+
+_SKILL_RESOURCE_TYPE = "linsight_skill"
+
+
+def skill_catalog_scope_actions() -> tuple[str, ...]:
+    """Actions whose published scope must include a personal skill."""
+
+    from bisheng.permission.domain.services.catalog_policy import ACTION_RESOURCE_SCOPES
+
+    return tuple(action for action, scopes in ACTION_RESOURCE_SCOPES.items() if _SKILL_RESOURCE_TYPE in scopes)
+
+
+async def ensure_linsight_skill_action_scopes() -> int:
+    """Add ``linsight_skill`` to the CURRENT catalog where the policy allows it.
+
+    A fresh install already has these rows. A catalog published before personal
+    skills were added to the action scope does not, so the owner's own enable
+    or delete fails with 25001. Only missing rows are inserted.
+    """
+
+    actions = skill_catalog_scope_actions()
+    added = 0
+    with bypass_tenant_filter():
+        async with get_async_db_session() as session:
+            async with session.begin():
+                release = (
+                    (
+                        await session.execute(
+                            select(PermissionCatalogRelease).where(
+                                PermissionCatalogRelease.status == "CURRENT",
+                            )
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if release is None or release.id is None or release.write_fenced:
+                    return 0
+                rows = [
+                    row
+                    for row in (
+                        await session.execute(
+                            select(PermissionAction).where(
+                                PermissionAction.catalog_release_id == release.id,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                    if row.active and row.code in actions
+                ]
+                for action in rows:
+                    if action.id is None:
+                        continue
+                    exists = (
+                        await session.execute(
+                            select(PermissionActionResourceScope.id).where(
+                                PermissionActionResourceScope.action_id == action.id,
+                                PermissionActionResourceScope.resource_type == _SKILL_RESOURCE_TYPE,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if exists is not None:
+                        continue
+                    session.add(
+                        PermissionActionResourceScope(
+                            action_id=int(action.id),
+                            resource_type=_SKILL_RESOURCE_TYPE,
+                        )
+                    )
+                    added += 1
+    if added:
+        logger.info("Attached linsight_skill to %s CURRENT catalog action scopes", added)
+    return added

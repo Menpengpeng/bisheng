@@ -1,11 +1,11 @@
 import asyncio
-import json
 import mimetypes
 import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from io import BytesIO
 from typing import Any
 from urllib.parse import unquote
@@ -15,6 +15,7 @@ from fastapi import UploadFile
 from langchain_core.tools import BaseTool
 from loguru import logger
 
+from bisheng.chat_session.domain.session_subject import SessionSubject
 from bisheng.common.constants.enums.telemetry import ApplicationTypeEnum, BaseTelemetryTypeEnum
 from bisheng.common.dependencies.user_deps import UserPayload
 from bisheng.common.errcode import BaseErrorCode
@@ -25,6 +26,7 @@ from bisheng.common.errcode.linsight import (
     LinsightFolderFileCountExceededError,
     LinsightFolderTotalSizeExceededError,
 )
+from bisheng.common.errcode.sandbox import SandboxConfigurationError
 from bisheng.common.schemas.telemetry.event_data_schema import NewMessageSessionEventData
 from bisheng.common.services import telemetry_service
 from bisheng.common.services.config_service import settings
@@ -43,6 +45,7 @@ from bisheng.linsight.domain.models.linsight_execute_task import LinsightExecute
 from bisheng.linsight.domain.models.linsight_session_version import (
     LinsightSessionVersion,
     LinsightSessionVersionDao,
+    SessionVersionStatusEnum,
 )
 from bisheng.linsight.domain.schemas.linsight_schema import (
     DownloadFilesSchema,
@@ -51,7 +54,7 @@ from bisheng.linsight.domain.schemas.linsight_schema import (
 )
 from bisheng.llm.domain.llm import BishengLLM
 from bisheng.llm.domain.services import LLMService
-from bisheng.tool.domain.models.gpts_tools import GptsToolsDao
+from bisheng.tool.domain.models.gpts_tools import GptsTools, GptsToolsDao
 from bisheng.tool.domain.services.executor import ToolExecutor
 from bisheng.utils import util
 from bisheng.utils.util import async_calculate_md5
@@ -76,6 +79,40 @@ class TaskNode:
         return task_dict
 
 
+def build_e2b_file_list(file_dir: str) -> list[WriteEntry]:
+    """Files the E2B sandbox receives when the code tool is constructed.
+
+    The walk happens at tool init, so skill bundles have to already be in
+    ``file_dir``. A file over ``SIZE_AUTOPUSH`` (5 MiB) is left out; the local
+    and container executors still read it from the session directory.
+    """
+    file_list: list[WriteEntry] = []
+    oversized: list[str] = []
+    for root, _dirs, files in os.walk(file_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            try:
+                if os.path.getsize(file_path) > SIZE_AUTOPUSH:
+                    oversized.append(file_path)
+                    continue
+            except OSError:
+                # Unstattable file: let it through rather than silently dropping
+                # it — the push itself will surface any real problem.
+                pass
+            file_list.append(WriteEntry(data=file_path, path=file_path.replace(file_dir, ".")))
+    if oversized:
+        # Never let a bounded copy-in look complete: the model is told these
+        # paths exist, so a silent drop reads as "the tool is broken".
+        logger.warning(
+            "code interpreter: {} file(s) exceed the E2B auto-push ceiling ({} bytes) and were not "
+            "pushed into the sandbox: {}",
+            len(oversized),
+            SIZE_AUTOPUSH,
+            ", ".join(os.path.basename(p) for p in oversized),
+        )
+    return file_list
+
+
 class LinsightWorkbenchImpl:
     """LinsightWorkbench Implementation Class"""
 
@@ -89,8 +126,8 @@ class LinsightWorkbenchImpl:
     _IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "webp", "bmp"})
     # Types whose ORIGINAL bytes stay useful after parsing, because the markdown
     # view is lossy in a way that defeats the user's actual intent: a spreadsheet
-    # loses cell types / sheets / formulas (and ExcelLoader is a RAG chunker that
-    # hard-fails past 10k chars), a Word file loses styling, a PDF loses table
+    # loses cell types / sheets / formulas (small enough xlsx/xls skip the view
+    # altogether, see _SPREADSHEET_ORIGINAL_EXTS), a Word file loses styling, a PDF loses table
     # geometry. These land in the workspace ALONGSIDE the .md so
     # ``bisheng_code_interpreter`` can open them with pandas / python-docx / fitz.
     # Images are deliberately absent: their originals are already promoted for
@@ -186,7 +223,7 @@ class LinsightWorkbenchImpl:
     @classmethod
     async def _get_llm(cls, invoke_user_id: int) -> (BishengLLM, Any):
         # Get and validate the workbench configuration
-        workbench_conf = await cls._get_workbench_config()
+        workbench_conf = await cls._get_workbench_config(invoke_user_id)
 
         # BuatLLMInstances
         linsight_conf = settings.get_linsight_conf()
@@ -231,6 +268,11 @@ class LinsightWorkbenchImpl:
         login_user: UserPayload,
         display_files: list[dict] | None = None,
         defer_ingest: bool = True,
+        *,
+        session_subject: SessionSubject | None = None,
+        api_meta: dict | None = None,
+        telemetry_source: str = "platform",
+        session_name: str = "New Chat",
     ) -> tuple[MessageSession, LinsightSessionVersion]:
         """
         Submit user issue and create session
@@ -249,6 +291,16 @@ class LinsightWorkbenchImpl:
                 minutes — so inline parsing put the whole batch inside one HTTP
                 request, which nginx cut at 300s. Set False only where the caller
                 genuinely needs the files materialized before it returns.
+            session_subject: F073 — the Open API caller identity. When given, a
+                new MessageSession is stamped through it (compatibility user id
+                + service-account marker, so self-identity runs stay out of the
+                resource owner's workbench list) and attachments are promoted
+                into its storage partition. ``None`` keeps the workbench path.
+            api_meta: F073 — persisted on the version; the worker switches to
+                unattended execution when ``channel == "open_api_v2"``.
+            telemetry_source: ``source`` on the NEW_MESSAGE_SESSION event
+                ("api" for Open API submissions).
+            session_name: Initial conversation name.
 
         Returns:
             tuple: (Message Session Model, Inspiration Conversation Version Model)
@@ -299,10 +351,12 @@ class LinsightWorkbenchImpl:
                 # session type, so flow_type=LINSIGHT(20) is no longer minted here.
                 message_session = MessageSession(
                     chat_id=chat_id,
-                    name="New Chat",
+                    name=session_name,
                     flow_type=FlowType.WORKSTATION.value,
                     user_id=login_user.user_id,
                 )
+                if session_subject is not None:
+                    message_session = session_subject.stamp(message_session)
 
                 message_session = await MessageSessionDao.async_insert_one(message_session)
 
@@ -314,13 +368,15 @@ class LinsightWorkbenchImpl:
                     event_data=NewMessageSessionEventData(
                         session_id=message_session.chat_id,
                         app_id=ApplicationTypeEnum.DAILY_CHAT.value,
-                        source="platform",
+                        source=telemetry_source,
                         app_name=ApplicationTypeEnum.DAILY_CHAT.value,
                         app_type=ApplicationTypeEnum.DAILY_CHAT,
                     ),
                 )
 
             # Create Ideas Conversation Version (id == svid used for the workspace)
+            from bisheng.linsight.domain.services.skill_provisioning import pending_skill_snapshot
+
             linsight_session_version = LinsightSessionVersion(
                 id=svid,
                 session_id=chat_id,
@@ -335,6 +391,8 @@ class LinsightWorkbenchImpl:
                 pending_files=pending_files,
                 model=submit_obj.model,
                 skills=submit_obj.skills,
+                skill_snapshot=pending_skill_snapshot(submit_obj.skill_ids),
+                api_meta=api_meta,
             )
             linsight_session_version = await LinsightSessionVersionDao.insert_one(linsight_session_version)
 
@@ -355,7 +413,11 @@ class LinsightWorkbenchImpl:
                 # failed state) is stamped on later by the worker, via the
                 # session_version_id pointer below.
                 files=await promote_chat_attachments(
-                    cls.annotate_display_files(display_files, processed_files), login_user.user_id
+                    cls.annotate_display_files(display_files, processed_files),
+                    login_user.user_id,
+                    # Only an Open API submit names its own partition; the
+                    # workbench call stays exactly what it was.
+                    **({"storage_partition": session_subject.storage_partition} if session_subject is not None else {}),
                 ),
                 session_version_id=svid,
             )
@@ -370,6 +432,63 @@ class LinsightWorkbenchImpl:
         except Exception as e:
             logger.error(f"Failed to submit user question: {e!s}")
             raise cls.LinsightError(f"Failed to submit user question: {e!s}")
+
+    @classmethod
+    async def terminate(cls, session_version_model: LinsightSessionVersion) -> None:
+        """Stop a queued or running task (F073: shared by v1 and the Open API).
+
+        Drops it from the queue, flips the status to TERMINATED, lands the task
+        turn and pushes TASK_TERMINATED. Ownership and "is it still stoppable"
+        are the caller's checks — v1 and v2 answer them differently.
+        """
+        from bisheng.linsight.domain.services.state_message_manager import (
+            LinsightStateMessageManager,
+            MessageData,
+            MessageEventType,
+        )
+        from bisheng.linsight.worker import LinsightQueue
+
+        await MessageSessionDao.touch_session(session_version_model.session_id)
+
+        redis_client = await get_redis_client()
+        queue = LinsightQueue("queue", namespace="linsight", redis=redis_client)
+
+        try:
+            # Remove task from queue
+            await queue.remove(session_version_model.id)
+        except Exception as e:
+            logger.error(f"Failed to delete queue task: {e!s}")
+
+        # Update status is terminated
+        session_version_model.status = SessionVersionStatusEnum.TERMINATED
+
+        state_message_manager = LinsightStateMessageManager(session_version_id=session_version_model.id)
+
+        await state_message_manager.set_session_version_info(session_version_model)
+
+        # Persist the bot task turn so the terminated state survives a refresh. A task
+        # cancelled while still queued never reached _execute_workflow, so no
+        # category="task" row was written yet — without this, a refresh shows only the
+        # user question and the "task terminated" banner is lost. Upsert is idempotent:
+        # a task terminated mid-execution already has the placeholder row.
+        try:
+            await linsight_execute_utils.persist_task_turn_message(session_version_model)
+        except Exception:
+            # Best-effort: the termination itself (status flip + WS push) already
+            # succeeded; only the reload-time banner is affected if this fails.
+            logger.exception("Failed to persist terminated task turn message")
+
+        # Push termination message
+        await state_message_manager.push_message(
+            MessageData(
+                event_type=MessageEventType.TASK_TERMINATED,
+                data={
+                    "message": "Task has been actively stopped by the user",
+                    "session_id": session_version_model.id,
+                    "terminated_at": datetime.now().isoformat(),
+                },
+            )
+        )
 
     @staticmethod
     def annotate_display_files(display_files: list[dict] | None, processed_files: list | None) -> list[dict] | None:
@@ -647,7 +766,8 @@ class LinsightWorkbenchImpl:
         # failure. ``unsupported`` short-circuits for the same reason; the pipeline
         # would reject it on exactly the same extension check.
         route = cls._ingest_route(file_name)
-        if route == "passthrough":
+        original_only = route == "passthrough" or cls._spreadsheet_original_applies(file_name, local_path)
+        if original_only:
             raw = await cls._read_local_bytes(local_path)
             if raw is None:
                 return {
@@ -658,7 +778,15 @@ class LinsightWorkbenchImpl:
                     "valid": False,
                     "error_message": "file bytes unavailable after download",
                 }
-            return await cls._finalize_passthrough(submit_file, file_name, chat_id, minio_client, raw, used_names)
+            return await cls._finalize_passthrough(
+                submit_file,
+                file_name,
+                chat_id,
+                minio_client,
+                raw,
+                used_names,
+                ingest_mode="passthrough" if route == "passthrough" else cls._SPREADSHEET_ORIGINAL_MODE,
+            )
         if route == "unsupported":
             return await cls._keep_original_in_workspace(
                 submit_file,
@@ -887,6 +1015,7 @@ class LinsightWorkbenchImpl:
         used_names: set[str] | None,
         *,
         degraded_from: Exception | None = None,
+        ingest_mode: str = "passthrough",
     ) -> dict:
         """Land a file in the workspace AS ITSELF, with no markdown view.
 
@@ -897,6 +1026,10 @@ class LinsightWorkbenchImpl:
         ``read_file`` and the code interpreter can open, so it is reported as a
         SUCCESS — the historical ``failed`` / ``valid=False`` marking made the
         chip cry wolf about a file that works.
+
+        A spreadsheet (``ingest_mode=spreadsheet_original``) lands the same way but
+        is binary: only the code interpreter can open it, and the pointer block
+        says so instead of advertising ``read_file``.
 
         ``parsing_status`` stays ``"completed"`` on purpose. It is not "which
         pipeline ran", it is "is ingestion finished / may this be submitted": the
@@ -919,7 +1052,7 @@ class LinsightWorkbenchImpl:
             "relative_path": submit_file.relative_path,
             "parsing_status": "completed",
             "valid": True,
-            "ingest_mode": "passthrough",
+            "ingest_mode": ingest_mode,
             # Not markdown, despite the name — see the key's docstring. It is the
             # workspace SEED object, and three downstream consumers key off it
             # (local prefetch, the workspace write below, the attachment drawer).
@@ -927,7 +1060,7 @@ class LinsightWorkbenchImpl:
             "original_file_path": formal_object,
             # Set BEFORE the workspace write: that path only ``setdefault``s a 0
             # for non-markdown attachments, so a real count has to be there first.
-            "line_count": cls._count_text_lines(raw),
+            "line_count": cls._count_text_lines(raw) if ingest_mode == "passthrough" else 0,
             "image_count": 0,
         }
         if degraded_from is not None:
@@ -1008,6 +1141,28 @@ class LinsightWorkbenchImpl:
     # Derived, not hand-maintained, so it can never drift from the routing sets.
     _TEXT_LIKE_EXTS = _PASSTHROUGH_TEXT_EXTS
 
+    # Spreadsheets skip the RAG ETL and land AS THEMSELVES, with no text view.
+    # ``ExcelLoader`` is a knowledge-base chunker: it repeats the header in every
+    # slice, drops cell types and hard-fails once a slice outgrows the chunk
+    # ceiling. The model reads the workbook through the code interpreter instead
+    # (``read_file`` refuses binary content). Unlike a text passthrough the
+    # original is NOT readable by ``read_file``, so the pointer block words it
+    # separately. ``.et`` stays on the parser: it goes through the xinchuang
+    # converter first.
+    _SPREADSHEET_ORIGINAL_EXTS = frozenset({"xlsx", "xls"})
+    _SPREADSHEET_ORIGINAL_MODE = "spreadsheet_original"
+    # ingest_mode values whose workspace file IS the original (no markdown product).
+    _ORIGINAL_ONLY_MODES = frozenset({"passthrough", _SPREADSHEET_ORIGINAL_MODE})
+
+    @classmethod
+    def _spreadsheet_original_applies(cls, filename: str, local_path: str | None) -> bool:
+        """Whether an ``original``-routed spreadsheet really lands as-is.
+
+        Over the carry ceiling the original never reaches the workspace, so the
+        old parsed markdown is the only data the model could get.
+        """
+        return cls._ingest_route(filename) == "original" and cls._should_keep_raw(filename, local_path)
+
     @classmethod
     def _ingest_route(cls, filename: str) -> str:
         """Decide how a submitted file enters the workspace.
@@ -1017,6 +1172,10 @@ class LinsightWorkbenchImpl:
             (plus, for ``_RAW_KEEP_EXTS``, the original beside it).
           - ``"passthrough"``: skip the parser entirely; the original IS the
             workspace file.
+          - ``"original"``: a spreadsheet. No ETL and no text view: the
+            original is the workspace file, read through the code interpreter.
+            Callers fall back to ``"parse"`` when the original is too large to
+            carry (``_spreadsheet_original_applies``).
           - ``"unsupported"``: no loader and no consumer — short-circuit instead
             of burning an ETL round-trip on a guaranteed failure.
 
@@ -1028,6 +1187,8 @@ class LinsightWorkbenchImpl:
         from bisheng.knowledge.rag.base_file_pipeline import FileExtensionMap
 
         ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
+        if ext in cls._SPREADSHEET_ORIGINAL_EXTS:
+            return "original"
         if ext in cls._PASSTHROUGH_TEXT_EXTS and ext not in FileExtensionMap:
             return "passthrough"
         if ext in cls._PASSTHROUGH_TEXT_EXTS:
@@ -1066,7 +1227,7 @@ class LinsightWorkbenchImpl:
         # A passthrough file has no markdown product, so its formal object keeps the
         # real extension — the drawer builds a preview URL straight off this key and
         # a ``.csv`` served as ``.md`` would be handed to the markdown renderer.
-        is_passthrough = bool(temp_info) and temp_info.get("ingest_mode") == "passthrough"
+        is_passthrough = bool(temp_info) and temp_info.get("ingest_mode") in cls._ORIGINAL_ONLY_MODES
         formal_object = (
             cls._formal_original_object(submit_file.file_id, chat_id, submit_file.file_name)
             if is_passthrough
@@ -1525,9 +1686,12 @@ class LinsightWorkbenchImpl:
             return {"task_title": fallback, "chat_id": chat_id, "error_message": str(e)}
 
     @classmethod
-    async def _get_workbench_config(cls):
+    async def _get_workbench_config(cls, user_id: int):
         """Get and validate the workbench configuration"""
         workbench_conf = await LLMService.get_workbench_llm()
+        from bisheng.dsh.domain.services.model_catalog import project_workbench_config
+
+        workbench_conf = await project_workbench_config(workbench_conf, user_id)
         if not workbench_conf or not workbench_conf.linsight_default_model_id:
             raise cls.BishengLLMError(
                 "The task has been terminated, please contact the administrator to check the status of the Ideas task execution model"
@@ -1602,6 +1766,7 @@ class LinsightWorkbenchImpl:
         records: list[tuple[str, str, str]] = []
         has_raw = False
         has_passthrough = False
+        has_sheet_original = False
         has_unparsed = False
         has_media = False
         for file in session_version.files:
@@ -1630,6 +1795,20 @@ class LinsightWorkbenchImpl:
                     (
                         rel_dir,
                         f"- path: {path}\n  name: {name}\n  note: 解析失败，工作区只有二进制原件（不可 read_file）",
+                        name,
+                    )
+                )
+                continue
+
+            if file.get("ingest_mode") == cls._SPREADSHEET_ORIGINAL_MODE:
+                # No text view and no line count: the workbook is the file. The
+                # path is rendered relative, same reason as ``raw`` below.
+                has_sheet_original = True
+                records.append(
+                    (
+                        rel_dir,
+                        f"- path: {path}\n  name: {name}\n  raw: {path.lstrip('/')}\n"
+                        "  note: Excel 原件，没有文本视图（不可 read_file）",
                         name,
                     )
                 )
@@ -1713,8 +1892,23 @@ class LinsightWorkbenchImpl:
                     "本次没有可用的代码执行工具，无法读取二进制原件——请基于文本视图作答，"
                     "并在结论中说明受原件格式限制的部分。"
                 )
-        elif has_passthrough and has_code_interpreter:
+        elif (has_passthrough or has_sheet_original) and has_code_interpreter:
             detail_parts.append("raw 是相对当前工作目录的路径，在代码里直接用该相对路径打开。")
+        if has_sheet_original:
+            if has_code_interpreter:
+                detail_parts.append(
+                    "Excel 条目只有原件，用 bisheng_code_interpreter 读取："
+                    "先列出全部工作表名并查看每个表的前几行，确认表头在第几行（报表常有标题行或多行表头），"
+                    "再用 pandas.read_excel(raw, sheet_name=..., header=...) 读取；"
+                    "read_excel 默认只读第一个工作表。"
+                )
+            else:
+                # Prompt <-> tool lockstep: never point the model at a tool that is
+                # not bound. It cannot open the workbook at all, so it must say so.
+                detail_parts.append(
+                    "本次没有可用的代码执行器工具，无法读取 Excel 原件；"
+                    "不要猜测或编造表格内容，请明确告诉用户：需要添加代码执行器工具后才能分析这些 Excel 文件。"
+                )
         if detail_parts:
             header_parts.append("说明：" + "".join(detail_parts) + "\n")
         header = "".join(header_parts)
@@ -2041,8 +2235,11 @@ class LinsightWorkbenchImpl:
             # here than on the daily path: a parse failure is reported to the
             # follow-up input as ``failed``, and that input DELETES the attachment
             # from the box on sight — so without this a ``.py`` could not even be
-            # submitted, let alone used.
-            if cls._ingest_route(original_filename) == "passthrough":
+            # submitted, let alone used. Spreadsheets under the carry ceiling take
+            # the same shape, minus the line count (they are binary).
+            is_text_passthrough = cls._ingest_route(original_filename) == "passthrough"
+            if is_text_passthrough or cls._spreadsheet_original_applies(original_filename, file_path):
+                mode = "passthrough" if is_text_passthrough else cls._SPREADSHEET_ORIGINAL_MODE
                 raw_bytes = await cls._read_local_bytes(file_path)
                 if raw_bytes is not None:
                     minio_client = await get_minio_storage()
@@ -2052,15 +2249,15 @@ class LinsightWorkbenchImpl:
                         "file_id": file_id,
                         "original_filename": original_filename,
                         "parsing_status": "completed",
-                        "ingest_mode": "passthrough",
-                        "parse_type": "passthrough",
+                        "ingest_mode": mode,
+                        "parse_type": mode,
                         "markdown_filename": tmp_key,
                         "markdown_file_path": tmp_key,
                         "markdown_file_md5": await async_calculate_md5(raw_bytes),
                         # Counted here, where the bytes are already in hand. The
                         # workspace write only ``setdefault``s a 0 for non-markdown
                         # attachments, so a real count has to arrive before it.
-                        "line_count": cls._count_text_lines(raw_bytes),
+                        "line_count": cls._count_text_lines(raw_bytes) if is_text_passthrough else 0,
                         # Deliberately no ``original_file_path``: ingest promotes
                         # this same key to the formal bucket, and setting it would
                         # make it store a second copy of identical bytes.
@@ -2143,71 +2340,54 @@ class LinsightWorkbenchImpl:
     async def _init_bisheng_code_tool(
         cls, selected_tool_ids: list[int], file_dir: str, user_id: int, session_version_id: str | None = None
     ) -> list[BaseTool]:
-        """Initialize the code interpreter separately (it needs the workspace dir bound).
+        """Bind the task's implicit execution capability through tool-use authorization.
 
-        ``selected_tool_ids`` is the user's per-turn tool selection. The id is
-        consumed (removed) on a hit so the generic ``init_by_tool_ids`` pass does
-        not build a second, workspace-less copy of the same tool.
+        Consume an explicit selection too, so every task owns one workspace-bound
+        interpreter. Revoked implicit access leaves the remaining tools available;
+        an explicitly requested capability retains normal permission errors.
         """
-        tools = []
         bisheng_code_tool = await GptsToolsDao.aget_tool_by_tool_key(tool_key="bisheng_code_interpreter")
-        if not bisheng_code_tool or bisheng_code_tool.id not in selected_tool_ids:
-            return tools
-        # Individual initialization code interpreter tool
-        selected_tool_ids.remove(bisheng_code_tool.id)
-        code_config = json.loads(bisheng_code_tool.extra) if bisheng_code_tool.extra else {}
-        if "config" not in code_config:
-            code_config["config"] = {}
-        if "local" not in code_config["config"]:
-            code_config["config"]["local"] = {}
-        code_config["config"]["local"]["local_sync_path"] = file_dir
+        if not bisheng_code_tool:
+            return []
+        explicit = bisheng_code_tool.id in selected_tool_ids
+        if explicit:
+            selected_tool_ids.remove(bisheng_code_tool.id)
+        tool_type = await GptsToolsDao.aget_one_tool_type(tool_type_id=bisheng_code_tool.type)
+        if tool_type is None:
+            raise SandboxConfigurationError()
+        try:
+            await ToolExecutor._ensure_use_permission_async(tool_type, user_id)
+        except PermissionError:
+            if explicit:
+                raise
+            logger.info("Task execution capability unavailable to user_id={}", user_id)
+            return []
+        code_config = ToolExecutor.parse_preset_extra(bisheng_code_tool, tool_type)
+        executor_type = code_config.get("type") or "local"
+        if executor_type not in {"local", "container", "e2b"}:
+            raise SandboxConfigurationError()
+        # Normalize the default before the factory selects config[executor_type].
+        code_config["type"] = executor_type
+        executor_config = code_config.setdefault("config", {}).setdefault(executor_type, {})
+        executor_config["local_sync_path"] = file_dir
         if session_version_id:
             from bisheng.linsight.domain.services.workspace_backend import WORKSPACE_PREFIX
 
-            # Lets the executor mirror what it writes into ``workspace/<svid>/``.
-            # Without it the local working dir is the ONLY copy, so the file tools
-            # cannot see a code-generated deliverable and the next turn's
-            # seed-from-previous finds an empty ``output/``.
-            code_config["config"]["local"]["workspace_prefix"] = f"{WORKSPACE_PREFIX}/{session_version_id}"
-        if "e2b" not in code_config["config"]:
-            code_config["config"]["e2b"] = {}
-        code_config["config"]["e2b"]["local_sync_path"] = file_dir
-        # Default60Validity period of minutes
-        code_config["config"]["e2b"]["timeout"] = 3600
-        code_config["config"]["e2b"]["keep_sandbox"] = True
-        # ``file_list`` is the E2B copy-in set: E2bCodeExecutor.__init__ reads every
-        # entry fully into worker memory and pushes it into the sandbox up front.
-        # E2B's own contract caps that at SIZE_AUTOPUSH — anything larger is meant to
-        # be requested explicitly per run — while the dual-track ingest keeps
-        # originals up to _RAW_KEEP_MAX_BYTES (50MB), which LocalExecutor serves for
-        # free through local_sync_path. Filter here so the E2B ceiling is honoured
-        # without shrinking what the local executor can reach.
-        file_list = []
-        oversized: list[str] = []
-        for root, dirs, files in os.walk(file_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                try:
-                    if os.path.getsize(file_path) > SIZE_AUTOPUSH:
-                        oversized.append(file_path)
-                        continue
-                except OSError:
-                    # Unstattable file: let it through rather than silently dropping
-                    # it — the push itself will surface any real problem.
-                    pass
-                file_list.append(WriteEntry(data=file_path, path=file_path.replace(file_dir, ".")))
-        if oversized:
-            # Never let a bounded copy-in look complete: the model is told these
-            # paths exist, so a silent drop reads as "the tool is broken".
-            logger.warning(
-                "code interpreter: {} file(s) exceed the E2B auto-push ceiling ({} bytes) and were not "
-                "pushed into the sandbox: {}",
-                len(oversized),
-                SIZE_AUTOPUSH,
-                ", ".join(os.path.basename(p) for p in oversized),
-            )
-        code_config["config"]["e2b"]["file_list"] = file_list
+            # File tools and follow-up turns read the same durable workspace.
+            executor_config["workspace_prefix"] = f"{WORKSPACE_PREFIX}/{session_version_id}"
+        if executor_type == "local":
+            executor_config["keep_run_dir"] = True
+        elif executor_type == "container":
+            executor_config["keep_session"] = True
+            executor_config["timeout"] = 3600
+        elif executor_type == "e2b":
+            executor_config["timeout"] = 3600
+            executor_config["keep_sandbox"] = True
+            # E2B eagerly reads this copy-in set. Local uses the task directory
+            # directly; container copies its working set at run().
+            executor_config["file_list"] = build_e2b_file_list(file_dir)
 
+        bisheng_code_tool = GptsTools(**bisheng_code_tool.model_dump())
         bisheng_code_tool.extra = code_config
 
         tools = await ToolExecutor.init_by_tool_id(
@@ -2237,37 +2417,27 @@ class LinsightWorkbenchImpl:
         """
         tools = []
 
-        if not session_version.tools:
-            return tools
+        tool_ids = list(dict.fromkeys(cls._extract_tool_ids(session_version.tools or [])))
 
-        # &Extraction toolID
-        tool_ids = list(dict.fromkeys(cls._extract_tool_ids(session_version.tools)))  # de-dup, preserve order
-
-        # todo Better tool initialization scheme
-        # The code interpreter binds ONLY when the user picked it for this turn.
-        # It used to be gated on the daily-config whitelist (the admin-configured
-        # candidate list), which made it bind on every task turn regardless of the
-        # input-bar toggle — the whitelist is the set of tools a user MAY pick,
-        # not a set of tools to auto-enable.
+        # Task infrastructure is resolved on each execution/resume, independently
+        # of the optional tools selected in the composer. Initialization failures
+        # propagate before the model starts so capability loss is actionable.
         if need_upload and file_dir:
-            try:
-                bisheng_code_tool = await cls._init_bisheng_code_tool(
-                    tool_ids,
-                    file_dir,
-                    user_id=session_version.user_id,
-                    session_version_id=session_version.id,
+            tools.extend(
+                await cls._init_bisheng_code_tool(
+                    tool_ids, file_dir, user_id=session_version.user_id, session_version_id=session_version.id
                 )
-                tools.extend(bisheng_code_tool)
-            except Exception:
-                # Swallowing is deliberate (a broken tool must not kill the task),
-                # but it must stay diagnosable: logger.error(f"...{e!s}") dropped the
-                # traceback, so a run silently losing the code interpreter looked
-                # identical whether the cause was a permission gate, a bad config or
-                # a missing sandbox. logger.exception keeps the stack.
-                logger.exception(
-                    "Failed to initialize BiSheng code interpreter tool: session_version_id={}",
-                    session_version.id,
-                )
+            )
+
+        # Retired builtin row. Saved task selections may still name it.
+        # Passing the row to load_tools raises "Got unknown tool image_view"
+        # and aborts the task before skills or any other tool run.
+        from bisheng.common.image_view.loop import IMAGE_VIEW_TOOL_KEY
+
+        image_view_tool = await GptsToolsDao.aget_tool_by_tool_key(tool_key=IMAGE_VIEW_TOOL_KEY)
+        if image_view_tool and image_view_tool.id in tool_ids:
+            tool_ids.remove(image_view_tool.id)
+            logger.info("skip image_view tool id={}: config row is not a callable tool", image_view_tool.id)
 
         # Unified-resource direction (2026-06-16): task mode reuses the daily
         # tool selection directly. Every selected tool id (a real GptsTools id

@@ -258,6 +258,10 @@ class KnowledgeContainerPermissionLoader(Protocol):
         resource_id: str,
     ) -> KnowledgeContainerPermissionRecord | None: ...
 
+    async def load_permission_records_from_rows(
+        self, rows: list[Knowledge], *, resource_type: str
+    ) -> tuple[KnowledgeContainerPermissionRecord, ...]: ...
+
 
 class KnowledgePermissionVersionPort(Protocol):
     async def get_permission_version(
@@ -325,6 +329,48 @@ class KnowledgeContainerDaoPermissionLoader:
             context_version=context_version,
         )
 
+    async def load_permission_records_from_rows(
+        self, rows: list[Knowledge], *, resource_type: str
+    ) -> tuple[KnowledgeContainerPermissionRecord, ...]:
+        """Resolve one business-loaded batch without per-resource SELECTs."""
+        allowed_kinds = {"knowledge_space": {"SPACE"}, "knowledge_library": {"NORMAL", "QA"}}
+        candidates: list[tuple[Knowledge, str, str]] = []
+        for row in rows:
+            if row.id is None or row.tenant_id is None:
+                continue
+            try:
+                kind = KnowledgeTypeEnum(row.type).name
+                status = KnowledgeState(row.state).name
+            except ValueError:
+                continue
+            if kind in allowed_kinds.get(resource_type, set()):
+                candidates.append((row, kind, status))
+        if not candidates:
+            return ()
+        keys = tuple((int(row.tenant_id), resource_type, str(row.id)) for row, _, _ in candidates)
+        snapshots = await self._versions.get_permission_snapshots(keys)
+        records = []
+        for row, kind, status in candidates:
+            snapshot = snapshots.get((int(row.tenant_id), resource_type, str(row.id)))
+            if snapshot is None:
+                continue
+            context_version = sha256(
+                (f"{snapshot.context_version}|{row.update_time.isoformat() if row.update_time else '0'}").encode()
+            ).hexdigest()[:64]
+            records.append(
+                KnowledgeContainerPermissionRecord(
+                    tenant_id=int(row.tenant_id),
+                    resource_type=resource_type,
+                    resource_id=str(row.id),
+                    status=status,
+                    kind=kind,
+                    owner_user_id=int(row.user_id or 0),
+                    permission_version=snapshot.version,
+                    context_version=context_version,
+                )
+            )
+        return tuple(records)
+
 
 class KnowledgeContainerPermissionPort(Protocol):
     async def check_action(
@@ -371,7 +417,7 @@ def _container_rejection(
     """Name why a container cannot serve as a permission target, or None.
 
     The reason never reaches the caller: `permission_error_response` flattens
-    every rejection into the same 19003 body so that a missing resource and one
+    every rejection into the same 25022 body so that a missing resource and one
     in another tenant stay indistinguishable. It goes to the log instead —
     without it, "Invalid resource type or ID" covers seven different causes, and
     a space stuck at status=FAILED reads exactly like a typo in the id.
@@ -445,6 +491,23 @@ class F048KnowledgeContainerPermissionAdapter:
             resource_id,
         )
         return self._target(record, actor, resource_type, resource_id)
+
+    async def resolve_permission_targets_from_rows(
+        self,
+        *,
+        rows: list[Knowledge],
+        resource_type: str,
+        actor: PermissionActor,
+    ) -> tuple[VerifiedPermissionTarget, ...]:
+        records = await self._loader.load_permission_records_from_rows(rows, resource_type=resource_type)
+        targets = []
+        for record in records:
+            try:
+                targets.append(self._target(record, actor, resource_type, record.resource_id))
+            except PermissionInvalidResourceError:
+                # Listing semantics omit individually invalid business resources.
+                continue
+        return tuple(targets)
 
     async def check_action(
         self,
@@ -792,11 +855,7 @@ class KnowledgeFileDaoPermissionLoader:
         ancestors = tuple(part for part in (row.file_level_path or "").split("/") if part)
         if ancestors:
             return "folder", ancestors[-1], ancestors
-        root_type = (
-            "knowledge_space"
-            if knowledge.type == KnowledgeTypeEnum.SPACE.value
-            else "knowledge_library"
-        )
+        root_type = "knowledge_space" if knowledge.type == KnowledgeTypeEnum.SPACE.value else "knowledge_library"
         return root_type, str(knowledge.id), ancestors
 
     async def load_permission_records_from_rows(
@@ -854,10 +913,7 @@ class KnowledgeFileDaoPermissionLoader:
                 status = "ACTIVE"
             parent_type, parent_id, ancestors = self._parent_scope(row, knowledge)
             context_version = sha256(
-                (
-                    f"{snapshot.context_version}|"
-                    f"{row.update_time.isoformat() if row.update_time else '0'}"
-                ).encode()
+                (f"{snapshot.context_version}|{row.update_time.isoformat() if row.update_time else '0'}").encode()
             ).hexdigest()[:64]
             records.append(
                 KnowledgeFilePermissionRecord(
@@ -968,6 +1024,8 @@ class KnowledgeFilePermissionPort(Protocol):
     ) -> bool: ...
 
     async def authorize_created(self, **kwargs): ...
+
+    async def rollback_created(self, **kwargs): ...
 
     async def project_parent_change(self, **kwargs): ...
 
@@ -1082,6 +1140,7 @@ class F048KnowledgeFilePermissionAdapter:
         actor: PermissionActor,
         action: str,
     ) -> VerifiedPermissionTarget:
+        del action  # Permission target identity must not depend on a requested action.
         record = await self._loader.load_permission_record(
             resource_type,
             resource_id,
@@ -1091,7 +1150,6 @@ class F048KnowledgeFilePermissionAdapter:
             actor,
             resource_type,
             resource_id,
-            action=action,
         )
 
     async def resolve_permission_targets_from_rows(
@@ -1104,6 +1162,7 @@ class F048KnowledgeFilePermissionAdapter:
     ) -> tuple[VerifiedPermissionTarget, ...]:
         """Verify an existing business batch without reloading each resource by id."""
 
+        del action  # Permission target identity must not depend on a requested action.
         records = await self._loader.load_permission_records_from_rows(
             rows,
             knowledge=knowledge,
@@ -1117,7 +1176,6 @@ class F048KnowledgeFilePermissionAdapter:
                         actor,
                         record.resource_type,
                         record.resource_id,
-                        action=action,
                     )
                 )
             except PermissionInvalidResourceError:
@@ -1153,6 +1211,13 @@ class F048KnowledgeFilePermissionAdapter:
             owner_user_id=record.owner_user_id,
             mode="INHERIT",
             protected=True,
+        )
+
+    async def rollback_created(self, *, record: KnowledgeFilePermissionRecord, actor: PermissionActor) -> None:
+        await self._permission.rollback_created(
+            actor=actor,
+            target=self._record_target(record, actor),
+            owner_user_id=record.owner_user_id,
         )
 
     async def project_move(
@@ -1258,24 +1323,17 @@ class F048KnowledgeFilePermissionAdapter:
         actor: PermissionActor,
         resource_type: str,
         resource_id: str,
-        *,
-        action: str,
     ) -> VerifiedPermissionTarget:
-        file_statuses = {status.name for status in KnowledgeFileStatus} if action == "delete" else {"SUCCESS"}
-        valid_statuses = {
-            "folder": {"ACTIVE", "SUCCESS"},
-            "knowledge_file": file_statuses,
-        }
+        valid_resource_types = {"folder", "knowledge_file"}
         valid_parents = {"knowledge_space", "knowledge_library", "folder"}
         if (
             record is None
             or record.resource_type != resource_type
             or record.resource_id != resource_id
-            or resource_type not in valid_statuses
-            or record.status not in valid_statuses[resource_type]
+            or resource_type not in valid_resource_types
             or record.parent_type not in valid_parents
             or not record.parent_id
-            or record.parent_id == record.resource_id
+            or (record.parent_type == record.resource_type and record.parent_id == record.resource_id)
             or record.resource_id in record.ancestor_ids
             or record.mode not in {"INHERIT", "CUSTOM"}
             or (record.tenant_id != actor.current_tenant_id and not actor.super_admin)
@@ -1311,7 +1369,7 @@ class F048KnowledgeFilePermissionAdapter:
             or record.status not in valid_statuses[resource_type]
             or record.parent_type not in valid_parents
             or not record.parent_id
-            or record.parent_id == record.resource_id
+            or (record.parent_type == record.resource_type and record.parent_id == record.resource_id)
             or record.resource_id in record.ancestor_ids
             or record.mode not in {"INHERIT", "CUSTOM"}
             or (record.tenant_id != actor.current_tenant_id and not actor.super_admin)

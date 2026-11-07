@@ -1,13 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
+import { Dropdown, DropdownItem, DropdownSeparator } from "@bisheng/ui";
 import { LogOut } from "lucide-react";
 import { Outlined } from "bisheng-icons";
 import { Channel, SortType, canDeleteChannel, canEditChannelSettings, canManageChannelPermissions, getChannelDetailApi, getChannelsApi } from "~/api/channels";
-import {
-    DropdownMenu,
-    DropdownMenuContent,
-    DropdownMenuItem,
-    DropdownMenuTrigger,
-} from "~/components/ui/DropdownMenu";
 import { useConfirm } from "~/Providers";
 import { useChannelActions } from "../hooks/useChannelActions";
 import { useLocalize } from "~/hooks";
@@ -18,8 +13,11 @@ interface ChannelActionsMenuProps {
     channel: Channel;
     onChannelSelect: (channel: Channel | null) => void;
     onChannelSettings?: (channel: Channel) => void;
-    /** "default" = PC labels (频道设置/成员管理/解散频道).
-     *  "mobile" = H5 labels (编辑频道/权限管理/删除频道). */
+    /** 创建频道 entry pinned at the top of the menu (divider below). Mobile-only by
+     *  convention — on PC, creation lives on the header button next to 切换频道. */
+    onCreateChannel?: () => void;
+    /** "default" = PC labels (频道设置/解散频道).
+     *  "mobile" = H5 labels (频道设置/删除频道). */
     variant?: "default" | "mobile";
     /** Mobile only: 分享 menu item — copies the share link. */
     onShare?: () => void;
@@ -41,6 +39,7 @@ export function ChannelActionsMenu({
     channel,
     onChannelSelect,
     onChannelSettings,
+    onCreateChannel,
     variant = "default",
     onShare,
     onOpenSourceFilter,
@@ -111,91 +110,94 @@ export function ChannelActionsMenu({
         || canUnsubscribe,
     );
     const permissionsResolving = !isChannelDetailFetched && !Array.isArray(listChannel.actions);
-    const itemCls = "flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-[5px] text-sm leading-[22px] text-[#212121]";
-    const iconCls = "size-4 text-[#4E5969]";
+    const showShare = Boolean(isMobile && onShare);
+    const showSourceFilter = Boolean(isMobile && onOpenSourceFilter);
+    const showSettings = Boolean((canEditSettings || canManageMembers) && onChannelSettings);
+    const hasRegularItem = showShare || showSourceFilter || showSettings;
+    const hasDangerItem = canDissolve || canUnsubscribe;
+
+    const handleDissolve = async () => {
+        const ok = await confirm({
+            title: localize("com_subscription.prompt_tip"),
+            description: localize("com_subscription.confirm_delete_channel_for_all"),
+            confirmText: localize("com_subscription.confirm"),
+            cancelText: localize("com_subscription.cancel"),
+        });
+        if (!ok) return;
+        handleDeleteChannel(liveChannel.id);
+    };
+
+    const handleUnsubscribe = async () => {
+        const ok = await confirm({
+            title: localize("com_subscription.prompt_tip"),
+            description: localize("com_subscription.confirm_unsubscribe_channel_and_subs"),
+            confirmText: localize("com_subscription.confirm"),
+            cancelText: localize("com_subscription.cancel"),
+        });
+        if (!ok) return;
+        handleUnsubscribeChannel(liveChannel.id);
+    };
 
     return (
-        <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-                <button
-                    type="button"
-                    disabled={disabled || permissionsResolving || !hasMenuItem}
-                    className={cn(
-                        isMobile
-                            ? "inline-flex size-5 shrink-0 items-center justify-center text-[#212121]"
-                            : "inline-flex size-8 items-center justify-center rounded-md border border-[#EBECF0] bg-white text-[#4e5969] outline-none transition-colors fine-pointer:hover:bg-[#F7F8FA]",
-                        (disabled || permissionsResolving || !hasMenuItem) && "pointer-events-none opacity-20",
-                        triggerClassName,
-                    )}
-                    aria-label={localize("com_subscription.channel_settings")}
-                >
-                    <Outlined.MoreCircle className={isMobile ? "size-5" : "size-4"} />
-                </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-                align="end"
-                sideOffset={isMobile ? 6 : undefined}
-                className={cn("z-[120] border-none p-2 shadow-[0px_2px_8px_rgba(0,23,66,0.1)]", isMobile ? "w-[180px]" : "w-[160px]")}
+        <Dropdown
+            align="end"
+            menu={
+                <>
+                    {onCreateChannel ? (
+                        <>
+                            <DropdownItem icon={<Outlined.Plus />} onSelect={onCreateChannel}>
+                                {localize("com_subscription.create_channel")}
+                            </DropdownItem>
+                            {hasRegularItem || hasDangerItem ? <DropdownSeparator /> : null}
+                        </>
+                    ) : null}
+                    {showShare ? (
+                        <DropdownItem icon={<Outlined.Share />} onSelect={() => onShare?.()}>
+                            {localize("com_subscription.share")}
+                        </DropdownItem>
+                    ) : null}
+                    {showSourceFilter ? (
+                        <DropdownItem icon={<Outlined.Filter />} onSelect={() => onOpenSourceFilter?.()}>
+                            {localize("com_subscription.source_filter")}
+                        </DropdownItem>
+                    ) : null}
+                    {showSettings ? (
+                        <DropdownItem icon={<Outlined.Edit />} onSelect={() => onChannelSettings?.(liveChannel)}>
+                            {isMobile
+                                ? localize("com_subscription.edit_channel")
+                                : localize("com_subscription.channel_settings")}
+                        </DropdownItem>
+                    ) : null}
+                    {hasRegularItem && hasDangerItem ? <DropdownSeparator /> : null}
+                    {canDissolve ? (
+                        <DropdownItem danger icon={<Outlined.Delete />} onSelect={handleDissolve}>
+                            {isMobile
+                                ? localize("com_subscription.delete_channel")
+                                : localize("com_subscription.dissolve_channel")}
+                        </DropdownItem>
+                    ) : null}
+                    {canUnsubscribe ? (
+                        <DropdownItem danger icon={<LogOut />} onSelect={handleUnsubscribe}>
+                            {localize("com_subscription.unsubscribe")}
+                        </DropdownItem>
+                    ) : null}
+                </>
+            }
+        >
+            <button
+                type="button"
+                disabled={disabled || permissionsResolving || !hasMenuItem}
+                className={cn(
+                    isMobile
+                        ? "inline-flex size-5 shrink-0 items-center justify-center text-text-1"
+                        : "inline-flex size-8 items-center justify-center rounded-md border border-border-base bg-white text-text-2 outline-none transition-colors fine-pointer:hover:bg-fill-1",
+                    (disabled || permissionsResolving || !hasMenuItem) && "pointer-events-none opacity-20",
+                    triggerClassName,
+                )}
+                aria-label={localize("com_subscription.channel_settings")}
             >
-                {isMobile && onShare ? (
-                    <DropdownMenuItem className={itemCls} onClick={onShare}>
-                        <Outlined.Share className={iconCls} />
-                        {localize("com_subscription.share")}
-                    </DropdownMenuItem>
-                ) : null}
-                {isMobile && onOpenSourceFilter ? (
-                    <DropdownMenuItem className={itemCls} onClick={onOpenSourceFilter}>
-                        <Outlined.Filter className={iconCls} />
-                        {localize("com_subscription.source_filter")}
-                    </DropdownMenuItem>
-                ) : null}
-                {(canEditSettings || canManageMembers) && onChannelSettings ? (
-                    <DropdownMenuItem className={itemCls} onClick={() => onChannelSettings(liveChannel)}>
-                        <Outlined.Edit className={iconCls} />
-                        {isMobile
-                            ? localize("com_subscription.edit_channel")
-                            : localize("com_subscription.channel_settings")}
-                    </DropdownMenuItem>
-                ) : null}
-                {canDissolve ? (
-                    <DropdownMenuItem
-                        className={cn(itemCls, "text-[#F53F3F] data-[highlighted]:bg-[#F53F3F]/10 data-[highlighted]:text-[#F53F3F]")}
-                        onClick={async () => {
-                            const ok = await confirm({
-                                title: localize("com_subscription.prompt_tip"),
-                                description: localize("com_subscription.confirm_delete_channel_for_all"),
-                                confirmText: localize("com_subscription.confirm"),
-                                cancelText: localize("com_subscription.cancel"),
-                            });
-                            if (!ok) return;
-                            handleDeleteChannel(liveChannel.id);
-                        }}
-                    >
-                        <Outlined.Delete className="size-4 text-[#F53F3F]" />
-                        {isMobile
-                            ? localize("com_subscription.delete_channel")
-                            : localize("com_subscription.dissolve_channel")}
-                    </DropdownMenuItem>
-                ) : null}
-                {canUnsubscribe ? (
-                    <DropdownMenuItem
-                        className={cn(itemCls, "text-[#F53F3F] data-[highlighted]:bg-[#F53F3F]/10 data-[highlighted]:text-[#F53F3F]")}
-                        onClick={async () => {
-                            const ok = await confirm({
-                                title: localize("com_subscription.prompt_tip"),
-                                description: localize("com_subscription.confirm_unsubscribe_channel_and_subs"),
-                                confirmText: localize("com_subscription.confirm"),
-                                cancelText: localize("com_subscription.cancel"),
-                            });
-                            if (!ok) return;
-                            handleUnsubscribeChannel(liveChannel.id);
-                        }}
-                    >
-                        <LogOut className="size-4 text-[#F53F3F]" />
-                        {localize("com_subscription.unsubscribe")}
-                    </DropdownMenuItem>
-                ) : null}
-            </DropdownMenuContent>
-        </DropdownMenu>
+                <Outlined.MoreCircle className={isMobile ? "size-5" : "size-4"} />
+            </button>
+        </Dropdown>
     );
 }

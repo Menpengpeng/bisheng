@@ -39,9 +39,10 @@ const SIZE_WIDTH: Record<Exclude<ModalSize, 'fullscreen'>, string> = {
     'min-[576px]:w-[min(400px,calc(100vw-32px))] lg:w-[min(600px,calc(100vw-32px))] xl:w-[min(960px,calc(100vw-32px))]',
 };
 
-/** §5 — 40% black, no blur (a blurred backdrop reads as "I left the page"). */
+/** §5 — 40% black, no blur (a blurred backdrop reads as "I left the page").
+ * Dark deepens it to 60%: 40% black over #121212 barely separates layers. */
 const OVERLAY_CLASS =
-  'fixed inset-0 z-modal bg-black/40 data-[state=open]:animate-modal-overlay-in data-[state=closed]:animate-modal-overlay-out motion-reduce:animate-none';
+  'fixed inset-0 z-modal bg-black/40 dark:bg-black/60 data-[state=open]:animate-modal-overlay-in data-[state=closed]:animate-modal-overlay-out motion-reduce:animate-none';
 
 /** Phone (< 576px) has no visible outside area — §7 says the mask is not drawn. */
 const OVERLAY_PHONE_CLASS = 'hidden min-[576px]:block';
@@ -80,8 +81,10 @@ export interface ModalProps {
   /** Footer actions, primary rightmost (组件-Button按钮.md). Omit and the footer is not rendered. */
   footer?: React.ReactNode;
   /**
-   * The header「×」(§4). Keep it for form dialogs — it is their only exit; drop it
-   * when the footer already carries a 取消 button, so there are not two ways to say no.
+   * The header「×」(§4). Decided by dialog TYPE, not by whether a 取消 button
+   * exists: a form dialog keeps both (取消 sits by the primary button, the「×」is
+   * where a hand reaches to dismiss a layer — different places to look); a
+   * confirm dialog drops it, its two footer buttons already are the question.
    */
   closable?: boolean;
   /** Accessible name of the「×」button. Text comes from the caller (library contract). */
@@ -106,7 +109,8 @@ export interface ModalProps {
   bodyClassName?: string;
   /** Extra classes on the footer. */
   footerClassName?: string;
-  /** Escape hatch for the mask, e.g. `bg-transparent` when this opens ON TOP of another overlay (§5). */
+  /** Escape hatch for the mask (§5) — e.g. a lighter second layer. Nesting needs
+   * nothing here: a confirm opened on top of a dialog draws its own mask. */
   overlayClassName?: string;
 }
 
@@ -187,7 +191,14 @@ export function Modal({
 
           <div
             className={cn(
-              'min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 text-body',
+              // §4 — the body keeps NO vertical padding of its own; the header's
+              // height and the footer's padding already hold that gap open.
+              // `py-0.5 -my-0.5` is not spacing: a scroll container clips at its
+              // padding box, and with zero vertical padding that edge cuts the
+              // 2px focus ring off any field sitting first or last in the body.
+              // The padding gives the ring its 2px, the negative margin takes
+              // the same 2px back out of the layout — nothing moves.
+              'min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-0.5 -my-0.5 text-body',
               bodyClassName,
             )}
           >

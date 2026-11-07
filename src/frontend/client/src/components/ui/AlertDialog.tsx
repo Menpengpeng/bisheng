@@ -2,6 +2,20 @@ import * as React from 'react';
 import * as AlertDialogPrimitive from '@radix-ui/react-alert-dialog';
 
 import { cn } from '../../utils';
+import { dialogOverlayStyle } from './dialogOverlayStyle';
+
+/**
+ * The color defaults below carry NO `dark:` prefix — they use semantic tokens
+ * (text-text-*, bg-fill-*, border-border-base, btn-*), which already flip with
+ * the theme. This is load-bearing: tailwind-merge only dedupes classes sharing
+ * a variant prefix, so a `dark:`-prefixed default survives any unprefixed color
+ * a caller passes and then wins on specificity in dark mode. Shipping shadcn's
+ * inverted dark palette here (dark:bg-gray-100 dark:text-gray-900) is what made
+ * the global confirm dialog's red delete button render white-on-white.
+ * Callers may pass plain `bg-danger` / `bg-blue-500` and have it hold in both
+ * themes; keep it that way. The overlay scrim is the one exception — it takes no
+ * className from callers, so its dark: pair can't shadow anything.
+ */
 
 const AlertDialog = AlertDialogPrimitive.Root;
 
@@ -21,13 +35,14 @@ AlertDialogPortal.displayName = AlertDialogPrimitive.Portal.displayName;
 const AlertDialogOverlay = React.forwardRef<
   React.ElementRef<typeof AlertDialogPrimitive.Overlay>,
   React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Overlay>
->(({ className = '', ...props }, ref) => (
+>(({ className = '', style, ...props }, ref) => (
   <AlertDialogPrimitive.Overlay
     className={cn(
       'fixed inset-0 z-[110] bg-gray-500/90 transition-opacity animate-in fade-in dark:bg-gray-800/90',
       className,
     )}
     {...props}
+    style={dialogOverlayStyle(style)}
     ref={ref}
   />
 ));
@@ -42,11 +57,11 @@ const AlertDialogContent = React.forwardRef<
     <AlertDialogPrimitive.Content
       ref={ref}
       className={cn(
-        'alert-dialog fixed z-[110] grid w-full max-w-lg scale-100 gap-4 bg-white p-6 opacity-100 animate-in fade-in-90 slide-in-from-bottom-10 sm:rounded-lg sm:zoom-in-90 sm:slide-in-from-bottom-0 touch-desktop:w-full',
-        'dark:bg-gray-900',
+        'alert-dialog fixed z-[110] grid w-full max-w-lg scale-100 gap-4 bg-bg-page p-6 opacity-100 animate-in fade-in-90 slide-in-from-bottom-10 sm:rounded-lg sm:zoom-in-90 sm:slide-in-from-bottom-0 touch-desktop:w-full',
         className,
       )}
       {...props}
+      aria-modal="true"
     />
   </AlertDialogPortal>
 ));
@@ -71,7 +86,7 @@ const AlertDialogTitle = React.forwardRef<
 >(({ className = '', ...props }, ref) => (
   <AlertDialogPrimitive.Title
     ref={ref}
-    className={cn('text-lg font-semibold text-gray-900', 'dark:text-gray-50', className)}
+    className={cn('text-lg font-semibold text-text-1', className)}
     {...props}
   />
 ));
@@ -83,7 +98,7 @@ const AlertDialogDescription = React.forwardRef<
 >(({ className = '', ...props }, ref) => (
   <AlertDialogPrimitive.Description
     ref={ref}
-    className={cn('text-sm text-gray-500', 'dark:text-gray-400', className)}
+    className={cn('text-sm text-text-2', className)}
     {...props}
   />
 ));
@@ -96,7 +111,7 @@ const AlertDialogAction = React.forwardRef<
   <AlertDialogPrimitive.Action
     ref={ref}
     className={cn(
-      'inline-flex h-10 items-center justify-center rounded-md bg-gray-900 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-gray-400 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-100 dark:focus:ring-gray-400 dark:focus:ring-offset-gray-900',
+      'inline-flex h-10 items-center justify-center rounded-md bg-btn-gray-solid-bg px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-btn-gray-solid-bg/90 focus:outline-none focus:ring-2 focus:ring-gray-400 focus:ring-offset-2 focus:ring-offset-bg-page disabled:cursor-not-allowed disabled:opacity-50',
       className,
     )}
     {...props}
@@ -111,7 +126,7 @@ const AlertDialogCancel = React.forwardRef<
   <AlertDialogPrimitive.Cancel
     ref={ref}
     className={cn(
-      'mt-2 inline-flex h-10 items-center justify-center rounded-md border border-gray-200 bg-transparent px-4 py-2 text-sm font-semibold text-gray-900 transition-colors hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-gray-400 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-800 dark:focus:ring-gray-400 dark:focus:ring-offset-gray-900 sm:mt-0',
+      'mt-2 inline-flex h-10 items-center justify-center rounded-md border border-border-base bg-transparent px-4 py-2 text-sm font-semibold text-text-1 transition-colors hover:bg-fill-1 focus:outline-none focus:ring-2 focus:ring-gray-400 focus:ring-offset-2 focus:ring-offset-bg-page disabled:cursor-not-allowed disabled:opacity-50 sm:mt-0',
       className,
     )}
     {...props}

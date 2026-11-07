@@ -55,6 +55,7 @@ def _make_login_user(
         user_id=user_id,
         user_name=user_name,
         tenant_id=1,
+        is_global_super=False,
         is_admin=lambda: False,
         get_user_group_ids=_get_user_group_ids,
     )
@@ -126,8 +127,7 @@ async def test_get_space_info_raises_when_space_is_missing(
     service: KnowledgeSpaceService,
 ) -> None:
     with patch(
-        "bisheng.knowledge.domain.services.knowledge_space_service."
-        "KnowledgeDao.aquery_by_id",
+        "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeDao.aquery_by_id",
         new_callable=AsyncMock,
         return_value=None,
     ):
@@ -141,20 +141,17 @@ async def test_create_limit_count_excludes_department_spaces(
     with (
         # A finite quota keeps the count path alive; -1 would skip it entirely.
         patch(
-            "bisheng.knowledge.domain.services.knowledge_space_service."
-            "QuotaService.get_effective_quota",
+            "bisheng.knowledge.domain.services.knowledge_space_service.QuotaService.get_effective_quota",
             new_callable=AsyncMock,
             return_value=50,
         ),
         patch(
-            "bisheng.knowledge.domain.services.knowledge_space_service."
-            "KnowledgeDao.async_count_spaces_by_user",
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeDao.async_count_spaces_by_user",
             new_callable=AsyncMock,
             return_value=0,
         ) as mock_count,
         patch(
-            "bisheng.knowledge.domain.services.knowledge_space_service."
-            "LLMService.get_workbench_llm",
+            "bisheng.knowledge.domain.services.knowledge_space_service.LLMService.get_workbench_llm",
             new_callable=AsyncMock,
             return_value=None,
         ),
@@ -219,20 +216,17 @@ async def test_unsubscribe_space_blocks_creator(
 
     with (
         patch(
-            "bisheng.knowledge.domain.services.knowledge_space_service."
-            "KnowledgeDao.aquery_by_id",
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeDao.aquery_by_id",
             new_callable=AsyncMock,
             return_value=owned_space,
         ),
         patch(
-            "bisheng.knowledge.domain.services.knowledge_space_service."
-            "SpaceChannelMemberDao.async_find_member",
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.async_find_member",
             new_callable=AsyncMock,
             return_value=creator_member,
         ),
         patch(
-            "bisheng.knowledge.domain.services.knowledge_space_service."
-            "SpaceChannelMemberDao.delete_space_member",
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.delete_space_member",
             new_callable=AsyncMock,
         ) as mock_delete_member,
     ):
@@ -274,8 +268,7 @@ async def test_add_folder_under_level_9_parent_raises_depth_error(
             return_value=parent_folder,
         ),
         patch(
-            "bisheng.knowledge.domain.services.knowledge_space_service."
-            "KnowledgeFileDao.aadd_file",
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeFileDao.aadd_file",
             new_callable=AsyncMock,
         ) as mock_add_file,
     ):
@@ -312,14 +305,12 @@ async def test_add_folder_under_level_8_parent_creates_level_9_child(
             return_value=parent_folder,
         ),
         patch(
-            "bisheng.knowledge.domain.services.knowledge_space_service."
-            "SpaceFileDao.count_folder_by_name",
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceFileDao.count_folder_by_name",
             new_callable=AsyncMock,
             return_value=0,
         ),
         patch(
-            "bisheng.knowledge.domain.services.knowledge_space_service."
-            "KnowledgeFileDao.aadd_file",
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeFileDao.aadd_file",
             new_callable=AsyncMock,
             side_effect=lambda folder: folder,
         ) as mock_add_file,
@@ -341,10 +332,14 @@ async def test_add_folder_under_level_8_parent_creates_level_9_child(
     assert created.level == MAX_FOLDER_LEVEL
 
 
-async def test_public_square_info_preview_does_not_require_visible_permission(
+@pytest.mark.parametrize("is_released", [False, True])
+@pytest.mark.parametrize("auth_type", [AuthTypeEnum.PUBLIC, AuthTypeEnum.APPROVAL])
+async def test_shared_space_info_previews_joinable_spaces(
     service: KnowledgeSpaceService,
+    is_released: bool,
+    auth_type: AuthTypeEnum,
 ) -> None:
-    space = _make_space(space_id=301, user_id=9, is_released=True, auth_type=AuthTypeEnum.PUBLIC)
+    space = _make_space(space_id=301, user_id=9, is_released=is_released, auth_type=auth_type)
     creator = SimpleNamespace(user_id=9, user_name="creator", avatar=None)
 
     with (
@@ -381,15 +376,130 @@ async def test_public_square_info_preview_does_not_require_visible_permission(
 
     check_action.assert_awaited_once_with("knowledge_space", 301, "visible")
     assert result.id == 301
+    assert result.name == space.name
+    assert result.description == space.description
+    assert result.auth_type == auth_type
+    assert result.is_released == is_released
+    assert result.actions == []
     assert result.user_role is None
     assert result.subscription_status == SpaceSubscriptionStatusEnum.NOT_SUBSCRIBED
     assert result.is_followed is False
 
 
-async def test_private_space_info_still_requires_visible_permission(
+async def test_space_info_marks_visible_grant_as_subscribed_without_membership(
     service: KnowledgeSpaceService,
 ) -> None:
-    space = _make_space(space_id=302, user_id=9, is_released=False, auth_type=AuthTypeEnum.PRIVATE)
+    space = _make_space(space_id=303, user_id=9, is_released=True, auth_type=AuthTypeEnum.APPROVAL)
+    creator = SimpleNamespace(user_id=9, user_name="creator", avatar=None)
+
+    with (
+        patch.object(
+            service,
+            "_require_space_info_permission",
+            new_callable=AsyncMock,
+            return_value=(space, True),
+        ),
+        patch.object(service, "_check_action", new_callable=AsyncMock, return_value=False) as check_action,
+        patch.object(
+            service,
+            "_get_effective_actions",
+            new_callable=AsyncMock,
+            return_value={"visible"},
+        ),
+        patch.object(
+            service,
+            "_permission_actor",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(super_admin=False),
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.async_count_space_members",
+            new_callable=AsyncMock,
+            return_value=1,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeFileDao.async_count_success_files_batch",
+            new_callable=AsyncMock,
+            return_value={303: 2},
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.UserDao.aget_user",
+            new_callable=AsyncMock,
+            return_value=creator,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.async_find_member",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch.object(service, "_decorate_department_metadata", new_callable=AsyncMock),
+        patch.object(service, "_decorate_auto_tag_for_info", new_callable=AsyncMock),
+    ):
+        result = await service.get_space_info(303)
+
+    check_action.assert_awaited_once_with("knowledge_space", 303, "manage_permission")
+    assert result.user_role == UserRoleEnum.MEMBER
+    assert result.actions == ["visible"]
+    assert result.subscription_status == SpaceSubscriptionStatusEnum.SUBSCRIBED
+    assert result.is_followed is True
+    assert result.is_pending is False
+
+
+async def test_joined_visibility_does_not_expand_super_admin_identity(
+    service: KnowledgeSpaceService,
+) -> None:
+    actor = SimpleNamespace(super_admin=True)
+    with (
+        patch.object(service, "_permission_actor", new_callable=AsyncMock, return_value=actor),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.batch_check_business_visible",
+            new_callable=AsyncMock,
+            return_value={"304": False},
+        ) as check_visible,
+    ):
+        has_joined_visibility = await service._has_joined_visibility(
+            304,
+            has_content_permission=True,
+        )
+
+    assert has_joined_visibility is False
+    check_visible.assert_awaited_once_with(
+        service.login_user,
+        resource_type="knowledge_space",
+        resource_ids=[304],
+        actor=actor,
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    list(SpaceSubscriptionStatusEnum),
+)
+def test_visible_permission_takes_precedence_over_application_status(
+    status: SpaceSubscriptionStatusEnum,
+) -> None:
+    assert (
+        KnowledgeSpaceService._resolve_effective_subscription_status(status, has_visible=True)
+        == SpaceSubscriptionStatusEnum.SUBSCRIBED
+    )
+
+
+@pytest.mark.parametrize("status", list(SpaceSubscriptionStatusEnum))
+def test_without_visible_permission_preserves_application_state_but_clears_stale_joined(
+    status: SpaceSubscriptionStatusEnum,
+) -> None:
+    expected = (
+        SpaceSubscriptionStatusEnum.NOT_SUBSCRIBED if status == SpaceSubscriptionStatusEnum.SUBSCRIBED else status
+    )
+    assert KnowledgeSpaceService._resolve_effective_subscription_status(status, has_visible=False) == expected
+
+
+@pytest.mark.parametrize("is_released", [False, True])
+async def test_private_space_info_requires_visible_permission(
+    service: KnowledgeSpaceService,
+    is_released: bool,
+) -> None:
+    space = _make_space(space_id=302, user_id=9, is_released=is_released, auth_type=AuthTypeEnum.PRIVATE)
 
     with (
         patch(
@@ -403,9 +513,10 @@ async def test_private_space_info_still_requires_visible_permission(
             await service.get_space_info(302)
 
 
-async def test_square_keeps_public_rows_without_visible_and_marks_not_subscribed(
+async def test_square_super_admin_scope_does_not_mark_ungranted_space_subscribed(
     service: KnowledgeSpaceService,
 ) -> None:
+    service.login_user.is_global_super = True
     space = _make_space(space_id=401, user_id=9, is_released=True, auth_type=AuthTypeEnum.PUBLIC)
     creator = SimpleNamespace(user_id=9, user_name="creator", avatar=None)
 
@@ -430,7 +541,11 @@ async def test_square_keeps_public_rows_without_visible_and_marks_not_subscribed
             new_callable=AsyncMock,
             return_value={401: 0},
         ),
-        patch.object(service, "_batch_actions", new_callable=AsyncMock, return_value={"401": frozenset()}),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.batch_check_business_visible",
+            new_callable=AsyncMock,
+            return_value={"401": False},
+        ) as check_visible,
         patch(
             "bisheng.user.domain.services.user.UserService.get_avatar_share_link",
             new_callable=AsyncMock,
@@ -445,6 +560,11 @@ async def test_square_keeps_public_rows_without_visible_and_marks_not_subscribed
     item = result["data"][0]
     assert item.subscription_status == SpaceSubscriptionStatusEnum.NOT_SUBSCRIBED
     assert item.is_followed is False
+    check_visible.assert_awaited_once_with(
+        service.login_user,
+        resource_type="knowledge_space",
+        resource_ids=[401],
+    )
 
 
 async def test_square_marks_real_visible_grant_as_subscribed(
@@ -474,11 +594,10 @@ async def test_square_marks_real_visible_grant_as_subscribed(
             new_callable=AsyncMock,
             return_value={402: 0},
         ),
-        patch.object(
-            service,
-            "_batch_actions",
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.batch_check_business_visible",
             new_callable=AsyncMock,
-            return_value={"402": frozenset({"visible"})},
+            return_value={"402": True},
         ),
         patch(
             "bisheng.user.domain.services.user.UserService.get_avatar_share_link",
@@ -492,3 +611,34 @@ async def test_square_marks_real_visible_grant_as_subscribed(
     item = result["data"][0]
     assert item.subscription_status == SpaceSubscriptionStatusEnum.SUBSCRIBED
     assert item.is_followed is True
+
+
+@pytest.mark.parametrize("is_released", [False, True])
+@pytest.mark.parametrize("auth_type", [AuthTypeEnum.PUBLIC, AuthTypeEnum.APPROVAL])
+@pytest.mark.parametrize("method", ["list_space_children", "asearch_space_children_cursor"])
+async def test_share_preview_content_requires_visible_permission(
+    service: KnowledgeSpaceService,
+    is_released: bool,
+    auth_type: AuthTypeEnum,
+    method: str,
+) -> None:
+    space = _make_space(space_id=301, user_id=9, is_released=is_released, auth_type=auth_type)
+    with (
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeDao.aquery_by_id",
+            new_callable=AsyncMock,
+            return_value=space,
+        ),
+        patch.object(service, "_check_action", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            service, "_require_action", new_callable=AsyncMock, side_effect=SpacePermissionDeniedError()
+        ) as require_action,
+        patch.object(service, "_scan_visible_child_items", new_callable=AsyncMock) as scan,
+    ):
+        preview_space, has_content_permission = await service._require_space_info_permission(301)
+        assert preview_space.id == 301
+        assert has_content_permission is False
+        with pytest.raises(SpacePermissionDeniedError):
+            await getattr(service, method)(301)
+    require_action.assert_awaited_once_with("knowledge_space", 301, "visible")
+    scan.assert_not_awaited()

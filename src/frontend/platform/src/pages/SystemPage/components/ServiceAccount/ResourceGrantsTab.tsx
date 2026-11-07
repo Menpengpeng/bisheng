@@ -1,0 +1,460 @@
+import { useServiceAccountRequestScope } from "./useServiceAccountManagementScope";
+import { TooltipProvider as SharedTooltipProvider } from '@bisheng/ui';
+import { Button, SearchInput, Select, notification, toast } from '@bisheng/ui';
+import { Tooltip as SharedTooltip } from "@bisheng/ui";
+import { Outlined } from "bisheng-icons";
+
+
+
+import { useSelectLabels } from "@/components/bs-comp/formFields/useSelectLabels";
+import {
+Table,
+TableBody,
+TableCell,
+TableHead,
+TableHeader,
+TableRow,
+} from "@/components/bs-ui/table";
+
+
+import { getResourcePermissionContextApi } from "@/controllers/API/permission";
+import {
+listServiceAccountKeysApi,
+listServiceAccountResourceGrantsApi,
+mutateServiceAccountResourceGrantsApi,
+} from "@/controllers/API/serviceAccount";
+import { handleUiRequest, showApiError } from "@/controllers/request";
+import type {
+ApiKeyItem,
+ServiceAccountResourceGrant,
+} from "@/types/api/openApi";
+import { copyText } from "@/utils";
+import { useCallback,useEffect,useMemo,useState } from "react";
+import { useTranslation } from "react-i18next";
+import { GrantScopeNotice } from "./GrantScopeNotice";
+import { ResourceGrantDialog } from "./ResourceGrantDialog";
+import { ResourceGrantRevokeDialogs } from "./ResourceGrantRevokeDialogs";
+import {
+createResourceGrantIdempotencyKey,
+formatServiceAccountGrantTime,
+getRequiredScope,
+isServiceAccountGrantEffective,
+isServiceAccountPermissionTier,
+RESOURCE_GRANT_FILTER_ALL,
+SERVICE_ACCOUNT_PERMISSION_TIERS,
+SERVICE_ACCOUNT_RESOURCE_TYPES,
+splitGrantKeys,
+} from "./resourceGrantUtils";
+
+export interface ResourceGrantsTabProps {
+  serviceAccountId: number
+  serviceAccountName: string
+}
+
+export function ResourceGrantsTab({
+  serviceAccountId,
+  serviceAccountName,
+}: ResourceGrantsTabProps) {
+  const requestScope = useServiceAccountRequestScope();
+  const { t } = useTranslation()
+  const selectLabels = useSelectLabels()
+  const [grants, setGrants] = useState<ServiceAccountResourceGrant[]>([])
+  const [keys, setKeys] = useState<ApiKeyItem[]>([])
+  const [keyword, setKeyword] = useState("")
+  const [resourceType, setResourceType] = useState(RESOURCE_GRANT_FILTER_ALL)
+  const [sourceType, setSourceType] = useState(RESOURCE_GRANT_FILTER_ALL)
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [revokeGrant, setRevokeGrant] =
+    useState<ServiceAccountResourceGrant | null>(null)
+  const [revokeAllOpen, setRevokeAllOpen] = useState(false)
+  const [updatingGrantId, setUpdatingGrantId] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [loadingData, setLoadingData] = useState(true)
+
+  const load = useCallback(async () => {
+    setLoadingData(true)
+    try {
+      const [grantRows, keyRows] = await Promise.all([
+        listServiceAccountResourceGrantsApi(serviceAccountId, requestScope),
+        listServiceAccountKeysApi(serviceAccountId, requestScope),
+      ])
+      if (grantRows) setGrants(grantRows)
+      if (keyRows) setKeys(keyRows)
+    } finally {
+      setLoadingData(false)
+    }
+  }, [serviceAccountId, requestScope])
+
+  useEffect(() => {
+    void load().catch(showApiError)
+  }, [load])
+
+  const filteredGrants = useMemo(() => {
+    const normalizedKeyword = keyword.trim().toLocaleLowerCase()
+    return grants.filter(
+      (grant) =>
+        (!normalizedKeyword ||
+          grant.resource_name
+            .toLocaleLowerCase()
+            .includes(normalizedKeyword)) &&
+        (resourceType === RESOURCE_GRANT_FILTER_ALL ||
+          grant.resource_type === resourceType) &&
+        (sourceType === RESOURCE_GRANT_FILTER_ALL ||
+          grant.source_type === sourceType),
+    )
+  }, [grants, keyword, resourceType, sourceType])
+
+  const directGrants = grants.filter(
+    (grant) =>
+      grant.editable && !grant.protected && grant.source_type === "DIRECT",
+  )
+  const hasOwnKeys = splitGrantKeys(keys).own.length > 0
+  const automaticGrants = grants.filter(
+    (grant) => grant.source_type === "CREATOR_GRANT",
+  )
+
+  const remove = async (rows: ServiceAccountResourceGrant[]) => {
+    setLoading(true)
+    let completed = true
+    try {
+      const groups = rows.reduce<Record<string, ServiceAccountResourceGrant[]>>(
+        (result, row) => {
+          const key = `${row.resource_type}:${row.resource_id}`
+          result[key] = [...(result[key] || []), row]
+          return result
+        },
+        {},
+      )
+      for (const group of Object.values(groups)) {
+        if (!group?.length) continue
+        const resource = group[0]
+        const context = await getResourcePermissionContextApi(
+            resource.resource_type as never,
+            resource.resource_id,
+          )
+        if (!context) {
+          completed = false
+          break
+        }
+        const result = await mutateServiceAccountResourceGrantsApi(
+            serviceAccountId,
+            resource.resource_type,
+            resource.resource_id,
+            {
+              idempotency_key: createResourceGrantIdempotencyKey(),
+              expected_resource_version: context.resource_version,
+              expected_catalog_release_id: context.catalog_release_id,
+              changes: group.map((grant) => ({
+                op: "REMOVE" as const,
+                assignee_id: grant.assignee_id,
+                expected_assignee_version: grant.assignee_version,
+              })),
+            }, requestScope)
+        if (!result) {
+          completed = false
+          break
+        }
+      }
+      if (completed) {
+        notification.open({ type: "success", title: String(t("openApiManagement.serviceAccount.grants") ?? ''), description: String(t("openApiManagement.feedback.grantRevoked") ?? '') })
+      }
+      await load()
+      return completed
+    } catch (error) {
+      await load().catch(showApiError)
+      throw error
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleTierChange = async (
+    grant: ServiceAccountResourceGrant,
+    targetModelKey: string,
+  ) => {
+    if (targetModelKey === grant.model_key) return
+    setUpdatingGrantId(grant.assignee_id)
+    try {
+      const context = await getResourcePermissionContextApi(
+          grant.resource_type as never,
+          grant.resource_id,
+        )
+      if (!context) return
+      const result = await mutateServiceAccountResourceGrantsApi(
+          serviceAccountId,
+          grant.resource_type,
+          grant.resource_id,
+          {
+            idempotency_key: createResourceGrantIdempotencyKey(),
+            expected_resource_version: context.resource_version,
+            expected_catalog_release_id: context.catalog_release_id,
+            changes: [
+              {
+                op: "MOVE",
+                assignee_id: grant.assignee_id,
+                expected_assignee_version: grant.assignee_version,
+                target_model_key: targetModelKey,
+              },
+            ],
+          }, requestScope)
+      if (!result) return
+      notification.open({ type: "success", title: String(t("openApiManagement.grants.change") ?? ''), description: String(t("openApiManagement.feedback.grantUpdated") ?? '') })
+      await load()
+    } finally {
+      setUpdatingGrantId(null)
+    }
+  }
+
+  const handleCopyResource = async (grant: ServiceAccountResourceGrant) => {
+    const resource = `${grant.resource_type}:${grant.resource_id}`
+    await copyText(resource)
+    toast.show({ type: "success", message: String(t("openApiManagement.feedback.resourceCopied", {
+        resource,
+      }) ?? '') })
+  }
+
+  const handleConfirmRevoke = async () => {
+    if (!revokeGrant) return
+    if (await remove([revokeGrant])) setRevokeGrant(null)
+  }
+
+  const handleConfirmRevokeAll = async () => {
+    if (await remove(directGrants)) setRevokeAllOpen(false)
+  }
+
+  return (
+    <SharedTooltipProvider delayDuration={100}><div className="space-y-4 py-4">
+        {!loadingData ? <GrantScopeNotice keys={keys} /> : null}
+
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <SearchInput value={keyword} aria-label={t("openApiManagement.grants.resourceSearch")} placeholder={t("openApiManagement.grants.resourceSearch")} onChange={(event) => setKeyword(event.target.value)} className={"w-52"} />
+            <Select
+              {...selectLabels}
+              className="w-36"
+              options={[
+                { value: RESOURCE_GRANT_FILTER_ALL, label: t("openApiManagement.grants.allTypes") },
+                ...SERVICE_ACCOUNT_RESOURCE_TYPES.map((type) => ({
+                  value: type,
+                  label: t(`openApiManagement.resourceTypes.${type}`),
+                })),
+              ]}
+              value={resourceType}
+              onChange={(value) => { if (value != null) setResourceType(String(value)) }}
+              aria-label={t("openApiManagement.grants.typeFilter")}
+            />
+            <Select
+              {...selectLabels}
+              className="w-44"
+              options={[
+                { value: RESOURCE_GRANT_FILTER_ALL, label: t("openApiManagement.grants.allSources") },
+                { value: "DIRECT", label: t("openApiManagement.grantSources.DIRECT") },
+                { value: "CREATOR_GRANT", label: t("openApiManagement.grantSources.CREATOR_GRANT") },
+              ]}
+              value={sourceType}
+              onChange={(value) => { if (value != null) setSourceType(String(value)) }}
+              aria-label={t("openApiManagement.grants.sourceFilter")}
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {directGrants.length ? (
+              <Button variant="outlined" disabled={loading || loadingData} onClick={() => setRevokeAllOpen(true)} color="default">
+                {t("openApiManagement.grants.revokeAll")}
+              </Button>
+            ) : null}
+            <Button disabled={loading || loadingData} onClick={() => setDialogOpen(true)}>
+              <Outlined.Plus className="mr-1 size-4 text-primary" />
+              {t("openApiManagement.grants.add")}
+            </Button>
+          </div>
+        </div>
+
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("openApiManagement.grants.resource")}</TableHead>
+              <TableHead>
+                {t("openApiManagement.grants.resourceType")}
+              </TableHead>
+              <TableHead>{t("openApiManagement.grants.model")}</TableHead>
+              <TableHead>{t("openApiManagement.grants.source")}</TableHead>
+              <TableHead>{t("openApiManagement.grants.effective")}</TableHead>
+              <TableHead>{t("openApiManagement.grants.grantedAt")}</TableHead>
+              <TableHead>
+                <span className="sr-only">{t("operations")}</span>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {filteredGrants.map((grant) => {
+              const effective = isServiceAccountGrantEffective(grant, keys)
+              const requiredScope = getRequiredScope(grant)
+              const canChangeTier =
+                grant.editable &&
+                !grant.protected &&
+                grant.source_type === "DIRECT" &&
+                isServiceAccountPermissionTier(grant.model_key)
+              return (
+                <TableRow key={grant.assignee_id}>
+                  <TableCell>
+                    <div className="min-w-52">
+                      <div className="flex items-center gap-1">
+                        <span className="font-medium">
+                          {grant.resource_name}
+                        </span>
+                        <SharedTooltip content={t("openApiManagement.actions.copy")}><Button type="button" variant="text" size="medium" className="size-7" aria-label={t(
+                                "openApiManagement.grants.copyResource",
+                                { name: grant.resource_name },
+                              )} onClick={() => void handleCopyResource(grant)} color="default" iconOnly>
+                              <Outlined.Copy  className="size-4" />
+                            </Button></SharedTooltip>
+                      </div>
+                      {!effective && requiredScope && hasOwnKeys ? (
+                        <p className="mt-1 flex items-center gap-1 text-xs text-orange-500">
+                          <Outlined.Info className="size-3.5 shrink-0" />
+                          {t("openApiManagement.grants.missingScope", {
+                            scope: t(
+                              `openApiManagement.scopes.${requiredScope.replace(":", "_")}.label`,
+                            ),
+                          })}
+                        </p>
+                      ) : null}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    {t(
+                      `openApiManagement.resourceTypes.${grant.resource_type}`,
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {isServiceAccountPermissionTier(grant.model_key) ? (
+                      <Select
+                        {...selectLabels}
+                        className="w-28"
+                        options={SERVICE_ACCOUNT_PERMISSION_TIERS.map((key) => ({
+                          value: key,
+                          label: t(`openApiManagement.permissionTiers.${key}`),
+                        }))}
+                        value={grant.model_key}
+                        disabled={
+                          !canChangeTier ||
+                          loading ||
+                          updatingGrantId === grant.assignee_id
+                        }
+                        onChange={(value) => {
+                          if (value != null) void handleTierChange(grant, String(value)).catch(showApiError)
+                        }}
+                        aria-label={t(
+                          "openApiManagement.grants.changeTierFor",
+                          { name: grant.resource_name },
+                        )}
+                      />
+                    ) : (
+                      grant.model_name
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <span
+                      className={
+                        grant.source_type === "CREATOR_GRANT"
+                          ? "inline-flex h-5 items-center rounded bg-primary/10 px-1.5 text-xs text-primary"
+                          : "inline-flex h-5 items-center rounded bg-muted px-1.5 text-xs text-muted-foreground"
+                      }
+                    >
+                      {t(`openApiManagement.grantSources.${grant.source_type}`)}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <span
+                      className={
+                        effective
+                          ? "inline-flex items-center gap-2 text-success-foreground"
+                          : "inline-flex items-center gap-2 text-orange-500"
+                      }
+                    >
+                      <span
+                        aria-hidden="true"
+                        className={`size-2 rounded-full ${effective ? "bg-success-foreground" : "bg-orange-500"}`}
+                      />
+                      {t(
+                        effective
+                          ? "openApiManagement.grants.effectiveActive"
+                          : "openApiManagement.grants.ineffective",
+                      )}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    {formatServiceAccountGrantTime(grant.granted_at)}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <SharedTooltip content={t("openApiManagement.actions.revoke")}><Button type="button" variant="text" size="medium" className="size-8" disabled={
+                            loading || !grant.editable || grant.protected
+                          } aria-label={t(
+                            "openApiManagement.grants.revokeResource",
+                            { name: grant.resource_name },
+                          )} onClick={() => setRevokeGrant(grant)} color="default" iconOnly>
+                          <Outlined.Delete className="size-4" />
+                        </Button></SharedTooltip>
+                  </TableCell>
+                </TableRow>
+              )
+            })}
+            {loadingData ? (
+              <TableRow>
+                <TableCell colSpan={7} className="py-8 text-center">
+                  <span role="status" aria-label={t("loading")}>
+                    <Outlined.Loading className="mx-auto size-5 animate-spin" />
+                  </span>
+                </TableCell>
+              </TableRow>
+            ) : null}
+            {!loadingData && !filteredGrants.length ? (
+              <TableRow>
+                <TableCell
+                  colSpan={7}
+                  className="text-center text-muted-foreground"
+                >
+                  {t(
+                    grants.length
+                      ? "openApiManagement.grants.noMatch"
+                      : "openApiManagement.grants.empty",
+                  )}
+                </TableCell>
+              </TableRow>
+            ) : null}
+          </TableBody>
+        </Table>
+
+        {!loadingData && filteredGrants.length ? (
+          <p className="text-sm text-muted-foreground">
+            {t("openApiManagement.grants.total", {
+              count: filteredGrants.length,
+            })}
+          </p>
+        ) : null}
+
+        <ResourceGrantDialog
+          serviceAccountId={serviceAccountId}
+          serviceAccountName={serviceAccountName}
+          existingGrants={grants}
+          editingGrant={null}
+          open={dialogOpen}
+          onOpenChange={setDialogOpen}
+          onGranted={load}
+        />
+        <ResourceGrantRevokeDialogs
+          grant={revokeGrant}
+          directGrants={directGrants}
+          automaticGrantCount={automaticGrants.length}
+          revokeAllOpen={revokeAllOpen}
+          loading={loading}
+          onGrantOpenChange={(open) => {
+            if (!open) setRevokeGrant(null)
+          }}
+          onRevokeAllOpenChange={setRevokeAllOpen}
+          onConfirmGrant={handleUiRequest(handleConfirmRevoke)}
+          onConfirmAll={handleUiRequest(handleConfirmRevokeAll)}
+        />
+      </div></SharedTooltipProvider>
+  )
+}

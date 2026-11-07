@@ -2,6 +2,8 @@
 
 bisheng-gateway 是 BiSheng 的**商业拓展套件**，作为 Java 网关层部署在前端与后端之间，提供 SSO/OAuth 统一认证、内容安全审查（敏感词过滤）、流量控制（限流/在线计数）和 API 反向代理能力。它是一个独立的 Java 项目（私有仓库 `dataelement/bisheng-gateway`），拥有独立的数据库表和配置，通过 HTTP 与 bisheng 后端通信。
 
+> DSH 原生接入已在 `feat/bisheng-work-110` 中解除本章所述 Java Gateway 依赖。DSH 登录、换证、设备会话和模型鉴权由 Python 提供，商业席位入口移除；其余 Gateway 商业能力仍按本章适用范围维护。新部署及切换说明见 [DSH 无 Gateway 发布](../../features/v3.0.0/110-dsh-local-access/deployment.md)。
+
 ## 1. 系统架构
 
 ### 1.1 请求流转路径
@@ -405,6 +407,8 @@ spring.cloud.gateway.routes:
 
 **注意**: 默认 WebSocket Routing Filter 已禁用（`global-filter.websocket-routing.enabled: false`），由自定义的 `SelfWebsocketRoutingFilter` 接管，实现在线计数和限流检查。
 
+**对外地址与转发头**：Spring Cloud Gateway 转发时把 `Host` 改写成上游地址（`backend:7860`），但默认的 `XForwardedHeadersFilter` 会在 `X-Forwarded-Host/Proto` 上**追加**网关自己看到的值、不覆盖已有值。后端写进技能包的地址取这两个头的**首值**，因此两种形态都能自动推导（2026-09-14 在 105 实测）：网关前面有仓库自带 nginx 时，首值是 nginx 传来的浏览器地址；网关直接对外时，首值是用户访问网关所用的地址。只有 TLS 在网关（或其前的 nginx）之前终结、且外层没有转发 `X-Forwarded-Proto` 时，协议会变成 `http://`，这时在后端 `config.yaml` 配置 `open_api.public_base_url`。无论哪种形态，员工运行「AI 助手接入」弹窗复制的配置命令时都会带上浏览器地址，包内地址只是兜底。详见 [08-deployment 反向代理与对外地址](08-deployment.md#反向代理与对外地址)。
+
 ### 10.2 bisheng 集成
 
 ```yaml
@@ -495,11 +499,14 @@ npm start
 # 远程服务器路径
 # /opt/bisheng-gateway/ on 192.168.106.114
 
-# 同步脚本（项目根目录 gateway-sync.sh）
+# 同步脚本（bisheng-gateway 仓根目录的 gateway-sync.sh，不在 bisheng 仓）
 ./gateway-sync.sh up      # 本地 → 远程
 ./gateway-sync.sh down    # 远程 → 本地
 ./gateway-sync.sh watch   # 监听变化，自动推送
 ```
+
+> 2026-10-27 核实：114 上只保留了 `/opt/bisheng-gateway/` 目录，Gateway 没有在运行（8180 无监听），
+> bisheng 后端以 `BISHENG_PRO=false` 启动。要在 114 联调商业版，先启动 Gateway，再把后端各 unit 的 `BISHENG_PRO` 改回 `true`。
 
 ### 11.3 数据库
 

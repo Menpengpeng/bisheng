@@ -23,7 +23,7 @@ from bisheng.linsight.domain.services import skill_service as service_module
 from bisheng.linsight.domain.services.skill_service import SkillService
 from test.linsight.fixtures.fake_minio import FakeMinioStorage
 
-from bisheng.linsight.domain.services.skill_store import MAX_BUNDLE_SIZE, SkillStore
+from bisheng.linsight.domain.services.skill_store import SkillStore
 from test.linsight.test_skill_service import FakeSkillDao
 
 BASE = "/api/v1/linsight/skill"
@@ -157,7 +157,15 @@ class TestCrudFlow:
     def test_selectable_shape(self, client):
         _create_form(client)
         item = client.get(f"{BASE}/selectable").json()["data"][0]
-        assert set(item) == {"name", "display_name", "description"}
+        assert set(item) == {"name", "display_name", "description", "default_checked"}
+        assert item["default_checked"] is False
+
+    def test_default_checked_toggle(self, client):
+        _create_form(client)
+        resp = client.patch(f"{BASE}/ji-du-cai-bao-fen-xi/default-checked", json={"default_checked": True})
+        assert resp.json()["data"] == {"ok": True}
+        assert client.get(f"{BASE}/selectable").json()["data"][0]["default_checked"] is True
+        assert client.get(BASE).json()["data"]["data"][0]["default_checked"] is True
 
 
 class TestErrorCodes:
@@ -166,6 +174,8 @@ class TestErrorCodes:
         assert client.get(f"{BASE}/kernel-core").json()["status_code"] == 11053
         assert client.delete(f"{BASE}/kernel-core").json()["status_code"] == 11053
         assert client.patch(f"{BASE}/kernel-core/status", json={"enabled": False}).json()["status_code"] == 11053
+        resp = client.patch(f"{BASE}/kernel-core/default-checked", json={"default_checked": True})
+        assert resp.json()["status_code"] == 11053
 
     def test_duplicate_name_11055(self, client):
         _create_form(client)
@@ -201,8 +211,10 @@ class TestErrorCodes:
         assert data["display_name"] == "Presentations"
         assert data["normalized_from"] == "Presentations"
 
-    def test_oversize_11052(self, client):
-        big = b"x" * (MAX_BUNDLE_SIZE + 1)
+    def test_oversize_11052(self, client, monkeypatch):
+        # A small configured cap keeps the payload small; the endpoint reads it per request.
+        monkeypatch.setattr(skill_endpoints, "resolve_skill_upload_limit", AsyncMock(return_value=1024 * 1024))
+        big = b"x" * (1024 * 1024 + 1)
         resp = client.post(BASE, files={"file": ("big.md", big, "text/markdown")})
         assert resp.json()["status_code"] == 11052
 

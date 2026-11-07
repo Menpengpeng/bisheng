@@ -1,5 +1,3 @@
-import type { ReactNode } from "react";
-
 import { darkContext } from "@/contexts/darkContext";
 import { locationContext } from "@/contexts/locationContext";
 import { userContext } from "@/contexts/userContext";
@@ -9,6 +7,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/layout/HeaderMenu", () => ({
   default: () => <div data-testid="header-menu" />,
+  HeaderMenu: () => <div data-testid="header-menu" />,
 }));
 
 vi.mock("@/components/bs-icons", () => {
@@ -40,34 +39,11 @@ vi.mock("@/components/bs-icons/menu/system", () => ({
   DashboardIcon: () => <span aria-hidden="true" />,
 }));
 
-vi.mock("@/components/bs-ui/select/hover", () => ({
-  SelectHover: ({ triagger, children }: { triagger: ReactNode; children: ReactNode }) => (
-    <div>
-      {triagger}
-      <div>{children}</div>
-    </div>
-  ),
-  SelectHoverItem: ({ children, onClick }: { children: ReactNode; onClick?: () => void }) => (
-    <button type="button" onClick={onClick}>
-      {children}
-    </button>
-  ),
-}));
-
 vi.mock("@/components/bs-ui/separator", () => ({
   Separator: () => null,
 }));
 
-vi.mock("@/components/bs-ui/tooltip", () => ({
-  Tooltip: ({ children }: { children: ReactNode }) => <>{children}</>,
-  TooltipContent: ({ children }: { children: ReactNode }) => <>{children}</>,
-  TooltipProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
-  TooltipTrigger: ({ children, ...props }: { children: ReactNode } & Record<string, unknown>) => (
-    <button type="button" {...props}>
-      {children}
-    </button>
-  ),
-}));
+
 
 vi.mock("@/components/bs-ui/alertDialog/useConfirm", () => ({
   bsConfirm: vi.fn(),
@@ -81,8 +57,16 @@ vi.mock("@/controllers/API/tenant", () => ({
   getUserTenantsApi: vi.fn(),
 }));
 
-vi.mock("@/controllers/request", () => ({
+vi.mock("@/controllers/request", async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/controllers/request')>(),
   captureAndAlertRequestErrorHoc: vi.fn((promise: Promise<unknown>) => Promise.resolve(promise)),
+}));
+
+vi.mock("@/hooks/useDshBrowserConfig", () => ({
+  useDshBrowserConfig: () => ({
+    config: { management_enabled: true, enabled: true },
+    failed: false,
+  }),
 }));
 
 beforeAll(() => {
@@ -109,7 +93,10 @@ const baseUser = {
   leaf_tenant_name: "华东子公司",
 };
 
-function renderLayout(userOverrides: Record<string, unknown> = {}) {
+function renderLayout(
+  userOverrides: Record<string, unknown> = {},
+  appConfigOverrides: Record<string, unknown> = {},
+) {
   return render(
     <darkContext.Provider value={{ dark: false, setDark: vi.fn() } as any}>
       <locationContext.Provider
@@ -124,7 +111,11 @@ function renderLayout(userOverrides: Record<string, unknown> = {}) {
           setExtraNavigation: vi.fn(),
           extraComponent: null,
           setExtraComponent: vi.fn(),
-          appConfig: { multiTenantEnabled: true, noFace: true },
+          appConfig: {
+            multiTenantEnabled: true,
+            noFace: true,
+            ...appConfigOverrides,
+          },
           reloadConfig: vi.fn(),
         } as any}
       >
@@ -174,7 +165,8 @@ describe("MainLayout identity-specific navigation", () => {
     ]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
-    expect(screen.queryByText("tenant.management")).toBeNull();
+    expect(screen.getByRole("link", { name: "menu.dshDesktop" })).toBeInTheDocument();
+    expect(screen.queryByText("menu.tenant")).toBeNull();
   });
 
   it("department admin sees system but not unassigned business menus", () => {
@@ -184,6 +176,7 @@ describe("MainLayout identity-specific navigation", () => {
     });
 
     expect(screen.getByText("menu.system")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "menu.dshDesktop" })).toBeNull();
     expect(screen.queryByText("menu.dataset")).toBeNull();
     expect(screen.queryByText("menu.skills")).toBeNull();
     expect(screen.queryByText("menu.knowledge")).toBeNull();
@@ -202,12 +195,35 @@ describe("MainLayout identity-specific navigation", () => {
   it("plain user without any admin flag sees neither system nor tenant management", () => {
     renderLayout();
     expect(screen.queryByText("menu.system")).toBeNull();
-    expect(screen.queryByText("tenant.management")).toBeNull();
+    expect(screen.queryByRole("link", { name: "menu.dshDesktop" })).toBeNull();
+    expect(screen.queryByText("menu.tenant")).toBeNull();
   });
 
   it("global super admin still sees both system and tenant management entries", () => {
     renderLayout({ role: "admin" });
     expect(screen.getByText("menu.system")).toBeInTheDocument();
-    expect(screen.getByText("tenant.management")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "menu.dshDesktop" })).toBeInTheDocument();
+    expect(screen.getByText("menu.tenant")).toBeInTheDocument();
+  });
+
+  it("aligns the DSH icon column with adjacent menus and distributes the label across three em", () => {
+    renderLayout({ role: "admin" });
+    const link = screen.getByRole("link", { name: "menu.dshDesktop" });
+    const modelLink = screen.getByRole("link", { name: "menu.models" });
+    expect(link).toHaveAttribute("href", "/dsh");
+    expect(link).toHaveClass("inline-flex", "items-center", "px-6", "w-full", "h-12");
+    expect(modelLink).toHaveClass("inline-flex", "px-6", "w-full", "h-12");
+    expect(link.querySelector("svg")).toHaveClass("h-4", "w-4", "mr-2", "shrink-0");
+    const label = link.querySelector("span[aria-hidden='true']");
+    expect(label).toHaveClass("mx-[14px]", "inline-flex", "w-[3em]", "justify-between", "text-sm");
+    expect(screen.getByText("menu.models")).toHaveClass("mx-[14px]");
+    expect(label?.textContent).toBe("menu.dshDesktop");
+  });
+
+  it("keeps single-tenant organization naming inside system management", () => {
+    renderLayout({ role: "admin" }, { multiTenantEnabled: false });
+    expect(screen.getByText("menu.system")).toBeInTheDocument();
+    expect(screen.queryByText("tenant.profile")).toBeNull();
+    expect(screen.queryByText("menu.tenant")).toBeNull();
   });
 });

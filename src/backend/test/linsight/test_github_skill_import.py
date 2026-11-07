@@ -25,9 +25,8 @@ from bisheng.linsight.domain.services.github_skill_fetcher import (
     fetch_skill_files,
     parse_github_url,
 )
+from bisheng.linsight.domain.services.skill_store import SKILL_MD, SkillStore
 from test.linsight.fixtures.fake_minio import FakeMinioStorage
-
-from bisheng.linsight.domain.services.skill_store import MAX_UNPACKED_SIZE, SKILL_MD, SkillStore
 
 TENANT = 1
 USER = 7
@@ -176,13 +175,16 @@ class TestFetchSkillFiles:
             await fetch_skill_files(GithubTarget("o", "r", "main", "skills/demo"))
 
     async def test_oversize_rejected(self, monkeypatch):
+        # The cumulative download is held to the configured unpacked cap.
+        monkeypatch.setattr(fetcher_module, "resolve_skill_unpacked_limit", AsyncMock(return_value=1024))
+
         def handler(url, params=None):
             return _FakeResponse(
                 json_data=[
                     {
                         "name": "SKILL.md",
                         "type": "file",
-                        "size": MAX_UNPACKED_SIZE + 1,
+                        "size": 1024 + 1,
                         "download_url": f"{RAW}/SKILL.md",
                     },
                 ]
@@ -237,12 +239,22 @@ class _FakeSkillDao:
         return skill
 
     @classmethod
-    async def get_by_name(cls, name):
-        return cls.rows.get(name)
+    async def get_by_name(cls, name, owner_user_id=0, **kwargs):
+        row = cls.rows.get(name)
+        if row is not None and getattr(row, "owner_user_id", 0) != owner_user_id:
+            return None
+        return row
 
     @classmethod
-    async def get_by_display_name(cls, display_name):
-        return next((s for s in cls.rows.values() if s.display_name == display_name), None)
+    async def get_by_display_name(cls, display_name, owner_user_id=0, **kwargs):
+        return next(
+            (
+                s
+                for s in cls.rows.values()
+                if s.display_name == display_name and getattr(s, "owner_user_id", 0) == owner_user_id
+            ),
+            None,
+        )
 
 
 @pytest.fixture

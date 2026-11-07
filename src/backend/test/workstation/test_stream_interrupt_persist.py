@@ -70,6 +70,10 @@ def stream_env(monkeypatch: pytest.MonkeyPatch):
         AsyncMock(return_value=(ws_config, conversation, message, _LLM(), model_info, False)),
     )
     monkeypatch.setattr(chat_service, "_resolve_user_kb_selection", AsyncMock(return_value=[]))
+    # Image viewing reads its model config from the DB; off for these tests.
+    monkeypatch.setattr("bisheng.common.image_view.loop.image_view_configured", AsyncMock(return_value=False))
+    # The citation handle table lives in Redis; start each turn with an empty one.
+    monkeypatch.setattr(chat_service.DailyCitationScope, "load", AsyncMock(return_value=None))
     monkeypatch.setattr(chat_service, "_prepare_tools", AsyncMock(return_value=([], [])))
     monkeypatch.setattr(chat_service, "_process_agent_files", AsyncMock(return_value=("", [], [])))
     monkeypatch.setattr(chat_service, "_get_history_max_tokens", AsyncMock(return_value=4096))
@@ -94,6 +98,16 @@ def stream_env(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(chat_service.ChatMessageDao, "insert_one", MagicMock(side_effect=_record))
     monkeypatch.setattr(chat_service.ChatMessageDao, "ainsert_one", AsyncMock(side_effect=_record))
+    monkeypatch.setattr(
+        chat_service.SensitiveWordPolicyService,
+        "evaluate_workbench_user_text",
+        staticmethod(lambda *_a, **_k: None),
+    )
+    monkeypatch.setattr(
+        chat_service.SensitiveWordPolicyService,
+        "is_workbench_content_safety_active",
+        staticmethod(lambda *_a, **_k: False),
+    )
 
     return SimpleNamespace(inserted=inserted, state=state)
 
@@ -166,3 +180,26 @@ async def test_interrupt_after_completion_does_not_double_insert(stream_env):
     await body_iterator.aclose()
 
     assert len(_answer_rows(stream_env.inserted)) == 1
+
+
+@pytest.mark.parametrize("error_type", ["file_parse_failed", "file_parse_busy"])
+async def test_attachment_parse_failure_ends_stream_without_calling_model(stream_env, monkeypatch, error_type):
+    from bisheng.common.errcode.workstation import ChatFileParseError
+
+    monkeypatch.setattr(
+        chat_service,
+        "_process_agent_files",
+        AsyncMock(
+            side_effect=ChatFileParseError(error_type=error_type, filename="photo.png", detail="photo.png: OCR failed")
+        ),
+    )
+    stream_env.state["chunks"] = ["The model must not receive this image"]
+    chunks = await _drain(await chat_service._agent_stream_chat_completion(MagicMock(), _data(), MagicMock()))
+    output = "".join(chunks)
+    assert '"status_code": 12047' in output
+    assert error_type in output
+    assert '"final": true' in output
+    assert "The model must not receive this image" not in output
+    rows = _answer_rows(stream_env.inserted)
+    assert len(rows) == 1
+    assert json.loads(rows[0].extra)["error"] is True

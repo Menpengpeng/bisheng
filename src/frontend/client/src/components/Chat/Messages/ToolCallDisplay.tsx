@@ -33,7 +33,7 @@ function classifyToolType(tc: AgentToolCall): "knowledge" | "web" | "tool" {
     // Heuristics for legacy rows / server variants:
     const name = (tc.tool_name || "").toLowerCase();
     if (name.includes("knowledge") || name.includes("kb")) return "knowledge";
-    if (name === "web_search" || name.includes("search")) return "web";
+    if (name === "web_search" || name === "web_fetch" || name.includes("search")) return "web";
     return "tool";
 }
 
@@ -42,6 +42,8 @@ function classifyToolType(tc: AgentToolCall): "knowledge" | "web" | "tool" {
 const BUILTIN_TOOL_I18N: Record<string, string> = {
     search_knowledge_bases: "com_tools_knowledge_search",
     web_search: "com_tools_web_search",
+    web_fetch: "com_tools_web_fetch",
+    read_skill_file: "skillReference.readFile",
 };
 
 function resolveToolName(
@@ -69,7 +71,7 @@ function parseResults(raw: any): any[] {
     return [{ text: String(raw) }];
 }
 
-function extractChipLabel(item: any, variant: string): string {
+function extractChipLabel(item: any, variant: string, localize: ReturnType<typeof useLocalize>): string {
     if (!item) return "";
     if (typeof item === "string") {
         return item.slice(0, 24);
@@ -79,7 +81,7 @@ function extractChipLabel(item: any, variant: string): string {
             item.title ||
             item.name ||
             item.source ||
-            (item.url ? safeHostname(item.url) : "网页")
+            (item.url ? safeHostname(item.url) : localize("com_tools_web_page_fallback"))
         )
             .toString()
             .slice(0, 24);
@@ -93,7 +95,7 @@ function extractChipLabel(item: any, variant: string): string {
         item.output ||
         item.result ||
         item.value ||
-        "结果";
+        localize("com_tools_result_fallback");
     return String(value).slice(0, 48);
 }
 
@@ -114,11 +116,11 @@ const WebResultChip: FC<{ item: any; chip: string }> = ({ item, chip }) => {
 
     const content = (
         <span
-            className="inline-flex items-center gap-1 rounded-sm bg-[#F7F7F7] px-2 py-[2px] text-xs leading-5 text-[#1D2129]"
+            className="inline-flex items-center gap-1 rounded-[4px] bg-[#F7F7F7] px-2 py-[2px] text-xs leading-5 text-text-1"
             title={chip}
         >
             {showFavicon ? (
-                <span className="flex size-4 shrink-0 items-center justify-center overflow-hidden rounded-full border-[0.5px] border-[#ECECEC] bg-white">
+                <span className="flex size-4 shrink-0 items-center justify-center overflow-hidden rounded-full border-[0.5px] border-border-base bg-white">
                     <img
                         src={`https://${host}/favicon.ico`}
                         alt=""
@@ -171,6 +173,7 @@ function normaliseWebResults(items: any[]): any[] {
  */
 function normaliseKnowledgeResults(
     items: any[],
+    localize: ReturnType<typeof useLocalize>,
 ): { id: string; name: string; error?: string }[] {
     const seen = new Map<string, { id: string; name: string; error?: string }>();
     const order: string[] = [];
@@ -204,7 +207,7 @@ function normaliseKnowledgeResults(
                 return "";
             })()
             : name;
-        const finalName = fallbackName || "知识库";
+        const finalName = fallbackName || localize("com_tools_knowledge_base_fallback");
         const key = id || finalName;
         const existing = seen.get(key);
         if (existing) {
@@ -225,13 +228,13 @@ function normaliseKnowledgeResults(
 
 const variantStyles = {
     knowledge: {
-        icon: <Outlined.BookOpenText size={16} className="shrink-0 text-[#999999]" />,
+        icon: <Outlined.BookOpenText size={16} className="shrink-0 text-text-3" />,
     },
     web: {
-        icon: <Outlined.Earth size={16} className="shrink-0 text-[#999999]" />,
+        icon: <Outlined.Earth size={16} className="shrink-0 text-text-3" />,
     },
     tool: {
-        icon: <Outlined.Hammer size={16} className="shrink-0 text-[#999999]" />,
+        icon: <Outlined.Hammer size={16} className="shrink-0 text-text-3" />,
     },
 } as const;
 
@@ -244,7 +247,7 @@ const ToolCallDisplay: FC<ToolCallDisplayProps> = memo(({ toolCall, showConnecto
     //   web       → dedupe by hostname, default expanded
     //   tool      → no result list; pill only conveys "已使用 {name}"
     const knowledgeChips =
-        variant === "knowledge" ? normaliseKnowledgeResults(rawResults) : [];
+        variant === "knowledge" ? normaliseKnowledgeResults(rawResults, localize) : [];
     const webResults = variant === "web" ? normaliseWebResults(rawResults) : [];
     const resultCount =
         variant === "knowledge"
@@ -254,19 +257,15 @@ const ToolCallDisplay: FC<ToolCallDisplayProps> = memo(({ toolCall, showConnecto
                 : 0;
     const name = resolveToolName(toolCall, localize);
     const label = (() => {
-        if (variant === "knowledge") {
-            if (toolCall.inflight) return "正在检索知识";
-            if (toolCall.error) return "检索知识失败";
-            return "已检索知识";
-        }
-        if (variant === "web") {
-            if (toolCall.inflight) return "正在联网搜索";
-            if (toolCall.error) return "联网搜索失败";
-            return "已联网搜索";
-        }
-        if (toolCall.inflight) return `正在调用 ${name}`;
-        if (toolCall.error) return `${name} 失败`;
-        return `已使用 ${name}`;
+        // web_fetch shares the web card but reads one page instead of searching.
+        const phase =
+            variant === "knowledge"
+                ? "knowledge"
+                : variant === "web"
+                    ? ((toolCall.tool_name || "").toLowerCase() === "web_fetch" ? "web_fetch" : "web_search")
+                    : "tool";
+        const state = toolCall.inflight ? "running" : toolCall.error ? "failed" : "done";
+        return localize(`com_tools_state_${phase}_${state}`, { name });
     })();
     const style = variantStyles[variant];
     // Panel only renders when there is actual content: errors, or finished
@@ -322,8 +321,8 @@ const ToolCallDisplay: FC<ToolCallDisplayProps> = memo(({ toolCall, showConnecto
                     onClick={hasDetails && !toolCall.inflight ? () => setExpanded((v) => !v) : undefined}
                     disabled={!hasDetails || toolCall.inflight}
                     className={cn(
-                        "group flex w-fit max-w-full items-center gap-1 text-sm leading-[22px] text-[#999999]",
-                        hasDetails && !toolCall.inflight && "transition-colors hover:text-[#212121]",
+                        "group flex w-fit max-w-full items-center gap-1 text-sm leading-[22px] text-text-3",
+                        hasDetails && !toolCall.inflight && "transition-colors hover:text-text-1",
                         toolCall.inflight && "animate-pulse",
                     )}
                 >
@@ -364,9 +363,9 @@ const ToolCallDisplay: FC<ToolCallDisplayProps> = memo(({ toolCall, showConnecto
                                             "inline-flex items-center gap-1 rounded-sm px-2 py-[2px] text-xs leading-5",
                                             kb.error
                                                 ? "bg-red-50 text-red-600 dark:bg-red-950/30 dark:text-red-300"
-                                                : "bg-[#F7F7F7] text-[#1D2129]",
+                                                : "bg-[#F7F7F7] text-text-1",
                                         )}
-                                        title={kb.error ? `${kb.name} 检索失败：${kb.error}` : kb.name}
+                                        title={kb.error ? localize("com_tools_knowledge_base_search_failed", { name: kb.name, error: kb.error }) : kb.name}
                                     >
                                         {kb.error ? (
                                             <AlertCircle className="size-[14px] shrink-0 text-red-500" />
@@ -385,7 +384,7 @@ const ToolCallDisplay: FC<ToolCallDisplayProps> = memo(({ toolCall, showConnecto
                                     <WebResultChip
                                         key={i}
                                         item={item}
-                                        chip={extractChipLabel(item, variant)}
+                                        chip={extractChipLabel(item, variant, localize)}
                                     />
                                 ))}
                             </div>

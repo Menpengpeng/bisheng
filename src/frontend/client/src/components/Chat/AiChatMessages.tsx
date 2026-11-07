@@ -22,6 +22,7 @@ import store from "~/store";
 import HeaderTitle from "./HeaderTitle";
 import { QueryKeys } from "~/types/chat";
 import type { ConversationData } from "~/types/chat/queries";
+import { useScrollOnUserMessage } from "~/hooks/useScrollOnUserMessage";
 
 interface AiChatMessagesProps {
     messages: ChatMessage[];
@@ -37,6 +38,7 @@ interface AiChatMessagesProps {
     hideHeaderTitle?: boolean;
     /** When true, renders messages as a flat list without tree/sibling navigation */
     flatMode?: boolean;
+    scrollOnUserMessage?: boolean;
     /** Knowledge space AI panel: full-width column, 14px body, gray user / borderless assistant */
     knowledgeChatLayout?: boolean;
     /** Show the export-session entry under assistant messages. The full homepage/task
@@ -44,6 +46,10 @@ interface AiChatMessagesProps {
         it off. Independent of knowledgeChatLayout (which is a layout-width flag and is
         true for the homepage chat too). */
     allowExport?: boolean;
+    /** F075: copying an answer also drops unresolved [Sn] citation handles.
+        Only the daily chat (and its share view) opts in; knowledge / channel
+        docks never produce handles and keep their copy text as is. */
+    stripCitationHandlesOnCopy?: boolean;
     /** Overrides empty-state line under the illustration (e.g. knowledge folder QA hint from parent) */
     emptyStateHint?: string;
     /** Overrides the empty-state illustration (defaults to the AI-home image).
@@ -83,6 +89,7 @@ function MessageTreeNode({
     onRegenerate,
     knowledgeChatLayout,
     allowExport,
+    stripCitationHandlesOnCopy,
     allowFeedback,
     onOpenCitationPanel,
     activeCitationMessageId,
@@ -96,6 +103,7 @@ function MessageTreeNode({
     onPreviewFile?: (file: ArtifactFile) => void;
     knowledgeChatLayout?: boolean;
     allowExport?: boolean;
+    stripCitationHandlesOnCopy?: boolean;
     allowFeedback?: boolean;
     onOpenCitationPanel?: (payload: CitationReferencesDesktopPayload) => void;
     activeCitationMessageId?: string | null;
@@ -142,6 +150,7 @@ function MessageTreeNode({
                 setSiblingIdx={setSiblingIdx}
                 knowledgeChatLayout={knowledgeChatLayout}
                 allowExport={allowExport}
+                stripCitationHandlesOnCopy={stripCitationHandlesOnCopy}
                 allowFeedback={allowFeedback}
                 onOpenCitationPanel={onOpenCitationPanel}
                 activeCitationMessageId={activeCitationMessageId}
@@ -157,6 +166,7 @@ function MessageTreeNode({
                     onRegenerate={onRegenerate}
                     knowledgeChatLayout={knowledgeChatLayout}
                     allowExport={allowExport}
+                    stripCitationHandlesOnCopy={stripCitationHandlesOnCopy}
                     allowFeedback={allowFeedback}
                     onOpenCitationPanel={onOpenCitationPanel}
                     activeCitationMessageId={activeCitationMessageId}
@@ -178,8 +188,10 @@ export default function AiChatMessages({
     hideShare = false,
     hideHeaderTitle = false,
     flatMode = false,
+    scrollOnUserMessage = false,
     knowledgeChatLayout = false,
     allowExport = false,
+    stripCitationHandlesOnCopy,
     emptyStateHint,
     emptyStateIllustration,
     contentWidthClassName,
@@ -285,6 +297,13 @@ export default function AiChatMessages({
         endRef.current?.scrollIntoView({ behavior: "smooth" });
     };
 
+    useScrollOnUserMessage(messages, conversationId, scrollOnUserMessage, () => {
+        isUserScrolledUp.current = false;
+        setShowScrollBtn(false);
+        const container = scrollRef.current;
+        container?.scrollTo({ top: container.scrollHeight, behavior: 'auto' });
+    });
+
     const hasMessages = messages.length > 0;
 
     // 点赞/点踩 is offered on every real chat surface; the read-only anonymous
@@ -365,7 +384,7 @@ export default function AiChatMessages({
                 (z-10) so it fades, but BELOW pinned sticky headers (z-20) — the
                 overflow container creates no stacking context, so a header's z-20
                 bubbles up to outrank this overlay and stays crisp. */}
-            <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-10 bg-gradient-to-b from-white to-transparent" />
+            <div className="dsh-chat-scroll-fade pointer-events-none absolute inset-x-0 top-0 z-10 h-10 bg-gradient-to-b from-white to-transparent" />
             <div
                 ref={(el) => {
                     scrollRef.current = el;
@@ -382,7 +401,7 @@ export default function AiChatMessages({
                 // specificity it would win on source order.
                 style={{ scrollbarGutter: "stable both-edges" }}
                 className={cn(
-                    "min-h-0 flex-1 overflow-y-auto scrollbar-on-scroll",
+                    "dsh-chat-message-scroll min-h-0 flex-1 overflow-y-auto scrollbar-on-scroll",
                     hideHeaderTitle
                         ? "pt-2"
                         : isNarrowViewport
@@ -426,6 +445,7 @@ export default function AiChatMessages({
                                     }
                                     knowledgeChatLayout={knowledgeChatLayout}
                                     allowExport={allowExport}
+                                    stripCitationHandlesOnCopy={stripCitationHandlesOnCopy}
                                     allowFeedback={allowFeedback}
                                     onOpenCitationPanel={onOpenCitationPanel}
                                     activeCitationMessageId={activeCitationMessageId}
@@ -444,6 +464,7 @@ export default function AiChatMessages({
                                 onRegenerate={onRegenerate}
                                 knowledgeChatLayout={knowledgeChatLayout}
                                 allowExport={allowExport}
+                                stripCitationHandlesOnCopy={stripCitationHandlesOnCopy}
                                 allowFeedback={allowFeedback}
                                 onOpenCitationPanel={onOpenCitationPanel}
                                 activeCitationMessageId={activeCitationMessageId}

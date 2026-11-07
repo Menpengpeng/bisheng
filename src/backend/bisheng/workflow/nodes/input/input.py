@@ -1,7 +1,7 @@
 import copy
 import json
 import time
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -25,7 +25,7 @@ from bisheng.workflow.nodes.base import BaseNode
 from bisheng.workflow.nodes.input.const import InputFileMetadata
 
 
-class ParseModeEnum(str, Enum):
+class ParseModeEnum(StrEnum):
     KEEP_RAW = "keep_raw"
     EXTRACT_TEXT = "extract_text"
     INGEST_TO_KNOWLEDGE_BASE = "ingest_to_temp_kb"
@@ -143,7 +143,7 @@ class InputNode(BaseNode):
         if not isinstance(result, dict):
             return
         questions = []
-        for key, value in result.items():
+        for value in result.values():
             if isinstance(value, list):
                 questions = value
                 break
@@ -294,6 +294,26 @@ class InputNode(BaseNode):
         self.graph_state.save_context(content=f"{human_input}", msg_sender="human")
         return ret
 
+    @staticmethod
+    def temp_file_identity_metadata(file_name: str, workflow_id: str) -> dict:
+        """Per-file identity written into the temp knowledge base.
+
+        One UUID per file (not per input variable). Must not carry bbox / page /
+        chunk_index — those keys would overwrite the parser's output when the
+        chunk dict is updated with this identity.
+        """
+        now = int(time.time())
+        return {
+            "document_id": generate_uuid(),
+            "document_name": file_name,
+            "knowledge_id": workflow_id,
+            "upload_time": now,
+            "update_time": now,
+            "uploader": "",
+            "updater": "",
+            "user_metadata": {},
+        }
+
     def parse_log(self, unique_id: str, result: dict) -> Any:
         ret = []
         for k, v in result.items():
@@ -304,7 +324,7 @@ class InputNode(BaseNode):
             ret.append({"key": f"{self.id}.{k}", "value": v, "type": "variable"})
         return [ret]
 
-    def get_upload_file_path_content(self, file_url: str) -> (list, list):
+    def get_upload_file_path_content(self, file_url: str, *, split_for_retrieval: bool = True) -> (list, list):
         """
         params:
             file_url: upload to minio share url
@@ -318,11 +338,29 @@ class InputNode(BaseNode):
         metadatas = []
         try:
             file_rule = FileProcessBase(knowledge_id=0)
+            from bisheng.chat_session.domain.services.workflow_file_service import WorkflowFileService
             from bisheng.knowledge.rag.pipeline.types import PipelineConfig
             from bisheng.knowledge.rag.temp_file_pipeline import TempFilePipeline
 
+            callback = getattr(self, "callback_manager", None)
+            image_storage = WorkflowFileService.image_storage(
+                chat_id=getattr(callback, "chat_id", None),
+                user_id=self.user_id,
+                tenant_id=self.tenant_id or 1,
+                workflow_id=self.workflow_id,
+                run_id=getattr(callback, "unique_id", None) or self.exec_unique_id or generate_uuid(),
+                node_id=self.id,
+                source_url=file_url,
+                file_name=file_name,
+            )
+
             pipeline = TempFilePipeline(
-                invoke_user_id=self.user_id, local_file_path=filepath, file_name=file_name, file_rule=file_rule
+                invoke_user_id=self.user_id,
+                local_file_path=filepath,
+                file_name=file_name,
+                file_rule=file_rule,
+                split_for_retrieval=split_for_retrieval,
+                image_storage=image_storage,
             )
             result = pipeline.run(PipelineConfig())
 
@@ -380,8 +418,6 @@ class InputNode(BaseNode):
         if media_count > MAX_MEDIA_FILES_PER_VARIABLE:
             raise WorkflowMediaFileCountLimitError()
 
-        file_id = generate_uuid()
-
         file_content_length = 0
         for one_file_url in value:
             if not one_file_url:
@@ -391,19 +427,9 @@ class InputNode(BaseNode):
             file_name = unquote(url_obj.path.split("/")[-1])
             # get file original name
             file_name = KnowledgeService.get_upload_file_original_name(file_name)
-            all_metadata.append(
-                {
-                    "document_id": file_id,
-                    "document_name": file_name,
-                    "knowledge_id": self.workflow_id,
-                    "upload_time": int(time.time()),
-                    "update_time": int(time.time()),
-                    "uploader": "",
-                    "updater": "",
-                    "user_metadata": {},
-                    "bbox": "",  # Temporary files cannot be traced because the source files are not persisted
-                }
-            )
+            identity = self.temp_file_identity_metadata(file_name, self.workflow_id)
+            file_id = identity["document_id"]
+            all_metadata.append(identity)
 
             file_ext = file_name.split(".")[-1].lower()
             if file_ext in self._image_ext:
@@ -426,7 +452,9 @@ class InputNode(BaseNode):
             ):
                 continue
 
-            texts, metadatas = self.get_upload_file_path_content(one_file_url)
+            texts, metadatas = self.get_upload_file_path_content(
+                one_file_url, split_for_retrieval=ParseModeEnum.INGEST_TO_KNOWLEDGE_BASE.value in modes
+            )
             if file_content_length < file_content_max_size:
                 file_content = "\n".join(texts)
                 file_content = file_content[: file_content_max_size - file_content_length]
@@ -459,7 +487,11 @@ class InputNode(BaseNode):
             self._es_client.add_texts(texts=texts, metadatas=new_metadata)
 
             logger.debug(f"workflow_record_file_metadata file={key} file_name={file_name}")
-            all_metadata[-1] = new_metadata[0]
+            # Graph-state copy only: source_url is not in InputFileMetadata, so
+            # it never reaches Milvus/ES. Retrieval backfills it from here.
+            graph_meta = dict(new_metadata[0])
+            graph_meta["source_url"] = one_file_url
+            all_metadata[-1] = graph_meta
         # Documentation metadata, other nodes according to metadataData to retrieve corresponding files
         return {
             key_info["key"]: all_metadata,

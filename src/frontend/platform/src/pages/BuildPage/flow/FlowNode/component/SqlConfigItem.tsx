@@ -1,19 +1,18 @@
 // @ts-strict-ignore
-import { Input } from "@/components/bs-ui/input";
+import { Button, Input, Select, Switch, toast } from '@bisheng/ui';
+
 import { Label } from "@/components/bs-ui/label";
-import { Switch } from "@/components/bs-ui/switch";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/bs-ui/select";
-import { LoadButton } from "@/components/bs-ui/button";
-import { MultiSelect } from "@/components/bs-ui/multiSelect.tsx";
-import { toast } from "@/components/bs-ui/toast/use-toast";
+import { useSelectLabels } from "@/components/bs-comp/formFields/useSelectLabels";
+import { showApiError } from "@/controllers/request";
 import { getDbTables, refreshDbSchema } from "@/controllers/API/workflow";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 export default function SqlConfigItem({ data, onChange, onValidate }) {
     const { t } = useTranslation('flow');
+    const selectLabels = useSelectLabels();
     const [values, setValues] = useState(data.value);
-    const [errors, setErrors] = useState({});
+    const [errors, setErrors] = useState<Record<string, boolean>>({});
     // F043: tables fetched at config time and related UI state
     const [fetchedTables, setFetchedTables] = useState([]);
     const [hasFetched, setHasFetched] = useState(false);
@@ -147,10 +146,10 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
             // Keep the current selection untouched: selected tables that no
             // longer exist are flagged at the top instead of being dropped.
             if (res?.truncated) {
-                toast({ title: t("prompt"), variant: "info", description: t("dbTableListTruncated") });
+                toast.show({ type: "info", message: t("dbTableListTruncated") });
             }
         } catch (error) {
-            toast({ title: t("dbFetchTablesFailed"), variant: "error", description: error || "" });
+            showApiError(error);
         } finally {
             setTableLoading(false);
         }
@@ -167,13 +166,15 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
                 schema_cache_ttl,
             });
             const missing = res?.missing_tables || [];
-            toast({
-                title: t("dbRefreshCacheSuccess"),
-                variant: "success",
-                description: missing.length > 0 ? t("dbRefreshMissingHint", { count: missing.length }) : "",
+            toast.show({
+                type: "success",
+                message: [
+                    t("dbRefreshCacheSuccess"),
+                    missing.length > 0 ? t("dbRefreshMissingHint", { count: missing.length }) : "",
+                ].filter(Boolean).join("\n"),
             });
         } catch (error) {
-            toast({ title: t("dbRefreshCacheFailed"), variant: "error", description: error || "" });
+            showApiError(error);
         } finally {
             setRefreshing(false);
         }
@@ -214,80 +215,56 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
                     {/* 数据库类型下拉框 */}
                     <Label className="flex items-center bisheng-label">{t("dbType")}</Label>
                     <Select
-                        value={database_engine}
-                        onValueChange={(value) => handleChange("database_engine", value)}
-                    >
-                        <SelectTrigger className={`mt-2 mb-4 nodrag ${errors['database_engine'] ? "border-red-500" : ""}`}>
-                            <SelectValue placeholder={t("selectDbType")} />
-                        </SelectTrigger>
-                        <SelectContent>
-                            {DATABASE_OPTIONS.map((engine) => (
-                                <SelectItem key={engine} value={engine}>
-                                    {engine}
-                                </SelectItem>
-                            ))}
-                        </SelectContent>
-                    </Select>
+                        {...selectLabels}
+                        options={DATABASE_OPTIONS.map((engine) => ({ value: engine, label: engine }))}
+                        value={database_engine || null}
+                        onChange={(value) => handleChange("database_engine", value == null ? "" : String(value))}
+                        placeholder={t("selectDbType")}
+                        status={errors.database_engine ? "error" : "default"}
+                        aria-label={t("dbType")}
+                        className="nodrag mt-2 mb-4 w-full"
+                    />
 
                     {/* 数据库地址 */}
                     <Label className="flex items-center bisheng-label">{t("dbAddress")}</Label> {/* 数据库地址 */}
-                    <Input
-                        className={`mt-2 nodrag ${errors['db_address'] ? "border-red-500" : ""}`}
-                        value={db_address}
-                        type="text"
-                        onChange={(e) => handleChange("db_address", e.target.value)}
-                    />
+                    <Input value={db_address} type="text" onChange={(e) => handleChange("db_address", e.target.value)} className={`mt-2 nodrag ${errors.db_address ? "border-red-500" : ""}`} />
 
                     {/* 数据库名称 */}
                     <Label className="flex items-center bisheng-label mt-4">{t("dbName")}</Label> {/* 数据库名称 */}
-                    <Input
-                        className={`mt-2 nodrag ${errors['db_name'] ? "border-red-500" : ""}`}
-                        value={db_name}
-                        type="text"
-                        onChange={(e) => handleChange("db_name", e.target.value)}
-                    />
+                    <Input value={db_name} type="text" onChange={(e) => handleChange("db_name", e.target.value)} className={`mt-2 nodrag ${errors.db_name ? "border-red-500" : ""}`} />
 
                     {/* 数据库用户名 */}
                     <Label className="flex items-center bisheng-label mt-4">{t("dbUsername")}</Label> {/* 数据库用户名 */}
-                    <Input
-                        className={`mt-2 nodrag ${errors['db_username'] ? "border-red-500" : ""}`}
-                        value={db_username}
-                        type="text"
-                        onChange={(e) => handleChange("db_username", e.target.value)}
-                    />
+                    <Input value={db_username} type="text" onChange={(e) => handleChange("db_username", e.target.value)} className={`mt-2 nodrag ${errors.db_username ? "border-red-500" : ""}`} />
 
                     {/* 数据库密码 */}
                     <Label className="flex items-center bisheng-label mt-4">{t("dbPassword")}</Label> {/* 数据库密码 */}
-                    <Input
-                        className={`mt-2 nodrag ${errors['db_password'] ? "border-red-500" : ""}`}
-                        value={db_password}
-                        type="password"
-                        onChange={(e) => handleChange("db_password", e.target.value)}
-                    />
+                    <Input value={db_password} type="password" onChange={(e) => handleChange("db_password", e.target.value)} className={`mt-2 nodrag ${errors.db_password ? "border-red-500" : ""}`} />
 
                     {/* F043: table selection */}
                     <Label className="flex items-center bisheng-label mt-4">{t("dbSelectedTables")}</Label>
-                    <LoadButton
+                    <Button
                         type="button"
-                        variant="outline"
-                        size="sm"
+                        variant="outlined"
+                        size="small"
                         className="nodrag mt-2"
                         loading={tableLoading}
                         onClick={handleFetchTables}
                     >
                         {t("dbFetchTables")}
-                    </LoadButton>
-                    <MultiSelect
-                        triggerClassName="nodrag mt-2"
+                    </Button>
+                    <Select
+                        {...selectLabels}
+                        multiple
+                        showSearch
+                        allowClear
                         options={tableOptions}
                         value={selected_tables}
-                        multiple
-                        searchable
-                        clearable
+                        onChange={(val) => handleChange("selected_tables", val)}
                         placeholder={t("dbSelectTablesPlaceholder")}
-                        searchPlaceholder={t("dbSearchTablesPlaceholder")}
-                        emptyMessage={t("dbNoTables")}
-                        onValueChange={(val) => handleChange("selected_tables", val)}
+                        emptyText={t("dbNoTables")}
+                        aria-label={t("dbSelectedTables")}
+                        className="nodrag mt-2 w-full"
                     />
                     {missingTables.length > 0 && (
                         <p className="mt-1 text-xs text-destructive">{t("dbMissingTablesHint")}</p>
@@ -312,8 +289,8 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
                                     type="number"
                                     min={1}
                                     max={720}
-                                    boxClassName="w-24"
-                                    className="nodrag h-8 px-2"
+                                    size="small"
+                                    className="nodrag w-24"
                                     value={schema_cache_ttl}
                                     onChange={(e) => handleTtlChange(e.target.value)}
                                     onBlur={handleTtlBlur}
@@ -325,17 +302,17 @@ export default function SqlConfigItem({ data, onChange, onValidate }) {
                             <p className="mt-1 text-[11px] leading-tight text-muted-foreground">
                                 {t("dbCacheTtlHint")}
                             </p>
-                            <LoadButton
+                            <Button
                                 type="button"
-                                variant="outline"
-                                size="sm"
+                                variant="outlined"
+                                size="small"
                                 className="nodrag mt-2"
                                 loading={refreshing}
                                 disabled={selected_tables.length === 0}
                                 onClick={handleRefreshCache}
                             >
                                 {t("dbRefreshCache")}
-                            </LoadButton>
+                            </Button>
                         </>
                     )}
                 </>

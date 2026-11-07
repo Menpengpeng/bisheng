@@ -92,12 +92,32 @@ def get_env():
     env["version"] = __version__
     env["enable_etl4lm"] = image_parser_enabled
     env["multi_tenant_enabled"] = bisheng_settings.multi_tenant.enabled
+    # Open platform switch → platform appConfig.openPlatformEnabled (gates the
+    # local-dev-toolkit scopes and the connect-info panel only).
+    env["open_platform_enabled"] = bisheng_settings.open_platform.enabled
+    # F054: app-factory runtime layer switch → platform appConfig.appRuntimeEnabled
+    # / client BishengConfig.app_runtime_enabled. Anonymous read on purpose: the
+    # /apps/* entry has to answer "this environment has no app factory" before
+    # anyone is logged in (AC-30 / AC-62).
+    env["app_runtime_enabled"] = bisheng_settings.app_runtime.enabled
+    # Open API (beta2): personal-token feature switch + management-UI tab gate.
+    # Four sibling switches on purpose — each gates a different surface.
+    env["personal_token_enabled"] = bool(bisheng_settings.open_api.pat_enabled)
+    env["open_api_management_enabled"] = bool(bisheng_settings.open_api.management_ui_enabled)
     try:
-        workflow_auto_rerun_on_open = bisheng_settings.get_workflow_conf().auto_rerun_on_open
+        workflow_conf = bisheng_settings.get_workflow_conf()
+        workflow_auto_rerun_on_open = workflow_conf.auto_rerun_on_open
+        # Lets the builder mark a Code node as disabled up front, instead of the
+        # author finding out when the workflow fails at run time.
+        workflow_code_node_enabled = workflow_conf.code_node_enabled
     except Exception as exc:
-        logger.warning(f"Failed to load workflow auto-rerun config, using disabled: {exc}")
+        logger.warning(f"Failed to load workflow config, using disabled: {exc}")
         workflow_auto_rerun_on_open = False
-    env["workflow"] = {"auto_rerun_on_open": workflow_auto_rerun_on_open}
+        workflow_code_node_enabled = False
+    env["workflow"] = {
+        "auto_rerun_on_open": workflow_auto_rerun_on_open,
+        "code_node_enabled": workflow_code_node_enabled,
+    }
 
     # Expose knowledge-space version management flag so the client can toggle UI affordances.
     vm = getattr(bisheng_settings.get_knowledge(), "version_management", None)
@@ -121,14 +141,14 @@ def get_all_langchain_types_legacy():
     return resp_200({})
 
 
-@router.get("/config")
+@router.get("/settings")
 def get_config(admin_user: UserPayload = Depends(UserPayload.get_admin_user)):
     db_config = ConfigDao.get_config(ConfigKeyEnum.INIT_DB)
     config_str = db_config.value if db_config else ""
     return resp_200(config_str)
 
 
-@router.post("/config/save")
+@router.post("/settings/save")
 def save_config(data: dict, admin_user: UserPayload = Depends(UserPayload.get_admin_user)):
     if not data.get("data", "").strip():
         raise SystemConfigEmptyError()

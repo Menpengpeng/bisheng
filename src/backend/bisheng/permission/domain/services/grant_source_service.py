@@ -18,7 +18,9 @@ SOURCE_TYPES = frozenset(
         "DIRECT",
         "DEPARTMENT",
         "USER_GROUP",
+        "TENANT",
         "CREATOR",
+        "CREATOR_GRANT",
         "SPACE_MEMBERSHIP",
         "CHANNEL_MEMBERSHIP",
         "SNAPSHOT_FROM_PARENT",
@@ -124,11 +126,16 @@ class GrantSourceService:
 
         relation: str | None
         projected_subject: str
-        if normalized_subject_type == "user":
+        if normalized_subject_type in {"user", "service_account"}:
             if userset_relation is not None or include_children:
-                raise ValueError("direct user sources cannot use userset options")
+                raise ValueError("direct subjects cannot use userset options")
             relation = None
-            projected_subject = f"user:{normalized_subject_id}"
+            projected_subject = f"{normalized_subject_type}:{normalized_subject_id}"
+        elif normalized_subject_type == "tenant":
+            if userset_relation not in {None, "member"} or include_children:
+                raise ValueError("tenant grants use the member relation")
+            relation = "member"
+            projected_subject = f"tenant:{normalized_subject_id}#member"
         elif normalized_subject_type == "department":
             expected_relation = "subtree_member" if include_children else "member"
             if userset_relation not in {None, expected_relation}:
@@ -180,10 +187,12 @@ class GrantSourceService:
         subject_type: str,
     ) -> None:
         expected_subjects = {
-            "DIRECT": {"user"},
+            "DIRECT": {"user", "service_account"},
+            "TENANT": {"tenant"},
             "DEPARTMENT": {"department"},
             "USER_GROUP": {"user_group"},
             "CREATOR": {"user"},
+            "CREATOR_GRANT": {"service_account"},
         }
         expected = expected_subjects.get(source_type)
         if expected is not None and subject_type not in expected:
@@ -202,6 +211,9 @@ class GrantSourceService:
         if source_type == "DIRECT":
             ref = f"{subject_type}:{subject_id}"
             return f"direct:{ref}", ref
+        if source_type == "TENANT":
+            ref = f"tenant:{subject_id}#member"
+            return ref, ref
         if source_type == "DEPARTMENT":
             ref = f"{subject_id}#{relation}"
             return (
@@ -213,6 +225,7 @@ class GrantSourceService:
             return f"user_group:{ref}", ref
         prefixes = {
             "CREATOR": "creator",
+            "CREATOR_GRANT": "creator_grant",
             "SPACE_MEMBERSHIP": "space_membership",
             "CHANNEL_MEMBERSHIP": "channel_membership",
             "SNAPSHOT_FROM_PARENT": "snapshot",

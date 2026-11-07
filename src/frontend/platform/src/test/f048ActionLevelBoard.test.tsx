@@ -1,5 +1,5 @@
 import { ActionLevelBoard } from "@/pages/SystemPage/components/permission/ActionLevelBoard"
-import { fireEvent, render, screen, selectMenuOption, waitFor, within } from "@/test/test-utils"
+import { fireEvent, render, screen, selectOption, waitFor, within } from "@/test/test-utils"
 import userEvent from "@testing-library/user-event"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -92,7 +92,7 @@ describe("ActionLevelBoard", () => {
       />,
     )
 
-    await selectMenuOption("actionLevel.change.edit", 3)
+    await selectOption("actionLevel.change.edit", 3)
     expect(
       screen.getByTestId("action-level-zone-3"),
     ).toContainElement(screen.getByTestId("permission-action-edit"))
@@ -138,11 +138,11 @@ describe("ActionLevelBoard", () => {
       />,
     )
 
-    await selectMenuOption("actionLevel.change.visible", 3)
+    await selectOption("actionLevel.change.visible", 3)
     expect(screen.getByRole("status")).toBeInTheDocument()
 
     // Re-query: moving zones remounts the card, so the old node is detached.
-    await selectMenuOption("actionLevel.change.visible", 1)
+    await selectOption("actionLevel.change.visible", 1)
     expect(screen.queryByRole("status")).not.toBeInTheDocument()
     expect(
       screen.getByRole("button", { name: "actionLevel.publishChanges" }),
@@ -158,7 +158,7 @@ describe("ActionLevelBoard", () => {
       />,
     )
 
-    await selectMenuOption("actionLevel.change.edit", 3)
+    await selectOption("actionLevel.change.edit", 3)
     fireEvent.click(screen.getByLabelText("actionLevel.active.delete"))
     expect(screen.getByRole("status")).toBeInTheDocument()
 
@@ -183,7 +183,7 @@ describe("ActionLevelBoard", () => {
       />,
     )
 
-    await selectMenuOption("actionLevel.change.edit", 3)
+    await selectOption("actionLevel.change.edit", 3)
     fireEvent.click(
       screen.getByRole("button", { name: "actionLevel.publishChanges" }),
     )
@@ -206,7 +206,7 @@ describe("ActionLevelBoard", () => {
       />,
     )
 
-    await selectMenuOption("actionLevel.change.edit", 3)
+    await selectOption("actionLevel.change.edit", 3)
     fireEvent.click(
       screen.getByRole("button", { name: "actionLevel.publishChanges" }),
     )
@@ -217,9 +217,10 @@ describe("ActionLevelBoard", () => {
     expect(onReviewImpact).not.toHaveBeenCalled()
   })
 
-  it("shows resource scope on demand and the inactive marker on the card", async () => {
-    // The card carries only what the author scans for — name and on/off. The
-    // scope is one hover away rather than a row of chips on every card.
+  it("shows resource scope on the card and the inactive marker on the card", async () => {
+    // Scope used to be hover-only, which meant an admin who never hovered
+    // assumed every operation applied to every resource. It now sits on the
+    // card, in the row the level dropdown already occupies.
     render(
       <ActionLevelBoard
         actions={actions}
@@ -229,7 +230,8 @@ describe("ActionLevelBoard", () => {
     )
 
     const card = screen.getByTestId("permission-action-visible")
-    expect(card).not.toHaveTextContent("workflow")
+    expect(card).toHaveTextContent("resourceTypeName.workflow")
+    expect(card).toHaveTextContent("resourceTypeName.dashboard")
 
     await userEvent.hover(within(card).getByText("actionName.visible"))
     const tip = await screen.findByRole("tooltip")

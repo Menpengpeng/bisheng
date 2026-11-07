@@ -1,4 +1,5 @@
-from enum import Enum
+from datetime import datetime
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -27,7 +28,7 @@ class InitialPermissionApplyResult(BaseModel):
     message: str | None = None
 
 
-class SpaceSubscriptionStatusEnum(str, Enum):
+class SpaceSubscriptionStatusEnum(StrEnum):
     SUBSCRIBED = "subscribed"
     PENDING = "pending"
     REJECTED = "rejected"
@@ -38,6 +39,11 @@ class KnowledgeSpaceListItemResp(KnowledgeBase):
     """Lightweight knowledge-space list item without detail-only counters or metadata."""
 
     id: int = Field(..., description="Knowledge Space ID")
+    user_name: str = Field(default="", description="Knowledge Space creator name")
+    actions: list[str] | None = Field(
+        default=None,
+        description="Effective F048 actions the current identity holds on this space",
+    )
     is_pinned: bool = Field(default=False, description="Knowledge Space pinned by current user or not")
     is_followed: bool = Field(default=False, description="Knowledge Space followed by current user or not")
     subscription_status: SpaceSubscriptionStatusEnum = Field(
@@ -84,7 +90,11 @@ class KnowledgeSpaceInfoResp(KnowledgeBase):
     user_name: str = Field(default="", description="Knowledge Space creator name")
     actions: list[str] | None = Field(
         default=None,
-        description="Effective F048 actions the current identity holds on this space",
+        description=(
+            "On /info, an entry access hint only: ['visible'] for content access, "
+            "[] for preview-only access. Full actions come from the resource my-permissions endpoint. "
+            "Other space listings may leave this field unset."
+        ),
     )
     avatar: str | None = Field(default=None, description="Knowledge Space creator avatar")
     follower_num: int = Field(1, description="Follower Number")
@@ -250,6 +260,33 @@ class ChatFolderReq(ChatReq):
     folder_id: int = Field(default=0, description="Folder ID")
     chat_id: str = Field(..., description="Chat ID")
     tags: list[dict] | None = Field(None, description="List of Tag info for filtering")
+
+
+class KnowledgeChatSessionResponse(BaseModel):
+    """Public knowledge-chat session shape; excludes the internal entry override."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    chat_id: str
+    name: str | None = None
+    flow_id: str
+    flow_type: int
+    flow_name: str
+    flow_description: str | None = None
+    flow_logo: str | None = None
+    user_id: int
+    tenant_id: int | None = None
+    api_subject_type: str | None = None
+    api_subject_id: int | None = None
+    external_user_id: str | None = None
+    group_ids: list[int] | None = None
+    is_delete: bool | None = None
+    like: int | None = None
+    dislike: int | None = None
+    copied: int | None = None
+    sensitive_status: int
+    create_time: datetime | None = None
+    update_time: datetime | None = None
 
 
 class SubscribeSpaceResp(BaseModel):

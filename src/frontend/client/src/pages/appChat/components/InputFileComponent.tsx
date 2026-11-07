@@ -1,14 +1,31 @@
 // @ts-strict-ignore
+import type { WorkflowFileFieldProps } from '@bisheng/chat';
+import type { ReactNode } from 'react';
 
 import { FileSearch2, Loader2 } from "lucide-react";
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { bishengConfState } from "../store/atoms";
 import { useRecoilState } from "recoil";
 import { useToastContext } from "~/Providers";
 import { Button } from "~/components";
 import { uploadFile, uploadFileWithProgress } from "~/api/apps";
 import useLocalize from "~/hooks/useLocalize";
+import { normalizeSuffixList } from "../fileAcceptUtils";
 
+interface InputFileComponentProps {
+    renderControl?: (props: WorkflowFileFieldProps) => ReactNode;
+    value?: string;
+    onChange: (name: string) => void;
+    disabled?: boolean;
+    suffixes?: string | readonly string[];
+    fileTypes?: unknown;
+    placeholder?: string;
+    onFileChange: (value: unknown) => void;
+    editNode?: boolean;
+    isSSO?: boolean;
+    multiple?: boolean;
+    flow?: unknown;
+}
 export default function InputFileComponent({
     value,
     onChange,
@@ -20,8 +37,9 @@ export default function InputFileComponent({
     editNode = false,
     isSSO = false,
     multiple = false,
-    flow
-}) {
+    flow,
+    renderControl,
+}: InputFileComponentProps) {
     const t = useLocalize()
     const [myValue, setMyValue] = useState(value);
     const [loading, setLoading] = useState(false);
@@ -33,13 +51,17 @@ export default function InputFileComponent({
         }
     }, [disabled, onChange]);
 
+    // Two callers, two shapes. The skill form passes an array of extensions off
+    // the node template; the workflow form passes the already-joined accept
+    // string from fileAcceptToInputAccept(). The component used to call
+    // suffixes.join(",") unconditionally, which threw `join is not a function`
+    // on the workflow form — that, not the picker mechanics, is why its upload
+    // field did nothing. Normalize once so neither consumer has to care.
+    const suffixList = normalizeSuffixList(suffixes);
+    const acceptAttr = suffixList.join(",");
+
     function checkFileType(fileName: string): boolean {
-        for (let index = 0; index < suffixes.length; index++) {
-            if (fileName.endsWith(suffixes[index])) {
-                return true;
-            }
-        }
-        return false;
+        return suffixList.length === 0 || suffixList.some((suffix) => fileName.toLowerCase().endsWith(suffix.trim().toLowerCase()));
     }
 
     useEffect(() => {
@@ -58,34 +80,35 @@ export default function InputFileComponent({
         return ''
     }
 
+    // A real input rendered into the tree, opened through this ref. The previous
+    // version built a detached `display:none` input and called .click() on it —
+    // a node that is in no document and explicitly not displayed, which browsers
+    // are free to ignore, and did: the workflow form's upload field opened
+    // nothing at all. Every other file field in this app renders its input in
+    // JSX; this one now matches.
+    const inputRef = useRef<HTMLInputElement>(null);
+
     const handleButtonClick = () => {
-        if (multiple) return batchUpload()
-        // Create a file input element
-        const input = document.createElement("input");
-        input.type = "file";
-        input.accept = suffixes.join(",");
-        input.style.display = "none"; // Hidden from view
-        input.multiple = false; // Allow only one file selection
+        if (disabled) return;
+        inputRef.current?.click();
+    };
 
-        input.onchange = (e: Event) => {
-            setLoading(true);
+    const singleUpload = (file: File | undefined) => {
+        if (!file) return;
+        setLoading(true);
 
-            // Get the selected file
-            const file = (e.target as HTMLInputElement).files?.[0];
-
+        {
             const errorMsg = checkFileSize(file)
             if (errorMsg) {
-                showToast({ message: errorMsg, status: 'error' });
+                showToast({ message: errorMsg, status: 'warning' });
 
                 return setLoading(false);
             }
-            // Check if the file type is correct
-            // if (file && checkFileType(file.name)) {
-            // Upload the file
+            // Types are validated by the picker handler before an upload starts.
             isSSO ? uploadFileWithProgress(file, (progress) => { }).then(res => {
                 setLoading(false);
                 
-                if (typeof res === 'string') return showToast({ message: res, status: 'error' });
+                if (typeof res === 'string') return showToast({ message: res, status: 'warning' });
                 const { file_path } = res;
                 setMyValue(file.name);
                 onChange(file.name);
@@ -109,34 +132,12 @@ export default function InputFileComponent({
                     console.error("Error occurred while uploading file");
                     setLoading(false);
                 });
-            // } else {
-            //   // Show an error if the file type is not allowed
-            //   setErrorData({
-            //     title:
-            //       "请选择有效文件。只允许使用这些文件类型：",
-            //     list: fileTypes,
-            //   });
-            //   setLoading(false);
-            // }
-        };
-
-        // Trigger the file selection dialog
-        input.click();
+        }
     };
 
-    const batchUpload = () => {
-        // Create a file input element
-        const input = document.createElement("input");
-        input.type = "file";
-        input.accept = suffixes.join(",");
-        input.style.display = "none"; // Hidden from view
-        input.multiple = true; // Allow multiple file selection
-
-        input.onchange = (e: Event) => {
+    const batchUpload = (_files: readonly File[] | null) => {
+        {
             setLoading(true);
-
-            // Get the selected files
-            const _files = (e.target as HTMLInputElement).files;
 
             if (_files && _files.length > 0) {
                 const filePaths = []; // This will hold the file paths after successful upload
@@ -149,10 +150,10 @@ export default function InputFileComponent({
                 }
 
                 if (errorMsgs.length) {
-                    showToast({ message: errorMsgs.join('\n'), status: 'error' });
+                    showToast({ message: errorMsgs.join('\n'), status: 'warning' });
 
 
-                    // 文件都不符合要求 结束上传
+                    // Stop when every selected file exceeds the size limit.
                     if (errorMsgs.length === _files.length) {
                         return setLoading(false);
                     }
@@ -167,7 +168,7 @@ export default function InputFileComponent({
                             .then(res => {
                                 if (typeof res === 'string') {
                                     // setErrorData({ title: "Error", list: [res] });
-                                    showToast({ message: res, status: 'error' });
+                                    showToast({ message: res, status: 'warning' });
 
                                     setLoading(false);
                                     throw new Error(res); // Exit the upload if error occurs
@@ -195,20 +196,47 @@ export default function InputFileComponent({
                         setLoading(false); // Hide loading state if an error occurs
                     });
             } else {
-                showToast({ message: t('com_inputfile_no_file_selected'), status: 'error' });
+                showToast({ message: t('com_inputfile_no_file_selected'), status: 'warning' });
 
                 setLoading(false); // Hide loading state if no files were selected
             }
-        };
-
-        // Trigger the file selection dialog
-        input.click();
+        }
     };
 
+    const handleFilesPicked = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const picked = Array.from(event.target.files ?? []);
+        // Snapshot the files before resetting the picker, including rejected selections.
+        event.target.value = "";
+        if (disabled || loading || !picked.length) return;
+        const allowed = picked.filter(file => checkFileType(file.name));
+        if (allowed.length !== picked.length) {
+            showToast({ message: t('com_ui_upload_file_type_error'), status: 'warning' });
+        }
+        if (!allowed.length) return;
+        if (multiple) {
+            batchUpload(allowed);
+        } else {
+            singleUpload(allowed[0]);
+        }
+    };
 
+    if (renderControl) return <>
+        <input ref={inputRef} type="file" className="hidden" accept={acceptAttr} multiple={multiple}
+            disabled={disabled || loading} onChange={handleFilesPicked} />
+        {renderControl({ value: myValue, placeholder, disabled, loading, onClick: handleButtonClick })}
+    </>;
 
     return (
         <div className={disabled ? "input-component-div" : "w-full"}>
+            <input
+                ref={inputRef}
+                type="file"
+                className="hidden"
+                accept={acceptAttr}
+                multiple={multiple}
+                disabled={disabled}
+                onChange={handleFilesPicked}
+            />
             <div className="input-file-component flex items-center gap-2 border bg-search-input rounded-md px-2 justify-between">
                 <span
                     onClick={handleButtonClick}

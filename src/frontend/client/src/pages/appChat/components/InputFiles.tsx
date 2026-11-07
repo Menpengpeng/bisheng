@@ -207,17 +207,19 @@ const InputFiles = forwardRef(({ v, showVoice, accepts, disabled = false, size, 
                 seenPaths.add(relativePath);
                 validFiles.push({ id: generateUUID(6), file, relativePath });
             } else {
-                invalidFiles.push({ id: generateUUID(6), file });
+                // Carry the limit that actually rejected this file: media and
+                // documents have different ceilings, and both are configurable.
+                invalidFiles.push({ id: generateUUID(6), file, maxMB: Math.floor(maxBytes / 1024 / 1024) });
             }
         });
 
         if (existingMediaCount + incomingMediaCount > MAX_MEDIA_FILES) {
-            showToast({ message: t('com_chat.media_file_too_many'), status: 'error' });
+            showToast({ message: t('com_chat.media_file_too_many'), status: 'warning' });
             return;
         }
 
         if (invalidTypeFiles.length > 0) {
-            showToast({ message: t('com_ui_upload_file_type_error'), status: 'error' }); // 请确保你有对应多语言key或直接写死中文测试
+            showToast({ message: t('com_ui_upload_file_type_error'), status: 'warning' }); // 请确保你有对应多语言key或直接写死中文测试
         }
         // Notify about skipped duplicates
         if (duplicateFiles.length > 0) {
@@ -228,8 +230,11 @@ const InputFiles = forwardRef(({ v, showVoice, accepts, disabled = false, size, 
             invalidFiles.map(file =>
                 showToast({
                     message: isMediaFileName(file.file.name)
-                        ? t('com_chat.media_file_too_large')
-                        : t('com_inputfiles_exceed_limit', { 0: file.file.name, 1: size }),
+                        // The ceiling comes from uploaded_media_maximum_size, so the
+                        // message has to quote what was actually enforced — it read
+                        // "1024M" to everyone, whatever the deployment allowed.
+                        ? t('com_chat.media_file_too_large', { 0: file.maxMB })
+                        : t('com_inputfiles_exceed_limit', { 0: file.file.name, 1: file.maxMB ?? size }),
                     status: 'info',
                 })
             )
@@ -419,7 +424,7 @@ const InputFiles = forwardRef(({ v, showVoice, accepts, disabled = false, size, 
                 }
                 logUploadStage(file.name, 'failed', uploadStartedAt, { error: String(e) });
                 console.log('e :>> ', e);
-                showToast({ message: t('com_inputfiles_upload_failed', { 0: file.name }), status: 'error' })
+                showToast({ message: t('com_inputfiles_upload_failed', { 0: file.name }), status: 'warning' })
                 handleFileRemove(id);
                 remainingUploadsRef.current -= 1; // Decrease the remaining uploads count
                 notifyUploadedFiles(getUploadedFileIds, onChange);
@@ -464,7 +469,7 @@ const InputFiles = forwardRef(({ v, showVoice, accepts, disabled = false, size, 
         const skipped = visible.length - supported.length;
 
         if (!supported.length) {
-            showToast({ message: t('com_ui_upload_file_type_error'), status: 'error' });
+            showToast({ message: t('com_ui_upload_file_type_error'), status: 'warning' });
             return;
         }
         if (skipped > 0) {
@@ -478,7 +483,7 @@ const InputFiles = forwardRef(({ v, showVoice, accepts, disabled = false, size, 
                 : rejection === 'size'
                     ? t('com_folder_upload_too_large')
                     : t('com_folder_upload_too_deep', { 0: TASK_MODE_MAX_FOLDER_DEPTH });
-            showToast({ message, status: 'error' });
+            showToast({ message, status: 'warning' });
             return;
         }
         handleFileChange(supported);
@@ -692,7 +697,7 @@ const InputFiles = forwardRef(({ v, showVoice, accepts, disabled = false, size, 
     };
 
     return (
-        <div className="">
+        <div hidden={hideTrigger && hideList}>
             {/* Displaying files */}
             {!hideList && !!files.length && (
                 <div className="flex max-w-full gap-2 overflow-x-auto overflow-y-hidden p-2 pb-3">

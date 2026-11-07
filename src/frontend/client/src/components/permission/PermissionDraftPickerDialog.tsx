@@ -1,15 +1,15 @@
-import { Button } from "@bisheng/ui";
+import { SubjectSelectionSummary } from "./SubjectSelectionSummary";
+import { Button, Radio, RadioGroup } from "@bisheng/ui";
 import type { ComponentProps } from "react";
 import { useEffect, useMemo, useState } from "react";
 import type { ResourceType, SelectedSubject, SubjectType } from "~/api/permission";
-import { Checkbox } from "~/components/ui/Checkbox";
+import { Checkbox } from '@bisheng/ui';
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from "~/components/ui/Dialog";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "~/components/ui/Tabs";
 import { useLocalize } from "~/hooks";
 import { cn } from "~/utils";
 import {
@@ -18,8 +18,6 @@ import {
   PERMISSION_DIALOG_CONTENT_CLASS,
   PERMISSION_FOOTER_ACTIONS_CLASS,
   PERMISSION_FOOTER_LABEL_CLASS,
-  SUBJECT_TAB_LIST_CLASS,
-  SUBJECT_TAB_TRIGGER_CLASS,
 } from "./permissionDialogStyles";
 import { RelationSelect, type RelationModelOption } from "./RelationSelect";
 import { SubjectSearchDepartment } from "./SubjectSearchDepartment";
@@ -41,6 +39,7 @@ export interface PermissionDraftPickerDialogProps {
   resourceType: ResourceType;
   resourceId?: string;
   disabledIds: Record<SubjectType, number[]>;
+  disabledDepartmentSubtreeRootIds?: number[];
   relationModels: RelationModelOption[];
   canAddNonUserSubjects: boolean;
   onConfirm: (rows: PermissionDraftRow[]) => void;
@@ -54,6 +53,7 @@ export function PermissionDraftPickerDialog({
   resourceType,
   resourceId,
   disabledIds,
+  disabledDepartmentSubtreeRootIds = [],
   relationModels,
   canAddNonUserSubjects,
   onConfirm,
@@ -80,9 +80,6 @@ export function PermissionDraftPickerDialog({
 
   const handleSubjectTypeChange = (value: string) => {
     setSubjectType(value as SubjectType);
-    setSubjects([]);
-    setIncludeChildren(true);
-    setSelectedModelId("");
   };
 
   const handleConfirm = () => {
@@ -91,6 +88,8 @@ export function PermissionDraftPickerDialog({
       subjectType: subject.type,
       subjectId: subject.id,
       subjectName: subject.name,
+      externalId: subject.externalId,
+      departmentPath: subject.departmentPath,
       modelKey: activeModel.id,
       modelName: activeModel.name,
       modelLevel: activeModel.level,
@@ -116,35 +115,34 @@ export function PermissionDraftPickerDialog({
             {localize("com_unified_permission.add_authorization")}
           </DialogTitle>
         </DialogHeader>
-        <Tabs
-          value={subjectType}
-          onValueChange={handleSubjectTypeChange}
-          className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden"
-        >
+        <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden">
           <div className="flex items-center gap-3">
-            <TabsList className={SUBJECT_TAB_LIST_CLASS}>
-              <TabsTrigger value="user" className={SUBJECT_TAB_TRIGGER_CLASS}>
+            <RadioGroup
+              variant="button"
+              value={subjectType}
+              aria-label={localize("com_unified_permission.authorization")}
+              onValueChange={handleSubjectTypeChange}
+            >
+              <Radio value="user">
                 {localize("com_permission.subject_user")}
-              </TabsTrigger>
-              <TabsTrigger
+              </Radio>
+              <Radio
                 value="department"
-                className={SUBJECT_TAB_TRIGGER_CLASS}
                 disabled={!canAddNonUserSubjects}
               >
                 {localize("com_permission.subject_department")}
-              </TabsTrigger>
-              <TabsTrigger
+              </Radio>
+              <Radio
                 value="user_group"
-                className={SUBJECT_TAB_TRIGGER_CLASS}
                 disabled={!canAddNonUserSubjects}
               >
                 {localize("com_permission.subject_user_group")}
-              </TabsTrigger>
-            </TabsList>
+              </Radio>
+            </RadioGroup>
             {subjectType === "department" && (
               <label className={INCLUDE_CHILDREN_LABEL_CLASS}>
                 <Checkbox
-                  className={INCLUDE_CHILDREN_CHECKBOX_CLASS}
+                  className={`peer ${(INCLUDE_CHILDREN_CHECKBOX_CLASS) || ''}`}
                   checked={includeChildren}
                   onCheckedChange={(checked) => setIncludeChildren(checked === true)}
                 />
@@ -152,21 +150,27 @@ export function PermissionDraftPickerDialog({
               </label>
             )}
           </div>
-          <TabsContent value="user" className="mt-3 min-h-0 flex-1 overflow-hidden p-0">
-            <SubjectSearchUser {...searchProps} usersApi={searchApi?.usersApi} />
-          </TabsContent>
-          <TabsContent value="department" className="mt-3 min-h-0 flex-1 overflow-hidden p-0">
-            <SubjectSearchDepartment
-              {...searchProps}
-              includeChildren={includeChildren}
-              departmentChildrenApi={searchApi?.departmentChildrenApi}
-              departmentSearchApi={searchApi?.departmentSearchApi}
-            />
-          </TabsContent>
-          <TabsContent value="user_group" className="mt-3 min-h-0 flex-1 overflow-hidden p-0">
-            <SubjectSearchUserGroup {...searchProps} userGroupsApi={searchApi?.userGroupsApi} />
-          </TabsContent>
-        </Tabs>
+          {/* The subject type is picked by the RadioGroup above, so the panes
+              render conditionally — there is no Tabs shell to hang them on. */}
+          <div className="mt-3 min-h-0 flex-1 overflow-hidden">
+            {subjectType === "user" && (
+              <SubjectSearchUser {...searchProps} usersApi={searchApi?.usersApi} />
+            )}
+            {subjectType === "department" && (
+              <SubjectSearchDepartment
+                {...searchProps}
+                includeChildren={includeChildren}
+                disabledSubtreeRootIds={disabledDepartmentSubtreeRootIds}
+                departmentChildrenApi={searchApi?.departmentChildrenApi}
+                departmentSearchApi={searchApi?.departmentSearchApi}
+              />
+            )}
+            {subjectType === "user_group" && (
+              <SubjectSearchUserGroup {...searchProps} userGroupsApi={searchApi?.userGroupsApi} />
+            )}
+          </div>
+          <SubjectSelectionSummary subjects={subjects} />
+        </div>
         {/* Mobile stacks the relation picker above a full-width action pair, with
             the divider directly above the buttons — matching the resource grant
             dialog. Desktop keeps both on one bordered row. */}
@@ -181,6 +185,7 @@ export function PermissionDraftPickerDialog({
               options={selectableModels}
               disabled={selectableModels.length === 0}
               className="w-[132px]"
+              aria-label={localize("com_permission.uniform_grant")}
             />
           </div>
           <div

@@ -1,67 +1,71 @@
 // @ts-strict-ignore
-import { LoadIcon, LoadingIcon } from "@/components/bs-icons/loading";
+import { Alert, Button, Cascader, Textarea, toast } from '@bisheng/ui';
+import { Outlined } from "bisheng-icons";
+
 import { bsConfirm } from "@/components/bs-ui/alertDialog/useConfirm";
-import { Button } from "@/components/bs-ui/button";
+
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/bs-ui/dialog";
-import { Textarea } from "@/components/bs-ui/input";
+
 import { Label } from "@/components/bs-ui/label";
-import Cascader from "@/components/bs-ui/select/cascader";
-import { Switch } from "@/components/bs-ui/switch";
-import { useToast } from "@/components/bs-ui/toast/use-toast";
-import { QuestionTooltip } from "@/components/bs-ui/tooltip";
-import Tip from "@/components/bs-ui/tooltip/tip";
+import { useSelectLabels } from "@/components/bs-comp/formFields/useSelectLabels";
+import {
+    fromModelCascaderValue,
+    toModelCascaderOptions,
+    toModelCascaderValue,
+} from "@/components/bs-comp/formFields/modelOptions";
+import { Switch } from "@bisheng/ui";
+
+import { ModelFieldHint } from "../ModelFieldHint";
+import { Tooltip as Tip } from "@bisheng/ui";
 import { getKnowledgeModelEnvelope, updateKnowledgeModelConfig } from "@/controllers/API/finetune";
-import { captureAndAlertRequestErrorHoc } from "@/controllers/request";
-import { Settings } from "lucide-react";
+import { showApiError } from "@/controllers/request";
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { defalutPrompt } from "./WorkbenchModel";
 import { FallbackBlockedBanner, InheritedBadge } from "../SystemConfigBanners";
 import { useSystemConfigEnvelope } from "../useSystemConfigEnvelope";
+import {
+    KnowledgeModelIdField,
+    normalizeKnowledgeModelIds,
+} from "./knowledgeModelValidation";
 
-export const ModelSelect = ({ required = false, close = false, label, tooltipText = '', value, options, onChange, footer = null }) => {
-
-    const defaultValue = useMemo(() => {
-        let _defaultValue = []
-        if (!value) return _defaultValue
-        options.some(option => {
-            const model = option.children.find(el => el.value === value)
-            if (model) {
-                _defaultValue = [{ value: option.value, label: option.label }, { value: model.value, label: model.label }]
-                return true
-            }
-        })
-        return _defaultValue
-    }, [value, options])
+export const ModelSelect = ({ required = false, close = false, label, tooltipText = '', value, options, onChange, placeholder = '' }) => {
+    const { t } = useTranslation()
+    const selectLabels = useSelectLabels()
+    const cascaderOptions = useMemo(() => toModelCascaderOptions(options), [options])
+    const cascaderValue = useMemo(() => toModelCascaderValue(value, options), [options, value])
 
     return (
-        <div>
-            <Label className="bisheng-label">
+        <div className="min-w-0">
+            {Boolean(label || required || tooltipText) && <Label className="bisheng-label inline-flex items-center">
                 <span>{label}</span>
                 {required && <span className="text-red-500 text-xs">*</span>}
-                {tooltipText && <QuestionTooltip className="relative top-0.5 ml-1" content={tooltipText} />}
-            </Label>
+                {tooltipText && <ModelFieldHint className="ml-1" content={tooltipText} />}
+            </Label>}
             <Cascader
-                defaultValue={defaultValue}
-                options={options}
-                close={close}
-                onChange={(val) => onChange(val[1])}
-                footer={footer}
+                {...selectLabels}
+                className="w-full"
+                options={cascaderOptions}
+                value={cascaderValue}
+                allowClear={close}
+                onChange={(path) => onChange(fromModelCascaderValue(path))}
+                placeholder={placeholder || t('build.selectModel')}
+                aria-label={typeof label === 'string' && label ? label : t('build.selectModel')}
+                backLabel={t('sharedUi.back')}
+                doneLabel={t('sharedUi.done')}
+                searchPlaceholder={t('sharedUi.searchModels')}
             />
         </div>
     );
 };
 
 
-// Default system prompt for knowledge-space auto tagging. Mirrors the
-// server-side `DEFAULT_AUTO_TAG_SYSTEM_PROMPT` so the textarea opens
-// with a sensible starting value when the tenant has not customised it.
-export const defaultAutoTagPrompt = `你是文件自动标签分类器。只能从候选标签中选择最相关的标签，最多返回 5 个标签。
-输出格要求严格遵循 JSON 格式： {"tags": ["标签名"]}。`;
-
-const PromptDialog = ({ value, onChange, onRestore, onSave, label, children }) => {
+export const PromptDialog = ({ value, onChange, onSave, label, children }) => {
     const { t } = useTranslation('model')
     const [open, setOpen] = useState(false)
+    const [saving, setSaving] = useState(false)
+    const savingRef = useRef(false)
     const modifyNotSavedRef = useRef(false)
     const [textValue, setTextValue] = useState(value)
     useEffect(() => {
@@ -85,7 +89,24 @@ const PromptDialog = ({ value, onChange, onRestore, onSave, label, children }) =
     }
 
 
-    return <Dialog open={open} onOpenChange={setOpen}>
+    const handleSave = async () => {
+        if (savingRef.current) return;
+        savingRef.current = true;
+        setSaving(true);
+        try {
+            await onSave(textValue);
+            modifyNotSavedRef.current = false;
+            onChange(textValue);
+            setOpen(false);
+        } catch (error) {
+            showApiError(error);
+        } finally {
+            savingRef.current = false;
+            setSaving(false);
+        }
+    };
+
+    return <Dialog open={open} onOpenChange={(next) => { if (!savingRef.current) setOpen(next); }}>
         <DialogTrigger>
             {children}
         </DialogTrigger>
@@ -95,24 +116,14 @@ const PromptDialog = ({ value, onChange, onRestore, onSave, label, children }) =
             </DialogHeader>
             <div>
                 <Label className="bisheng-label">{label || t('model.docKnowledgeAbstractPrompt')}</Label>
-                <Textarea
-                    value={textValue}
-                    onChange={(e) => {
+                <Textarea value={textValue} onChange={(e) => {
                         setTextValue(e.target.value)
                         modifyNotSavedRef.current = true;
-                    }}
-                    className="mt-1"
-                    rows={16}
-                />
+                    }} rows={16} textareaClassName={"mt-1"} />
             </div>
             <DialogFooter>
-                <Button variant="outline" className="px-11" type="button" onClick={handleCancel}>{t('model.cancel')}</Button>
-                <Button disabled={false} type="submit" className="px-11" onClick={() => {
-                    modifyNotSavedRef.current = false
-                    onSave(textValue)
-                    setOpen(false)
-                    onChange(textValue)
-                }}>
+                <Button disabled={saving} variant="outlined" type="button" onClick={handleCancel} color="default">{t('model.cancel')}</Button>
+                <Button disabled={saving} type="submit" onClick={() => { void handleSave(); }}>
                     {t('model.save')}
                 </Button>
             </DialogFooter>
@@ -120,8 +131,9 @@ const PromptDialog = ({ value, onChange, onRestore, onSave, label, children }) =
     </Dialog>
 }
 
-export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], onBack }) {
+export function KnowledgeModel({ llmOptions, embeddings, asrModel = [], onBack }) {
     const { t } = useTranslation('model')
+    const defaultAutoTagPrompt = t('model.defaultAutoTagPrompt')
 
     const [form, setForm] = useState({
         embeddingModelId: null,
@@ -134,8 +146,8 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
         abstractPrompt: '',
         autoTagPrompt: ''
     });
-    // 最后保存的配置
     const lastSaveFormDataRef = useRef(null)
+    const [unavailableModelFields, setUnavailableModelFields] = useState<KnowledgeModelIdField[]>([])
 
     const { config, loading, inheritedFromRoot, fallbackBlocked, clearInherited } =
         useSystemConfigEnvelope<any>(getKnowledgeModelEnvelope)
@@ -153,12 +165,22 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
             abstract_prompt,
             auto_tag_prompt,
         } = config
+        const { modelIds, unavailableFields } = normalizeKnowledgeModelIds(
+            {
+                embedding_model_id,
+                source_model_id,
+                extract_title_model_id,
+                qa_similar_model_id,
+                asr_model_id,
+            },
+            { llmOptions, embeddings, asrModels: asrModel },
+        )
         setForm({
-            embeddingModelId: embedding_model_id,
-            sourceModelId: source_model_id,
-            extractModelId: extract_title_model_id,
-            qaSimilarModelId: qa_similar_model_id,
-            asrModelId: asr_model_id ?? null,
+            embeddingModelId: modelIds.embedding_model_id,
+            sourceModelId: modelIds.source_model_id,
+            extractModelId: modelIds.extract_title_model_id,
+            qaSimilarModelId: modelIds.qa_similar_model_id,
+            asrModelId: modelIds.asr_model_id,
             abstractEnabled: abstract_enabled ?? true,
             autoTagEnabled: auto_tag_enabled ?? true,
             abstractPrompt: abstract_prompt ?? defalutPrompt,
@@ -166,10 +188,12 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
         })
         lastSaveFormDataRef.current = {
             ...config,
+            ...modelIds,
             abstract_prompt: abstract_prompt || defalutPrompt,
             auto_tag_prompt: auto_tag_prompt || defaultAutoTagPrompt,
         }
-    }, [config]);
+        setUnavailableModelFields(unavailableFields)
+    }, [asrModel, config, defaultAutoTagPrompt, embeddings, llmOptions]);
 
     // Clear inherited flag on first user edit — the in-memory form no
     // longer reflects Root's value, so the Badge should disappear before
@@ -179,7 +203,15 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
         setForm(next)
     }
 
-    const { message } = useToast()
+    const handleModelChange = (
+        field: KnowledgeModelIdField,
+        next: typeof form,
+    ) => {
+        setUnavailableModelFields((current) => current.filter((item) => item !== field))
+        setFormAndClearInherited(next)
+    }
+
+
     const [saveload, setSaveLoad] = useState(false)
     const handleSave = async () => {
         const {
@@ -203,7 +235,7 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
         if (!qaSimilarModelId) {
             errors.push(t('model.qaSimilarModel') + t('bs:required'))
         }
-        if (errors.length) return message({ variant: 'error', description: errors })
+        if (errors.length) return toast.show({ type: 'error', message: errors.filter(Boolean).join('\n') })
 
         const data = {
             embedding_model_id: embeddingModelId,
@@ -217,33 +249,45 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
             auto_tag_prompt: autoTagPrompt
         }
         setSaveLoad(true)
-        await captureAndAlertRequestErrorHoc(updateKnowledgeModelConfig(data).then(res => {
-            lastSaveFormDataRef.current = data
-            message({ variant: 'success', description: t('model.saveSuccess') })
-        }))
-        setSaveLoad(false)
+        try {
+            await updateKnowledgeModelConfig(data);
+            lastSaveFormDataRef.current = data;
+            setUnavailableModelFields([]);
+            toast.show({ type: 'success', message: String(t('model.saveSuccess') ?? '') });
+        } catch (error) {
+            showApiError(error);
+        } finally {
+            setSaveLoad(false);
+        }
     };
 
     // Persist a single prompt edit (abstract or auto-tag) without going
     // through the main save flow, mirroring the existing per-prompt save
     // semantics. Caller passes the patch keyed by the backend field name.
     const handleSavePrompt = (patch: { abstract_prompt?: string; auto_tag_prompt?: string }) => {
-        captureAndAlertRequestErrorHoc(updateKnowledgeModelConfig({
+        return updateKnowledgeModelConfig({
             ...lastSaveFormDataRef.current,
             ...patch,
         }).then(res => {
             lastSaveFormDataRef.current = { ...lastSaveFormDataRef.current, ...patch }
-            message({ variant: 'success', description: t('model.promptSaved') })
-        }))
+            toast.show({ type: 'success', message: String(t('model.promptSaved') ?? '') })
+        })
     }
 
     if (loading) return <div className="absolute w-full h-full top-0 left-0 flex justify-center items-center z-10 bg-[rgba(255,255,255,0.6)] dark:bg-blur-shared">
-        <LoadingIcon />
+        <Outlined.Loading  className="size-4 animate-spin"/>
     </div>
 
     return (
         <div className="max-w-[520px] mx-auto gap-y-4 flex flex-col mt-16 relative">
             <FallbackBlockedBanner visible={fallbackBlocked} />
+            {unavailableModelFields.length > 0 && (
+                <Alert
+                    type="warning"
+                    description={t('model.unavailableSelectionsCleared')}
+                    live
+                />
+            )}
             {inheritedFromRoot && (
                 <div className="-mb-2 text-xs text-muted-foreground flex items-center">
                     <InheritedBadge visible={true} />
@@ -254,7 +298,7 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
                 label={t('model.defaultEmbeddingModel')}
                 value={form.embeddingModelId}
                 options={embeddings}
-                onChange={(val) => setFormAndClearInherited({ ...form, embeddingModelId: val })}
+                onChange={(val) => handleModelChange('embedding_model_id', { ...form, embeddingModelId: val })}
             />
             <ModelSelect
                 close
@@ -262,7 +306,7 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
                 tooltipText={t('model.sourceTracingModelTooltip')}
                 value={form.sourceModelId}
                 options={llmOptions}
-                onChange={(val) => setFormAndClearInherited({ ...form, sourceModelId: val })}
+                onChange={(val) => handleModelChange('source_model_id', { ...form, sourceModelId: val })}
             />
             <ModelSelect
                 close
@@ -270,11 +314,11 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
                 tooltipText={t('model.documentSummaryModelTooltip')}
                 value={form.extractModelId}
                 options={llmOptions}
-                onChange={(val) => setFormAndClearInherited({ ...form, extractModelId: val })}
+                onChange={(val) => handleModelChange('extract_title_model_id', { ...form, extractModelId: val })}
             />
             <div className="rounded-md border p-4 space-y-4">
                 <div className="flex items-center justify-between gap-6">
-                    <Label className="bisheng-label mb-0">{t('model.summaryGeneration', '摘要生成')}</Label>
+                    <Label className="bisheng-label mb-0">{t('model.summaryGeneration')}</Label>
                     <div className="flex items-center gap-2">
                         <PromptDialog
                             value={form.abstractPrompt}
@@ -284,8 +328,8 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
                             onRestore={() => setFormAndClearInherited({ ...form, abstractPrompt: lastSaveFormDataRef.current.abstract_prompt })}
                         >
                             <Tip content={t('model.docKnowledgeAbstractPromptTooltip')} side="top">
-                                <Button variant="link" size="sm" className="h-auto px-0">
-                                    <Settings size={14} className="mr-1" />
+                                <Button variant="link" size="small" className="h-auto px-0">
+                                    <Outlined.Setting size={14} className="mr-1" />
                                     {t('model.editPromptButton')}
                                 </Button>
                             </Tip>
@@ -297,18 +341,18 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
                     </div>
                 </div>
                 <div className="flex items-center justify-between gap-6">
-                    <Label className="bisheng-label mb-0">{t('model.autoTagGeneration', '自动标签生成')}</Label>
+                    <Label className="bisheng-label mb-0">{t('model.autoTagGeneration')}</Label>
                     <div className="flex items-center gap-2">
                         <PromptDialog
                             value={form.autoTagPrompt}
-                            label={t('model.autoTagPrompt', '自动标签提示词')}
+                            label={t('model.autoTagPrompt')}
                             onChange={value => setFormAndClearInherited({ ...form, autoTagPrompt: value })}
                             onSave={(prompt) => handleSavePrompt({ auto_tag_prompt: prompt ?? form.autoTagPrompt })}
                             onRestore={() => setFormAndClearInherited({ ...form, autoTagPrompt: lastSaveFormDataRef.current.auto_tag_prompt })}
                         >
-                            <Tip content={t('model.autoTagPromptTooltip', '编辑用于自动标签分类的系统提示词')} side="top">
-                                <Button variant="link" size="sm" className="h-auto px-0">
-                                    <Settings size={14} className="mr-1" />
+                            <Tip content={t('model.autoTagPromptTooltip')} side="top">
+                                <Button variant="link" size="small" className="h-auto px-0">
+                                    <Outlined.Setting size={14} className="mr-1" />
                                     {t('model.editPromptButton')}
                                 </Button>
                             </Tip>
@@ -326,7 +370,7 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
                 tooltipText={t('model.qaSimilarModelTooltip')}
                 value={form.qaSimilarModelId}
                 options={llmOptions}
-                onChange={(val) => setFormAndClearInherited({ ...form, qaSimilarModelId: val })}
+                onChange={(val) => handleModelChange('qa_similar_model_id', { ...form, qaSimilarModelId: val })}
             />
             <ModelSelect
                 close
@@ -334,16 +378,12 @@ export default function KnowledgeModel({ llmOptions, embeddings, asrModel = [], 
                 tooltipText={t('model.knowledgeAsrModelTooltip')}
                 value={form.asrModelId}
                 options={asrModel}
-                onChange={(val) => setFormAndClearInherited({ ...form, asrModelId: val })}
+                onChange={(val) => handleModelChange('asr_model_id', { ...form, asrModelId: val })}
             />
             <div className="mt-10 text-center space-x-6">
-                <Button className="px-6" variant="outline" onClick={onBack}>{t('model.cancel')}</Button>
-                <Button
-                    className="px-10"
-                    disabled={saveload}
-                    onClick={handleSave}
-                >
-                    {saveload && <LoadIcon className="mr-2" />}
+                <Button variant="outlined" onClick={onBack} color="default">{t('model.cancel')}</Button>
+                <Button disabled={saveload || !config} onClick={handleSave}>
+                    {saveload && <Outlined.Loading className="animate-spin mr-2" />}
                     {t('model.save')}
                 </Button>
             </div>

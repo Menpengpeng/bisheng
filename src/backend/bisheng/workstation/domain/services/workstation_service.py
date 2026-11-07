@@ -7,7 +7,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 from loguru import logger
 from sqlmodel import col, select
 
-from bisheng.api.v1.schema.chat_schema import UseKnowledgeBaseParam
 from bisheng.api.v1.schemas import (
     KnowledgeFileOne,
     KnowledgeFileProcess,
@@ -50,6 +49,7 @@ from bisheng.tool.domain.const import ToolPresetType
 from bisheng.tool.domain.langchain.knowledge import KnowledgeRetrieverTool
 from bisheng.tool.domain.models.gpts_tools import GptsTools, GptsToolsDao, GptsToolsType
 from bisheng.tool.domain.services.f048_tool_permission import SYSTEM_TOOL_ACTIONS
+from bisheng.workstation.domain.schemas.chat import UseKnowledgeBaseParam
 
 from ..models import TenantWorkstationConfigDao
 
@@ -594,6 +594,42 @@ class WorkStationService(BaseService):
         return [group for group in identified if "use" in action_map.get(str(group["id"]), frozenset())]
 
     @classmethod
+    async def afilter_org_kbs_by_visible_permission(
+        cls,
+        org_kbs: list[dict] | None,
+        login_user: UserPayload,
+    ) -> list[dict]:
+        """Keep configured organization knowledge bases visible to this user.
+
+        The public workstation config exposes knowledge-base metadata and seeds
+        the client's default selection. That presentation boundary intentionally
+        checks ``visible``; retrieval continues to enforce the stricter runtime
+        action independently.
+        """
+        from bisheng.permission.application.business_authorization import batch_check_business_actions
+
+        if not org_kbs:
+            return []
+
+        normalized = [cls._to_plain_dict(item) for item in org_kbs]
+        identified = [item for item in normalized if item and item.get("id") is not None]
+        if len(identified) != len(normalized):
+            logger.warning(
+                "[workstation.org_kbs] dropped {} configured knowledge base(s) without an id",
+                len(normalized) - len(identified),
+            )
+        if not identified:
+            return []
+
+        action_map = await batch_check_business_actions(
+            login_user,
+            resource_type="knowledge_library",
+            resource_ids=[item["id"] for item in identified],
+            actions=("visible",),
+        )
+        return [item for item in identified if "visible" in action_map.get(str(item["id"]), frozenset())]
+
+    @classmethod
     async def _aproject_daily_config_for_current_tenant(
         cls,
         config: WorkstationConfig | None,
@@ -749,7 +785,7 @@ class WorkStationService(BaseService):
         return cls._apply_workbench_models(ret, await LLMService.get_workbench_llm())
 
     @classmethod
-    async def get_daily_chat_config(cls) -> WorkstationConfig | None:
+    async def get_daily_chat_config(cls, *, for_picker: bool = False) -> WorkstationConfig | None:
         """Get the default workstation configuration for daily chat."""
         value, inherited, _, _ = await cls._aresolve_tenant_config(ConfigKeyEnum.WORKSTATION)
         config = type("TenantConfigValue", (), {"value": value}) if value else None
@@ -760,7 +796,25 @@ class WorkStationService(BaseService):
             ret.tools = cls.sync_tool_info(ret.tools)
         if inherited:
             ret = await cls._aproject_daily_config_for_current_tenant(ret, DEFAULT_TENANT_ID)
-        return cls._apply_workbench_models(ret, await LLMService.get_workbench_llm())
+        workbench_config = await (
+            LLMService.get_workbench_llm_for_picker() if for_picker else LLMService.get_workbench_llm()
+        )
+        return cls._apply_workbench_models(ret, workbench_config)
+
+    @classmethod
+    async def get_open_api_daily_config(cls, login_user: UserPayload) -> dict[str, list]:
+        """Project the daily configuration onto the two safe Open API fields."""
+
+        config = await cls.get_daily_chat_config()
+        if config is None:
+            return {"models": [], "tools": []}
+        tools = [tool.model_dump(mode="json") for tool in config.tools or []]
+        if tools:
+            tools = await cls.afilter_tools_by_use_permission(tools, login_user)
+        return {
+            "models": [model.model_dump(mode="json") for model in config.models or []],
+            "tools": tools,
+        }
 
     @classmethod
     async def update_daily_chat_config(cls, data: WorkstationConfig) -> WorkstationConfig:
@@ -1012,7 +1066,9 @@ class WorkStationService(BaseService):
             system_types = tuple(child_type_by_name.values())
         if not settings.openfga.enabled:
             return result
-        invalid_types = tuple(row for row in system_types if row.id is None or row.user_id is not None)
+        invalid_types = tuple(
+            row for row in system_types if row.id is None or row.is_preset != ToolPresetType.PRESET.value
+        )
         if invalid_types:
             raise RuntimeError("copied preset tool category does not satisfy the system-owned predicate")
         specs = tuple(
@@ -1319,10 +1375,27 @@ class WorkStationService(BaseService):
                     continue
 
                 try:
+                    milvus_kwargs = {"k": 100, "param": {"ef": 110}}
+                    es_kwargs = {"k": 100}
+                    selected_tag_id = use_knowledge_param.knowledge_space_tag_filters.get(int(kb_id))
+                    if selected_tag_id is not None:
+                        from bisheng.knowledge.domain.services.knowledge_space_tag_filter_service import (
+                            KnowledgeSpaceTagFilterService,
+                        )
+
+                        scope_filter = await KnowledgeSpaceTagFilterService().build_index_prefilter(
+                            int(kb_id), selected_tag_id, login_user
+                        )
+                        if scope_filter.is_empty:
+                            continue
+                        if scope_filter.milvus_expr:
+                            milvus_kwargs["expr"] = scope_filter.milvus_expr
+                        if scope_filter.es_filter:
+                            es_kwargs["filter"] = scope_filter.es_filter
                     per_kb_milvus = (
                         MultiRetriever(
                             vectors=[milvus_vectorstore],
-                            search_kwargs=[{"k": 100, "param": {"ef": 110}}],
+                            search_kwargs=[milvus_kwargs],
                             finally_k=100,
                         )
                         if milvus_vectorstore is not None
@@ -1331,7 +1404,7 @@ class WorkStationService(BaseService):
                     per_kb_es = (
                         MultiRetriever(
                             vectors=[es_vectorstore],
-                            search_kwargs=[{"k": 100}],
+                            search_kwargs=[es_kwargs],
                             finally_k=100,
                         )
                         if es_vectorstore is not None
@@ -1423,7 +1496,13 @@ class WorkStationService(BaseService):
         return ""
 
     @classmethod
-    async def get_chat_history(cls, chat_id: str, size: int = 4, max_tokens: int | None = None):
+    async def get_chat_history(
+        cls,
+        chat_id: str,
+        size: int = 4,
+        max_tokens: int | None = None,
+        citation_key_to_handle: dict[str, str] | None = None,
+    ):
         """Build LLM-consumable chat history, backward compatible with both
         legacy plain-text messages and v2.5 JSON-formatted messages.
 
@@ -1440,7 +1519,19 @@ class WorkStationService(BaseService):
         ``daily_chat.history_max_tokens`` in the DB config). If ``None`` the
         token-cap stage is skipped — keep this for callers that only want
         row-count trimming or that manage budgeting themselves.
+
+        ``citation_key_to_handle`` (F075): when given, citation markers in past
+        answers are shown to the model as ``[Sn]`` handles, and markers whose
+        key has no handle are dropped — the model never sees the verbatim-id
+        format it is no longer taught.
         """
+        from bisheng.citation.domain.services.daily_citation_handles import markers_to_handles
+
+        def _ai(content: str) -> AIMessage:
+            if citation_key_to_handle is not None:
+                content = markers_to_handles(content, citation_key_to_handle)
+            return AIMessage(content=content)
+
         import re as _re
 
         chat_history = []
@@ -1494,19 +1585,19 @@ class WorkStationService(BaseService):
                     content = parsed.get("msg", "") if isinstance(parsed, dict) else raw
                 except (json.JSONDecodeError, TypeError):
                     content = raw
-                chat_history.append(AIMessage(content=content))
+                chat_history.append(_ai(content))
 
             elif one.category == MessageCategory.ANSWER.value:
                 # Legacy plain-text: strip :::thinking / :::web markup so the
                 # model sees only the visible answer.
                 content = _re.sub(r":::thinking\n[\s\S]*?\n:::", "", raw)
                 content = _re.sub(r":::web\n[\s\S]*?\n:::", "", content).strip()
-                chat_history.append(AIMessage(content=content))
+                chat_history.append(_ai(content))
 
             elif one.category == MessageCategory.TASK.value:
                 # F035 Track J: linsight task-turn answer — plain text (the rich
                 # execution detail lives on the linked session_version, not here).
-                chat_history.append(AIMessage(content=raw))
+                chat_history.append(_ai(raw))
 
         # Token-count cap: drop oldest until total tokens ≤ max_tokens.
         # Keep at least one message (the most recent) so the model still

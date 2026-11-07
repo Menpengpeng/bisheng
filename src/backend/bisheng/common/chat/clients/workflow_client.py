@@ -6,12 +6,14 @@ from loguru import logger
 
 from bisheng.api.services.audit_log import AuditLogService
 from bisheng.api.v1.schema.workflow import WorkflowEventType
+from bisheng.chat_session.domain.chat import ChatSessionService
 from bisheng.common.chat.clients.base import BaseClient
 from bisheng.common.chat.types import WorkType
 from bisheng.common.dependencies.user_deps import UserPayload
 from bisheng.common.errcode.chat import WorkflowOfflineError
 from bisheng.database.models.flow import FlowDao, FlowStatus
 from bisheng.database.models.message import ChatMessage, ChatMessageDao
+from bisheng.database.models.session import MessageSession
 from bisheng.utils import generate_uuid, get_request_ip
 from bisheng.worker.workflow.redis_callback import RedisCallback
 from bisheng.worker.workflow.tasks import continue_workflow, execute_workflow, workflow_stateful_worker
@@ -43,6 +45,8 @@ class WorkflowClient(BaseClient):
         self.hash_key = None
         self.ws_closed = False
         self.run_lock = asyncio.Lock()
+        self.session_subject = kwargs.get("session_subject")
+        self.execution_snapshot = kwargs.get("execution_snapshot")
 
     async def close(self, force_stop=False):
         # If the user is not actively stopping, setwsTurn the flag off, but there is no need to abortworkflowExecution
@@ -92,24 +96,34 @@ class WorkflowClient(BaseClient):
         # chat ws connection first handle
         workflow_id = message.get("flow_id", self.client_id)
         self.chat_id = message.get("chat_id", "")
+        if self.chat_id and self.session_subject is not None:
+            session = await ChatSessionService.get_subject_session_if_exists(
+                self.chat_id,
+                self.session_subject,
+            )
+            if session is not None and session.flow_id != workflow_id:
+                from bisheng.common.errcode.http_error import NotFoundError
+
+                raise NotFoundError.http_exception()
+            if session is None:
+                workflow_db = FlowDao.get_flow_by_id(workflow_id)
+                await ChatSessionService.create_subject_session(
+                    MessageSession(
+                        chat_id=self.chat_id,
+                        flow_id=workflow_id,
+                        flow_name=workflow_db.name,
+                        flow_type=workflow_db.flow_type,
+                        user_id=self.user_id,
+                    ),
+                    self.session_subject,
+                )
         unique_id = generate_uuid()
         if self.chat_id:
             await self.init_history()
             unique_id = f"{self.chat_id}_async_task_id"
         logger.debug(f"init workflow with unique_id: {unique_id}, workflow_id: {workflow_id}, chat_id: {self.chat_id}")
         self.workflow = RedisCallback(unique_id, workflow_id, self.chat_id, self.user_id)
-        # JudgingworkflowWhether it is online, if it is not online, close the currentwebsocketLinks
-        workflow_db = FlowDao.get_flow_by_id(workflow_id)
-        if workflow_db.status != FlowStatus.ONLINE.value and self.chat_id:
-            self.workflow.set_workflow_stop()
-            try:
-                await WorkflowOfflineError().websocket_close_message(websocket=self.websocket, close_ws=False)
-                await self.send_response("processing", "close", "")
-            except Exception:
-                logger.warning("websocket is closed")
-            self.workflow.clear_workflow_status()
-            self.workflow = None
-            logger.debug("workflow is offline not support with chat")
+        if not await self.ensure_workflow_available(workflow_id):
             return False, unique_id
 
         status_info = self.workflow.get_workflow_status()
@@ -167,7 +181,15 @@ class WorkflowClient(BaseClient):
             # Start asynchronous task
 
             execute_workflow.apply_async(
-                [unique_id, workflow_id, self.chat_id, self.user_id], queue=await self.get_execute_worker()
+                [
+                    unique_id,
+                    workflow_id,
+                    self.chat_id,
+                    self.user_id,
+                    "api" if self.execution_snapshot is not None else "platform",
+                    self.execution_snapshot,
+                ],
+                queue=await self.get_execute_worker(),
             )
             await self.send_response("processing", "begin", "")
             await self.workflow_run()
@@ -204,12 +226,34 @@ class WorkflowClient(BaseClient):
             logger.warning(f"workflow status is unknown: {status_info}")
         return False
 
+    async def ensure_workflow_available(self, workflow_id: str) -> bool:
+        # Builder preview uses an empty chat ID and may execute draft workflows.
+        if not self.chat_id:
+            return True
+        workflow_db = FlowDao.get_flow_by_id(workflow_id)
+        if workflow_db and workflow_db.status == FlowStatus.ONLINE.value:
+            return True
+
+        if self.workflow:
+            await self.workflow.async_set_workflow_stop()
+            # The worker consumes the stop marker before terminal-state cleanup.
+            self.workflow = None
+        await WorkflowOfflineError().websocket_close_message(websocket=self.websocket, close_ws=False)
+        await self.send_response("processing", "close", "")
+        return False
+
     async def handle_user_input(self, data: dict):
+        if not await self.ensure_workflow_available(self.client_id):
+            return
         logger.info(f"get user input: {data}")
         if not self.workflow:
-            logger.warning("workflow is over")
+            await self.send_response("processing", "close", "")
             return
         status_info = await self.workflow.async_get_workflow_status()
+        if not status_info:
+            self.workflow = None
+            await self.send_response("processing", "close", "")
+            return
         if status_info["status"] != WorkflowStatus.INPUT.value:
             logger.warning(f"workflow is not input status: {status_info}")
         else:
@@ -231,7 +275,14 @@ class WorkflowClient(BaseClient):
             )
             await self.workflow.async_set_workflow_status(WorkflowStatus.INPUT_OVER.value)
             continue_workflow.apply_async(
-                [self.workflow.unique_id, self.workflow.workflow_id, self.workflow.chat_id, self.workflow.user_id],
+                [
+                    self.workflow.unique_id,
+                    self.workflow.workflow_id,
+                    self.workflow.chat_id,
+                    self.workflow.user_id,
+                    "api" if self.execution_snapshot is not None else "platform",
+                    self.execution_snapshot,
+                ],
                 queue=await self.get_execute_worker(),
             )
             await self.workflow_run()

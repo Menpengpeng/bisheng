@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from hashlib import sha256
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
@@ -68,7 +68,9 @@ from bisheng.common.errcode.channel import (
     ChannelAdminLimitExceededError,
     ChannelCreateLimitExceededError,
     ChannelCreationRequestConflictError,
+    ChannelGrantedNotSubscribedError,
     ChannelNotFoundError,
+    ChannelNotSubscribedError,
     ChannelOrganizationGrantUnsubscribeDeniedError,
 )
 from bisheng.common.errcode.knowledge_space import SpaceFileNameDuplicateError, SpacePermissionDeniedError
@@ -107,7 +109,10 @@ from bisheng.permission.domain.services.permission_action_service import (
 )
 from bisheng.role.domain.services.quota_service import QuotaResourceType, QuotaService
 from bisheng.sensitive_word.domain.schemas import SensitiveWordBusinessType
-from bisheng.sensitive_word.domain.services.sensitive_word_policy_service import SensitiveWordPolicyService
+from bisheng.sensitive_word.domain.services.sensitive_word_policy_service import (
+    DEFAULT_AUTO_REPLY,
+    SensitiveWordPolicyService,
+)
 from bisheng.user.domain.models.user import UserDao
 from bisheng.utils import generate_uuid, get_request_ip
 
@@ -255,6 +260,13 @@ class ChannelService:
         return set(action_map.get(str(channel_id), frozenset()))
 
     @staticmethod
+    async def _has_channel_subscription_access(channel_id: str, login_user: UserPayload) -> bool:
+        # Match the square's business visibility check. Administrative access
+        # permits inspection, but must not impersonate a subscription grant.
+        visible = await batch_check_business_visible(login_user, resource_type="channel", resource_ids=(channel_id,))
+        return visible.get(str(channel_id), False)
+
+    @staticmethod
     def _resolve_subscription_status(
         membership_status: MembershipStatusEnum | None,
         update_time: datetime | None = None,
@@ -274,10 +286,20 @@ class ChannelService:
         return SubscriptionStatusEnum.NOT_SUBSCRIBED
 
     @classmethod
-    def _resolve_membership_subscription_status(cls, membership) -> SubscriptionStatusEnum:
-        if membership is None:
+    def _resolve_effective_subscription_status(
+        cls,
+        *,
+        can_read: bool,
+        approval_required: bool,
+        membership_status: MembershipStatusEnum | None,
+        update_time: datetime | None = None,
+    ) -> SubscriptionStatusEnum:
+        """Use effective access for subscribed and membership for application progress."""
+        if can_read:
+            return SubscriptionStatusEnum.SUBSCRIBED
+        if membership_status == MembershipStatusEnum.ACTIVE or not approval_required:
             return SubscriptionStatusEnum.NOT_SUBSCRIBED
-        return cls._resolve_subscription_status(membership.status, membership.update_time)
+        return cls._resolve_subscription_status(membership_status, update_time)
 
     @staticmethod
     def _current_tenant_id(login_user: UserPayload) -> int:
@@ -317,6 +339,9 @@ class ChannelService:
         can_view_sensitive: bool,
     ) -> ArticleSensitiveReview:
         violated = bool(hits)
+        # Existing policies share the upload default; article readers need reading-specific wording.
+        if auto_reply == DEFAULT_AUTO_REPLY:
+            auto_reply = "该文章未通过安全审查，无法查看详情"  # noqa: RUF001
         return ArticleSensitiveReview(
             enabled=enabled,
             violated=violated,
@@ -402,52 +427,17 @@ class ChannelService:
             for info_source in information_sources
         ]
         if new_rows:
-            await self.channel_info_source_repository.batch_add(new_rows)
+            await self.channel_info_source_repository.upsert_metadata(new_rows)
         return new_rows
 
-    async def reconcile_information_subscriptions(self) -> dict:
-        """Reconcile information-service subscriptions for the current tenant.
-
-        The desired subscription set is the union of every channel's ``source_list``;
-        the materialized view is the ``channel_info_source`` table. This converges the two
-        (and the external information service) on the eventual-consistency path:
-
-        - ``current - desired`` (orphans): unsubscribe at the information service + delete row.
-        - ``desired - current`` (missing): subscribe + fetch metadata + insert row
-          (heals subscribes that were missed or failed on the synchronous hot path).
-
-        Per-source failures are isolated (logged + counted) so one bad source never aborts
-        the rest; the next run retries it. Must run inside the target tenant's context — the
-        ``channel`` / ``channel_info_source`` queries are tenant-scoped automatically.
-
-        Returns ``{"to_sub", "to_unsub", "failed"}`` for observability.
-        """
-        bisheng_information_client = await get_bisheng_information_client()
-        desired = await self.channel_repository.find_all_referenced_source_ids()
-        current_rows = await self.channel_info_source_repository.find_all()
-        current = {row.id for row in current_rows}
-
-        to_unsub = current - desired
-        to_sub = desired - current
-        failed = 0
-
-        for source_id in to_unsub:
-            try:
-                await bisheng_information_client.unsubscribe_information_source([source_id])
-                await self.channel_info_source_repository.delete_by_ids([source_id])
-            except Exception:
-                logger.exception("reconcile: failed to unsubscribe information source %s", source_id)
-                failed += 1
-
-        for source_id in to_sub:
-            try:
-                await bisheng_information_client.subscribe_information_source([source_id])
-                await self._sync_channel_info_source_metadata(bisheng_information_client, [source_id])
-            except Exception:
-                logger.exception("reconcile: failed to subscribe information source %s", source_id)
-                failed += 1
-
-        return {"to_sub": len(to_sub), "to_unsub": len(to_unsub), "failed": failed}
+    async def _best_effort_sync_channel_info_source_metadata(self, source_ids: list[str]) -> None:
+        if not source_ids:
+            return
+        try:
+            client = await get_bisheng_information_client()
+            await self._sync_channel_info_source_metadata(client, list(dict.fromkeys(source_ids)))
+        except Exception:
+            logger.exception("Failed to refresh public information source metadata")
 
     async def create_channel(
         self,
@@ -497,26 +487,15 @@ class ChannelService:
             if len(existing_channels) >= effective:
                 raise ChannelCreateLimitExceededError(quota=effective)
 
-        bisheng_information_client = await get_bisheng_information_client()
         if channel_data.source_list:
-            # A source already present in the local channel_info_source table has been
-            # subscribed before. The row and the information-service subscription share a
-            # lifecycle (both created on first subscribe, both removed together by the
-            # daily reconcile), so a present row means "already subscribed" — we skip
-            # re-subscribing it. Only sources missing from the table are new subscriptions.
-            existing_sources = await self.channel_info_source_repository.find_by_ids(channel_data.source_list)
-            existing_source_ids = {source.id for source in existing_sources}
-            missing_source_ids = [
-                sid for sid in dict.fromkeys(channel_data.source_list) if sid not in existing_source_ids
-            ]
-
-            if missing_source_ids:
-                # Subscribe the not-yet-subscribed sources BEFORE persisting the channel.
-                # The subscribe call enforces the API-key source-count limit (19007); doing
-                # it first guarantees that a limit error aborts creation instead of leaving
-                # an orphaned channel / membership / OpenFGA owner tuple.
-                await bisheng_information_client.subscribe_information_source(missing_source_ids)
-                await self._sync_channel_info_source_metadata(bisheng_information_client, missing_source_ids)
+            # Role/tenant quota on deduped subscribed info sources (`info_source_subscribe`,
+            # default 200; 0 = adding sources prohibited). Checked before the channel is
+            # persisted so a limit error aborts creation without side effects, mirroring
+            # the channel-count gate above. No subscribe call happens here any more —
+            # the reconcile worker converges the information service asynchronously.
+            await QuotaService.check_info_source_subscribe_limit(
+                login_user.user_id, login_user.tenant_id, channel_data.source_list, login_user=login_user
+            )
 
         channel_model = Channel(
             name=channel_data.name,
@@ -669,6 +648,8 @@ class ChannelService:
                     error_code=exc.code if isinstance(exc, BaseErrorCode) else 500,
                 )
 
+        await self._best_effort_sync_channel_info_source_metadata(channel_model.source_list or [])
+
         if channel_data.creation_request_id is None and channel_data.initial_permissions is None:
             return channel_model
 
@@ -804,9 +785,7 @@ class ChannelService:
                 statuses=[MembershipStatusEnum.ACTIVE],
             )
             channel_ids = [membership.business_id for membership in memberships]
-            existing_channels = (
-                await self.channel_repository.find_channels_by_ids(channel_ids) if channel_ids else []
-            )
+            existing_channels = await self.channel_repository.find_channels_by_ids(channel_ids) if channel_ids else []
             if len(existing_channels) >= effective:
                 raise ChannelCreateLimitExceededError(quota=effective)
         return (
@@ -846,9 +825,7 @@ class ChannelService:
         # Apply mixed sorting: pinned channels first, then sort by the selected criteria within each group
         return self._sort_channels(result, query_data.sort_by)
 
-    async def _get_created_channels(
-        self, login_user: UserPayload, pinned_ids: set[str]
-    ) -> list[ChannelItemResponse]:
+    async def _get_created_channels(self, login_user: UserPayload, pinned_ids: set[str]) -> list[ChannelItemResponse]:
         """Channels created by the current user, straight from the channel table."""
         channels = await self.channel_repository.find_channels_by_user_id(login_user.user_id)
         if not channels:
@@ -878,9 +855,7 @@ class ChannelService:
             )
         return result
 
-    async def _get_followed_channels(
-        self, login_user: UserPayload, pinned_ids: set[str]
-    ) -> list[ChannelItemResponse]:
+    async def _get_followed_channels(self, login_user: UserPayload, pinned_ids: set[str]) -> list[ChannelItemResponse]:
         """Channels the user can see but did not create.
 
         Uses the "visible-ids-first" pattern (F048 ``list_visible_objects``): one
@@ -978,11 +953,7 @@ class ChannelService:
             fga_elapsed_ms=fga_elapsed_ms,
             total_elapsed_ms=(perf_counter() - started) * 1000,
             returned_count=len(result),
-            alert=(
-                "capacity_80_percent"
-                if len(visible_ids) >= _FOLLOWED_VISIBLE_MAX_RESULTS * 0.8
-                else None
-            ),
+            alert=("capacity_80_percent" if len(visible_ids) >= _FOLLOWED_VISIBLE_MAX_RESULTS * 0.8 else None),
         )
         return result
 
@@ -1622,13 +1593,11 @@ class ChannelService:
             subscriber_count = row[3]
             article_count = article_counts[i] if i < len(article_counts) else 0
 
-            status = (
-                SubscriptionStatusEnum.SUBSCRIBED
-                if visible_map.get(str(channel.id), False)
-                else self._resolve_subscription_status(
-                    membership_status=user_subscription_status,
-                    update_time=user_subscription_update_time,
-                )
+            status = self._resolve_effective_subscription_status(
+                can_read=visible_map.get(str(channel.id), False),
+                approval_required=channel.visibility == ChannelVisibilityEnum.REVIEW,
+                membership_status=user_subscription_status,
+                update_time=user_subscription_update_time,
             )
 
             # Prepare source infos
@@ -1683,35 +1652,24 @@ class ChannelService:
             raise ChannelNotFoundError()
         channel = channels[0]
 
-        existing_membership = await self.space_channel_member_repository.find_membership(
-            business_id=req.channel_id, business_type=BusinessTypeEnum.CHANNEL, user_id=login_user.user_id
-        )
-        if existing_membership and existing_membership.user_role != UserRoleEnum.MEMBER:
+        if await self._has_channel_subscription_access(req.channel_id, login_user):
             return SubscriptionStatusEnum.SUBSCRIBED
 
-        # 3. Check channel visibility
         if channel.visibility == ChannelVisibilityEnum.PRIVATE:
             raise ChannelAccessDeniedError()
 
-        # 4. Determine subscription status based on channel visibility
-        if channel.visibility == ChannelVisibilityEnum.PUBLIC:
-            status = MembershipStatusEnum.ACTIVE
-            return_status = SubscriptionStatusEnum.SUBSCRIBED
-        elif channel.visibility == ChannelVisibilityEnum.REVIEW:
-            status = MembershipStatusEnum.PENDING
-            return_status = SubscriptionStatusEnum.PENDING
-        else:
+        existing_membership = await self.space_channel_member_repository.find_membership(
+            business_id=req.channel_id,
+            business_type=BusinessTypeEnum.CHANNEL,
+            user_id=login_user.user_id,
+            include_inactive=True,
+        )
+        if existing_membership and existing_membership.user_role != UserRoleEnum.MEMBER:
+            raise ChannelAccessDeniedError(msg="A channel administrator must update this authorization")
+        if channel.visibility not in (ChannelVisibilityEnum.PUBLIC, ChannelVisibilityEnum.REVIEW):
             raise ValueError(f"Unsupported channel visibility: {channel.visibility}")
-
-        if existing_membership and existing_membership.status == MembershipStatusEnum.ACTIVE:
-            return SubscriptionStatusEnum.SUBSCRIBED
-        if (
-            existing_membership
-            and existing_membership.status == MembershipStatusEnum.PENDING
-            and status == MembershipStatusEnum.PENDING
-        ):
-            return SubscriptionStatusEnum.PENDING
-
+        # Persist application progress first; effective access becomes the success signal.
+        status = MembershipStatusEnum.PENDING
         if not existing_membership or existing_membership.status == MembershipStatusEnum.REJECTED:
             await QuotaService.check_quota(
                 user_id=login_user.user_id,
@@ -1733,10 +1691,7 @@ class ChannelService:
                 status=status,
             )
 
-        # Public channels activate the subscriber immediately, so mirror the
-        # membership into an explicit ReBAC viewer grant. Review channels stay
-        # PENDING here and are synced once their approval passes.
-        if status == MembershipStatusEnum.ACTIVE:
+        if channel.visibility == ChannelVisibilityEnum.PUBLIC:
             await self.__class__.sync_direct_channel_user_permissions(
                 req.channel_id,
                 login_user.user_id,
@@ -1744,6 +1699,9 @@ class ChannelService:
                 is_active=True,
                 operator_user_id=login_user.user_id,
             )
+            member_row.status = MembershipStatusEnum.ACTIVE
+            await self.space_channel_member_repository.update(member_row)
+            return SubscriptionStatusEnum.SUBSCRIBED
 
         if channel.visibility == ChannelVisibilityEnum.REVIEW:
             gate = self.approval_gate or self._build_channel_approval_gate()
@@ -1770,32 +1728,13 @@ class ChannelService:
                 )
             )
             if gate_result.decision == ApprovalGateDecision.PASS:
-                # Reuse the membership row created/updated above instead of
-                # re-fetching it. The old re-fetch raced a concurrent unsubscribe
-                # (returned None between create and re-fetch → the just-approved
-                # access was silently dropped, no error). member_row is always set
-                # by the create/update block above.
-                if member_row is not None:
-                    member_row.status = MembershipStatusEnum.ACTIVE
-                    await self.space_channel_member_repository.update(member_row)
-                else:
-                    # Defensive upsert: the row vanished (concurrent unsubscribe);
-                    # recreate it ACTIVE so an approved subscription is never lost.
-                    await self.space_channel_member_repository.add_member(
-                        business_id=req.channel_id,
-                        business_type=BusinessTypeEnum.CHANNEL,
-                        user_id=login_user.user_id,
-                        role=UserRoleEnum.MEMBER,
-                        status=MembershipStatusEnum.ACTIVE,
-                    )
-                await self.__class__.sync_direct_channel_user_permissions(
-                    req.channel_id,
-                    login_user.user_id,
-                    UserRoleEnum.MEMBER,
-                    is_active=True,
-                    operator_user_id=login_user.user_id,
+                # ApprovalGate dispatches the durable outbox for automatic approvals too.
+                # Its handler owns activation; report the access that has actually landed.
+                return self._resolve_effective_subscription_status(
+                    can_read=await self._has_channel_subscription_access(req.channel_id, login_user),
+                    approval_required=True,
+                    membership_status=MembershipStatusEnum.PENDING,
                 )
-                return SubscriptionStatusEnum.SUBSCRIBED
             if gate_result.decision == ApprovalGateDecision.PENDING and gate_result.task_ids and self.message_service:
                 await self._send_channel_approval_notification(
                     channel=channel,
@@ -1804,13 +1743,16 @@ class ChannelService:
                     task_ids=gate_result.task_ids,
                 )
 
-        return return_status
+        return SubscriptionStatusEnum.PENDING
 
     def _build_channel_approval_gate(self) -> ApprovalGate:
         registry = ApprovalRegistry.with_default_presets()
         registry.register_handler(
             "channel_subscribe_request",
-            ChannelSubscribeScenarioHandler(self.space_channel_member_repository),
+            ChannelSubscribeScenarioHandler(
+                self.space_channel_member_repository,
+                sync_permissions=self.__class__.sync_direct_channel_user_permissions,
+            ),
         )
         return ApprovalGate(registry=registry)
 
@@ -1906,8 +1848,6 @@ class ChannelService:
             action="edit",
         )
 
-        bisheng_information_client = await get_bisheng_information_client()
-
         # 3. Update channel information
         if req.name is not None:
             channel.name = req.name
@@ -1928,7 +1868,6 @@ class ChannelService:
         # Track if source_list changed for updating latest_article_update_time
         source_list_changed = False
         if req.source_list is not None:
-            # Calculate the difference between old and new source lists to minimize calls to bisheng_information_client
             old_sources = set(channel.source_list or [])
             new_sources = set(req.source_list)
             to_add_sources = list(new_sources - old_sources)
@@ -1939,16 +1878,16 @@ class ChannelService:
                 source_list_changed = True
 
             if to_add_sources:
-                # Subscribe only sources not already subscribed (missing from
-                # channel_info_source). Already-subscribed sources are skipped.
-                existing_add = await self.channel_info_source_repository.find_by_ids(to_add_sources)
-                existing_add_ids = {source.id for source in existing_add}
-                missing_add = [sid for sid in to_add_sources if sid not in existing_add_ids]
-                if missing_add:
-                    await bisheng_information_client.subscribe_information_source(missing_add)
-            # Removed sources are NOT unsubscribed here: unsubscription is deferred to
-            # the daily reconcile, which unsubscribes a source only once no channel
-            # references it (avoids over-unsubscribing sources shared by other channels).
+                # Enforce the `info_source_subscribe` quota against the channel CREATOR's
+                # allowance — the spec's quota owner — not the operator's: managers and
+                # editors can add sources to someone else's channel, and those sources
+                # count toward the creator's deduped total in every later check.
+                await QuotaService.check_info_source_subscribe_limit(
+                    channel.user_id,
+                    channel.tenant_id or login_user.tenant_id,
+                    to_add_sources,
+                    login_user=login_user,
+                )
 
             channel.source_list = req.source_list
 
@@ -1967,21 +1906,7 @@ class ChannelService:
             await self.update_channels_latest_article_time([channel])
 
         if channel.source_list:
-            # Sync information sources to local database
-            existing_sources = await self.channel_info_source_repository.find_by_ids(channel.source_list)
-            existing_source_ids = {source.id for source in existing_sources}
-            missing_source_ids = [sid for sid in channel.source_list if sid not in existing_source_ids]
-
-            new_channel_info_sources = await self._sync_channel_info_source_metadata(
-                bisheng_information_client, missing_source_ids
-            )
-            if new_channel_info_sources:
-                from bisheng.worker.information.article import sync_information_article
-
-                for one in new_channel_info_sources:
-                    # Sync articles for the new information source one hour later
-                    exec_time = datetime.now() + timedelta(hours=1)
-                    sync_information_article.apply_async(args=(one.id,), eta=exec_time)
+            await self._best_effort_sync_channel_info_source_metadata(channel.source_list)
 
         # Replace knowledge-sync config atomically if caller provided one.
         if req.knowledge_sync is not None:
@@ -2047,14 +1972,12 @@ class ChannelService:
             return
 
         if old_visibility == ChannelVisibilityEnum.REVIEW and new_visibility == ChannelVisibilityEnum.PUBLIC:
-            activated_members = await self.space_channel_member_repository.activate_pending_members(channel_id)
-            if activated_members:
-                logger.info(
-                    "Activated %d pending members for channel_id=%s after visibility change from REVIEW to PUBLIC",
-                    len(activated_members),
-                    channel_id,
-                )
-                for member in activated_members:
+            members = await self.space_channel_member_repository.find_all(
+                business_id=channel_id,
+                business_type=BusinessTypeEnum.CHANNEL,
+            )
+            for member in members:
+                if member.status == MembershipStatusEnum.PENDING:
                     await self.__class__.sync_direct_channel_user_permissions(
                         channel_id,
                         member.user_id,
@@ -2062,6 +1985,8 @@ class ChannelService:
                         is_active=True,
                         operator_user_id=login_user.user_id,
                     )
+                    member.status = MembershipStatusEnum.ACTIVE
+                    await self.space_channel_member_repository.update(member)
             await self.space_channel_member_repository.remove_rejected_members(channel_id)
             if self.message_service:
                 await self.message_service.batch_approve_channel_subscription_messages(
@@ -2151,12 +2076,13 @@ class ChannelService:
                         {"id": sid, "source_name": "Unknown", "source_icon": "", "source_type": "", "description": ""}
                     )
 
-        # Determine subscription status. ``current_membership`` is ACTIVE-only (it
-        # gates permissions), but the subscribe button must also reflect PENDING /
-        # REJECTED applications — the same states the channel square shows. F040:
-        # ``status_membership`` (the highest-rank row of any status from the split
-        # lookup above) carries that PENDING/REJECTED state, so use it directly.
-        subscription_status = self._resolve_membership_subscription_status(status_membership)
+        # Subscription presentation follows effective access; membership tracks application progress.
+        subscription_status = self._resolve_effective_subscription_status(
+            can_read=await self._has_channel_subscription_access(channel_id, login_user),
+            approval_required=channel.visibility == ChannelVisibilityEnum.REVIEW,
+            membership_status=status_membership.status if status_membership else None,
+            update_time=status_membership.update_time if status_membership else None,
+        )
 
         # Knowledge-sync config — only returned for the channel creator since
         # the feature is creator-only (Module D). Members don't need to see it.
@@ -2406,8 +2332,15 @@ class ChannelService:
         current_membership = await self.space_channel_member_repository.find_membership(
             business_id=channel_id, business_type=BusinessTypeEnum.CHANNEL, user_id=login_user.user_id
         )
-        if not current_membership or current_membership.status != MembershipStatusEnum.ACTIVE:
-            raise ValueError("You are not subscribed to this channel")
+        if not current_membership:
+            # No membership row at all, yet the caller reached this channel — the
+            # followed list is resolved from `visible`, so it also carries
+            # channels held through a Grant. There is nothing of theirs to
+            # remove; whoever granted it has to take it back.
+            raise ChannelGrantedNotSubscribedError()
+        if current_membership.status != MembershipStatusEnum.ACTIVE:
+            # An application still pending, or one that was rejected.
+            raise ChannelNotSubscribedError()
 
         sources = await self.space_channel_member_repository.find_channel_membership_sources(
             channel_id,

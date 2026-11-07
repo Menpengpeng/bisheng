@@ -1,3 +1,4 @@
+import { showApiError } from "~/api/request";
 /**
  * Knowledge space single-file chat hook.
  * Sends user queries in the context of a specific file within a knowledge space.
@@ -17,14 +18,34 @@ import store from "~/store";
  * Hook for single-file Q&A chat in a knowledge space.
  * @param spaceId - Knowledge space ID; empty string disables the hook.
  * @param fileId  - File ID within the space; empty string disables the hook.
+ * @param model   - The surface's own model selection (see useSurfaceModel).
+ *                  Omitted, it falls back to the shared `chatModel` atom, which
+ *                  is what the pre-isolation callers relied on.
  */
-export default function useFileChat(spaceId: string, fileId: string) {
-    const chatModel = useRecoilValue(store.chatModel);
+export default function useFileChat(
+    spaceId: string,
+    fileId: string,
+    model?: { id: number; name: string },
+) {
+    const sharedChatModel = useRecoilValue(store.chatModel);
+    const chatModel = model ?? sharedChatModel;
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [isStreaming, setIsStreaming] = useState(false);
+    const [historyError, setHistoryError] = useState<unknown>(null);
+    const [historyReload, setHistoryReload] = useState(0);
+    const [isClearing, setIsClearing] = useState(false);
+    const clearingRef = useRef<object | null>(null);
+    const retryHistory = () => setHistoryReload(value => value + 1);
     const [isLoading, setIsLoading] = useState(false);
     const [sseSubmission, setSseSubmission] =
         useState<StreamChatSSESubmission | null>(null);
+
+    const resourceKey = JSON.stringify([spaceId, fileId]);
+    const resourceRef = useRef({ key: resourceKey });
+    if (resourceRef.current.key !== resourceKey) {
+        resourceRef.current = { key: resourceKey };
+        clearingRef.current = null;
+    }
 
     const messagesRef = useRef<ChatMessage[]>([]);
     messagesRef.current = messages;
@@ -37,14 +58,16 @@ export default function useFileChat(spaceId: string, fileId: string) {
     // --- Load chat history on mount or when params change ---
     useEffect(() => {
         if (!enabled) return;
+        let active = true;
+        setHistoryError(null);
+        setIsClearing(false);
         setIsLoading(true);
         getFileChatHistory(spaceId, fileId)
-            .then((msgs) => setMessages(msgs))
-            .catch((err) =>
-                console.error("[FileChat] Failed to load history:", err)
-            )
-            .finally(() => setIsLoading(false));
-    }, [spaceId, fileId, enabled]);
+            .then(msgs => { if (active) setMessages(msgs); })
+            .catch(error => { if (active) setHistoryError(error); })
+            .finally(() => { if (active) setIsLoading(false); });
+        return () => { active = false; };
+    }, [spaceId, fileId, enabled, historyReload]);
 
     // --- Helper: build SSE submission ---
     const buildSubmission = useCallback(
@@ -65,7 +88,7 @@ export default function useFileChat(spaceId: string, fileId: string) {
                     return msgs;
                 });
             },
-            onFinal: (fullText, realMessageId) => {
+            onFinal: (fullText, realMessageId, citations) => {
                 setMessages((prev) => {
                     const msgs = [...prev];
                     const idx = msgs.findIndex(
@@ -77,6 +100,7 @@ export default function useFileChat(spaceId: string, fileId: string) {
                         msgs[idx] = {
                             ...msgs[idx],
                             text: fullText,
+                            citations,
                             ...(realMessageId != null && { messageId: String(realMessageId) }),
                         };
                     }
@@ -110,7 +134,7 @@ export default function useFileChat(spaceId: string, fileId: string) {
     // --- Send a message ---
     const sendMessage = useCallback(
         (text: string, _files?: any[] | null) => {
-            if (!text.trim() || isStreaming || !enabled) return;
+            if (clearingRef.current || !text.trim() || isStreaming || !enabled) return;
 
             const userMessageId = v4();
             const userMessage: ChatMessage = {
@@ -156,19 +180,29 @@ export default function useFileChat(spaceId: string, fileId: string) {
 
     // --- Clear conversation (local + server) ---
     const clearConversation = useCallback(() => {
+        if (clearingRef.current) return;
         stopGenerating();
-        setMessages([]);
         if (enabled) {
-            clearFileChatHistory(spaceId, fileId).catch((err) =>
-                console.error("[FileChat] Failed to clear history:", err)
-            );
+            const operation = {};
+            clearingRef.current = operation;
+            setIsClearing(true);
+            const resource = resourceRef.current;
+            void clearFileChatHistory(spaceId, fileId).then(() => {
+                if (resourceRef.current === resource) setMessages([]);
+            }).catch(showApiError).finally(() => {
+                if (clearingRef.current === operation) {
+                    clearingRef.current = null;
+                    setIsClearing(false);
+                }
+            });
         }
+
     }, [stopGenerating, enabled, spaceId, fileId]);
 
     // --- Regenerate (resend last user message) ---
     const regenerate = useCallback(
         (parentMessageId: string) => {
-            if (isStreaming || !enabled) return;
+            if (clearingRef.current || isStreaming || !enabled) return;
 
             const parentMsg = messagesRef.current.find(
                 (m) => m.messageId === parentMessageId
@@ -202,6 +236,9 @@ export default function useFileChat(spaceId: string, fileId: string) {
     );
 
     return {
+        historyError,
+        isClearing,
+        retryHistory,
         messages,
         conversationId: "",
         title: "",

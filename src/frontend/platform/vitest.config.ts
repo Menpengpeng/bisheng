@@ -1,8 +1,11 @@
 import path from 'path';
 import { defineConfig } from 'vitest/config';
+import svgr from 'vite-plugin-svgr';
 
 export default defineConfig({
+  plugins: [svgr()],
   resolve: {
+    dedupe: ['react-i18next'],
     alias: {
       '@': path.resolve(__dirname, './src'),
     },

@@ -13,6 +13,21 @@ from sqlalchemy.sql.schema import Computed
 from sqlalchemy.sql.sqltypes import Boolean as _Boolean
 from sqlalchemy.types import TypeDecorator
 
+
+class PreciseDateTime(TypeDecorator):
+    """Microsecond ordering on MySQL; retain the native temporal type on DM8."""
+
+    impl = sa.DateTime
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "mysql":
+            from sqlalchemy.dialects.mysql import DATETIME
+
+            return dialect.type_descriptor(DATETIME(fsp=6))
+        return dialect.type_descriptor(sa.DateTime())
+
+
 # ---------------------------------------------------------------------------
 # Boolean DDL override for DaMeng
 # ---------------------------------------------------------------------------
@@ -267,6 +282,23 @@ def json_array_contains(column, value: str, dialect_name: str):
     )
 
 
+def json_object_field_equals(column, key: str, value: str, dialect_name: str):
+    """Return expression: does the top-level string field ``key`` of a JSON
+    object column equal ``value``?
+
+    MySQL: ``JSON_UNQUOTE(JSON_EXTRACT(col, '$.key')) = value``.
+    DaMeng/others: LIKE against the text serialised by ``JsonType`` —
+    ``json.dumps`` writes ``"key": "value"`` with the default ``": "``
+    separator, so the quoted pair is unambiguous inside the document.
+
+    ``key`` must be a plain identifier (no quotes / path syntax); ``value`` is
+    matched as a JSON string, so numeric fields must be stored as strings.
+    """
+    if dialect_name == "mysql":
+        return sa.func.json_unquote(sa.func.json_extract(column, f"$.{key}")) == value
+    return sa.cast(column, Text()).like(f'%"{key}": "{value}"%')
+
+
 def json_search_exists(column, value: str, dialect_name: str):
     """Return expression: does JSON column contain value anywhere (JSON_SEARCH equivalent)?
 
@@ -276,6 +308,46 @@ def json_search_exists(column, value: str, dialect_name: str):
     if dialect_name == "mysql":
         return sa.func.json_search(column, "all", value).isnot(None)
     return sa.cast(column, Text()).like(f"%{value}%")
+
+
+class StrJoinKey(FunctionElement):
+    """Cast a numeric key to text for joining against a VARCHAR key column.
+
+    MySQL renders ``CAST(x AS CHAR) COLLATE utf8mb4_unicode_ci``. The explicit
+    collation is not cosmetic: a bare ``CAST(... AS CHAR)`` carries
+    ``collation_connection`` (``utf8mb4_0900_ai_ci`` on a stock MySQL 8), while
+    the VARCHAR column it is compared against carries its table collation
+    (``utf8mb4_unicode_ci`` for BiSheng's schema). Two IMPLICIT collations that
+    differ make MySQL raise ``1267 Illegal mix of collations`` instead of
+    running the join. An EXPLICIT collation on one side wins over the other
+    side's IMPLICIT one, so this compiles cleanly whatever the table collation
+    is — and the keys being compared are digit strings, which every utf8mb4
+    collation orders identically.
+
+    DaMeng / others: a plain CAST — they do not carry per-column collations
+    that can clash, and ``COLLATE utf8mb4_unicode_ci`` is not valid there.
+
+    Usage::
+
+        kid_str = StrJoinKey(col(Knowledge.id))
+        query.outerjoin(Member, kid_str == Member.business_id)
+    """
+
+    inherit_cache = True
+    name = "str_join_key"
+    type = sa.String()
+
+
+@compiles(StrJoinKey)
+def _compile_str_join_key(element, compiler, **kw):
+    (inner,) = element.clauses
+    return compiler.process(sa.cast(inner, sa.String()), **kw)
+
+
+@compiles(StrJoinKey, "mysql")
+def _compile_str_join_key_mysql(element, compiler, **kw):
+    (inner,) = element.clauses
+    return f"{compiler.process(sa.cast(inner, sa.String()), **kw)} COLLATE utf8mb4_unicode_ci"
 
 
 def get_dialect_name(conn_or_engine) -> str:
@@ -315,28 +387,75 @@ def _reflect(conn, method: str, table_name: str) -> list:
     an already-migrated DaMeng schema.
     """
     last_result: list = []
-    for candidate in (table_name, table_name.upper(), table_name.lower()):
+    last_error: Exception | None = None
+    succeeded = False
+    for candidate in dict.fromkeys((table_name, table_name.upper(), table_name.lower())):
         try:
             result = getattr(inspect(conn), method)(candidate)
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             continue
+        succeeded = True
         if result:
             return result
         last_result = result
+    if not succeeded and last_error is not None:
+        raise last_error
     return last_result
 
 
+_DM_COLUMN_METADATA_SQL = sa.text(
+    """
+    SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH, NULLABLE
+    FROM SYS.ALL_TAB_COLUMNS
+    WHERE UPPER(OWNER) = UPPER(SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'))
+      AND UPPER(TABLE_NAME) = UPPER(:table_name)
+      AND UPPER(COLUMN_NAME) = UPPER(:column_name)
+    """
+)
+
+
+def _dm_column_metadata(conn, table_name: str, column_name: str) -> dict | None:
+    """Read one current-schema DM8 column without privileged system tables.
+
+    dmSQLAlchemy 2.0.12 joins ``SYS.SYSCOLUMNS`` while implementing
+    ``Inspector.get_columns()``. Normal application accounts cannot select
+    that global catalog table. ``SYS.ALL_TAB_COLUMNS`` is already scoped to
+    objects visible to the current account and provides all metadata needed by
+    BiSheng's migration guards.
+    """
+    row = (
+        conn.execute(
+            _DM_COLUMN_METADATA_SQL,
+            {"table_name": table_name, "column_name": column_name},
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        return None
+    return {str(key).lower(): value for key, value in row.items()}
+
+
 def table_exists(conn, table_name: str) -> bool:
-    for candidate in (table_name, table_name.upper(), table_name.lower()):
+    last_error: Exception | None = None
+    succeeded = False
+    for candidate in dict.fromkeys((table_name, table_name.upper(), table_name.lower())):
         try:
             if inspect(conn).has_table(candidate):
                 return True
-        except Exception:
+            succeeded = True
+        except Exception as exc:
+            last_error = exc
             continue
+    if not succeeded and last_error is not None:
+        raise last_error
     return False
 
 
 def column_exists(conn, table_name: str, column_name: str) -> bool:
+    if get_dialect_name(conn) == "dm":
+        return _dm_column_metadata(conn, table_name, column_name) is not None
     cols = [c["name"].lower() for c in _reflect(conn, "get_columns", table_name)]
     return column_name.lower() in cols
 
@@ -348,6 +467,9 @@ def index_exists(conn, table_name: str, index_name: str) -> bool:
 
 def get_column_type(conn, table_name: str, column_name: str) -> str | None:
     """Return the SQLAlchemy type class name in lowercase, e.g. 'longtext', 'clob', 'varchar'."""
+    if get_dialect_name(conn) == "dm":
+        column = _dm_column_metadata(conn, table_name, column_name)
+        return str(column["data_type"]).lower() if column is not None else None
     for c in _reflect(conn, "get_columns", table_name):
         if c["name"].lower() == column_name.lower():
             return type(c["type"]).__name__.lower()
@@ -355,6 +477,9 @@ def get_column_type(conn, table_name: str, column_name: str) -> str | None:
 
 
 def is_column_nullable(conn, table_name: str, column_name: str) -> bool:
+    if get_dialect_name(conn) == "dm":
+        column = _dm_column_metadata(conn, table_name, column_name)
+        return column is not None and str(column["nullable"]).upper() == "Y"
     for c in _reflect(conn, "get_columns", table_name):
         if c["name"].lower() == column_name.lower():
             return bool(c.get("nullable", False))
@@ -392,6 +517,12 @@ def name_sort_clauses(dialect_name: str, col: str = "name") -> list:
 
 def get_version_num_length(conn) -> int | None:
     """Return the character length of alembic_version.version_num, or None."""
+    if get_dialect_name(conn) == "dm":
+        column = _dm_column_metadata(conn, "alembic_version", "version_num")
+        if column is None:
+            return None
+        length = column.get("char_length") or column.get("data_length")
+        return int(length) if length is not None else None
     for c in _reflect(conn, "get_columns", "alembic_version"):
         if c["name"].lower() == "version_num":
             return getattr(c["type"], "length", None)

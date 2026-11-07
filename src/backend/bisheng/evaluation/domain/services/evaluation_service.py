@@ -138,7 +138,7 @@ class EvaluationService:
         file_ext = os.path.basename(file.filename).split(".")[-1]
         file_path = f"evaluation/dataset/{file_id}.{file_ext}"
         minio_client.put_object_sync(
-            bucket_name=minio_client.bucket, object_name=file_path, file=file.file, content_type=file.content_type
+            bucket_name=minio_client.bucket, object_name=file_path, file=file.file, content_type="text/csv"
         )
         return file_name, file_path
 
@@ -273,7 +273,7 @@ async def add_evaluation_task(evaluation_id: int):
                 raise Exception("Assistant not found")
             gpts_agent = AssistantAgent(assistant_info=assistant, chat_id="", invoke_user_id=evaluation.user_id)
             await gpts_agent.init_assistant()
-            for index, one in enumerate(csv_data):
+            for _index, one in enumerate(csv_data):
                 messages = await gpts_agent.run(one.get("question"))
                 if len(messages):
                     one["answer"] = messages[-1].content
@@ -283,7 +283,7 @@ async def add_evaluation_task(evaluation_id: int):
             workflow_info = FlowVersionDao.get_version_by_id(version_id=evaluation.version)
             if not workflow_info or workflow_info.flow_id != evaluation.unique_id:
                 raise Exception("workflow version info not found")
-            for index, one in enumerate(csv_data):
+            for _index, one in enumerate(csv_data):
                 one["answer"] = await asyncio.to_thread(
                     execute_workflow_get_answer, workflow_info, evaluation, one.get("question", "")
                 )
@@ -323,7 +323,7 @@ async def add_evaluation_task(evaluation_id: int):
         valid_count_dict = defaultdict(int)
         total_dict = {}
 
-        for index, one in enumerate(question):
+        for index, _one in enumerate(question):
             row_data = {}
             for field, title, unit_type in columns:
                 value = result.get(field)[index]

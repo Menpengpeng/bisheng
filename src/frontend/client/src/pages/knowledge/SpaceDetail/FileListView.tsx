@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 
 import { FileType, SpaceRole, updateFileEncoding, type KnowledgeFile } from "~/api/knowledge";
 import { NotificationSeverity } from "~/common";
@@ -27,7 +27,7 @@ interface FileListViewProps {
     currentUserRole?: SpaceRole | null;
     onDownload: (id: string) => void;
     onEditTags: (id: string) => void;
-    onRename: (id: string, newName: string) => void;
+    onRename: (id: string, newName: string) => void | Promise<void>;
     onDelete: (id: string) => void;
     onRetry: (id: string) => void;
     onNavigateFolder: (id: string) => void;
@@ -35,6 +35,8 @@ interface FileListViewProps {
     onValidateName: (name: string, isFolder: boolean, fileId: string, isCreating: boolean) => string | null;
     onCancelCreate?: () => void;
     permissionEntryIds?: Set<string>;
+    /** File ids whose lazy permission lookup is still in flight. */
+    pendingFileIds?: Set<string>;
     renameEntryIds?: Set<string>;
     deleteEntryIds?: Set<string>;
     downloadEntryIds?: Set<string>;
@@ -56,6 +58,7 @@ interface FileListViewProps {
     /** Keyword hit by the active search; matching substring in the file name is highlighted. */
     highlightKeyword?: string;
     onScroll?: React.UIEventHandler<HTMLDivElement>;
+    footer?: ReactNode;
     /** Extra spacing reserved below the last row (e.g. to clear a floating bottom dock). */
     bottomSpacing?: number;
 }
@@ -77,6 +80,7 @@ export function FileListView({
     onValidateName,
     onCancelCreate,
     permissionEntryIds,
+    pendingFileIds,
     renameEntryIds,
     deleteEntryIds,
     downloadEntryIds,
@@ -92,6 +96,7 @@ export function FileListView({
     highlightedTagIds,
     highlightKeyword,
     onScroll,
+    footer,
     bottomSpacing = 0,
 }: FileListViewProps) {
     const localize = useLocalize();
@@ -127,7 +132,7 @@ export function FileListView({
         } catch (e) {
             showToast?.({
                 message: localize("com_knowledge.file_encoding_update_failed"),
-                severity: NotificationSeverity.ERROR,
+                severity: NotificationSeverity.WARNING,
             });
             throw e;
         }
@@ -157,6 +162,7 @@ export function FileListView({
                         index={index}
                         isAdmin={isAdmin}
                         onEnsureFilePermissions={onEnsureFilePermissions}
+                        permissionsLoading={Boolean(pendingFileIds?.has(String(file.id)))}
                         isSelected={selectedFiles.has(file.id)}
                         onSelect={(val) => handleSelectFile(file.id, val)}
                         onDownload={() => onDownload(file.id)}
@@ -195,6 +201,7 @@ export function FileListView({
                         onFolderDrop={handleFolderDrop(file)}
                     />
                 ))}
+                {footer}
                 {bottomSpacing > 0 && <div style={{ height: bottomSpacing }} aria-hidden />}
             </div>
 

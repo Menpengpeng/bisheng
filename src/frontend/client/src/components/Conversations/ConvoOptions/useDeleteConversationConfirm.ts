@@ -1,3 +1,4 @@
+import { showApiError } from "~/api/request";
 import { useCallback } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -6,6 +7,7 @@ import { QueryKeys } from '~/types/chat';
 import { useDeleteConversationMutation } from '~/hooks/queries/data-provider';
 import { useConfirm } from '~/Providers';
 import { useLocalize, useNewConvo } from '~/hooks';
+import { closeChatStream } from '~/hooks/useAiChat';
 
 /**
  * Confirm-then-delete for a conversation, shared by the sidebar convo menu and
@@ -42,6 +44,11 @@ export function useDeleteConversationConfirm() {
         return;
       }
 
+      // A turn keeps streaming after you navigate away from its conversation, so
+      // deleting one has to stop it explicitly — the switch used to abort it as a
+      // side effect, and that side effect is gone on purpose.
+      closeChatStream(conversationId);
+
       const messages = queryClient.getQueryData<TMessage[]>([QueryKeys.messages, conversationId]);
       const thread_id = messages?.[messages.length - 1]?.thread_id;
       const endpoint = messages?.[messages.length - 1]?.endpoint;
@@ -49,6 +56,7 @@ export function useDeleteConversationConfirm() {
       deleteConvoMutation.mutate(
         { conversationId, thread_id, endpoint, source: 'button' },
         {
+          onError: showApiError,
           onSuccess: () => {
             if (currentConvoId === conversationId || currentConvoId === 'new') {
               newConversation();

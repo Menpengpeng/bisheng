@@ -11,11 +11,13 @@ from loguru import logger
 from bisheng.common.errcode.permission import (
     AuthorizationModelMismatchError,
     InvalidPermissionModeError,
+    PermissionEnumerationIncompleteError,
     PermissionInvalidResourceError,
     PermissionPublishNotReadyError,
     PermissionVersionConflictError,
 )
 from bisheng.core.openfga.client import FGAClient
+from bisheng.core.openfga.contextual import contextual_operation
 from bisheng.permission.application.control_state import (
     PermissionResourceSnapshot,
     RuntimeCatalogSnapshot,
@@ -38,6 +40,7 @@ from bisheng.permission.application.sql_runtime import (
     stable_grant_key,
 )
 from bisheng.permission.domain.models import ProjectionOperationStatus
+from bisheng.permission.domain.repositories.creation_rollback_repository import CreationRollbackRepository
 from bisheng.permission.domain.schemas import (
     VerifiedPermissionTarget,
     VisibleObjectEnumerationResult,
@@ -76,6 +79,7 @@ from bisheng.permission.domain.services.projection_service import (
     ProjectionPlan,
     ProjectionService,
     ProjectionTupleDelta,
+    restore_projection_plan,
 )
 from bisheng.permission.domain.services.resource_lifecycle_policy import (
     build_delete_plan,
@@ -85,6 +89,14 @@ from bisheng.permission.domain.services.resource_lifecycle_policy import (
 )
 
 HIGHER_CONSISTENCY = "HIGHER_CONSISTENCY"
+
+# A service account that creates a top-level resource gets a revocable
+# "manager" grant through a CREATOR_GRANT source (see ``authorize_created``).
+# The manager model stops at level 3, but delete is level 4, so that service
+# account could not delete what it created. This exception adds delete only,
+# only for the creating service account, and only while that source is active.
+_CREATOR_DELETE_ACTION = "delete"
+_CREATOR_DELETE_MODEL_KEY = "manager"
 
 
 def _idempotency_key(*parts: object) -> str:
@@ -129,6 +141,7 @@ class F048PermissionRuntime:
         self._modes = modes
         self._explain = explain
 
+    @contextual_operation
     async def check_action(
         self,
         actor: PermissionActor,
@@ -137,8 +150,12 @@ class F048PermissionRuntime:
     ) -> bool:
         if action == "visible":
             return await self._decision.check_visible(actor, target)
-        return await self._decision.check_action(actor, target, action)
+        allowed = await self._decision.check_action(actor, target, action)
+        if not allowed and await self._creator_grant_allows_delete(actor, target, action):
+            return True
+        return allowed
 
+    @contextual_operation
     async def batch_check_actions(
         self,
         actor: PermissionActor,
@@ -146,12 +163,91 @@ class F048PermissionRuntime:
         action: str,
     ) -> tuple[bool, ...]:
         if action != "visible":
-            return await self._decision.batch_check_actions(
+            results = await self._decision.batch_check_actions(
                 actor,
                 targets,
                 action,
             )
+            if action != _CREATOR_DELETE_ACTION or actor.subject_type != "service_account" or all(results):
+                return results
+            return tuple(
+                [
+                    allowed or await self._creator_grant_allows_delete(actor, target, action)
+                    for target, allowed in zip(targets, results, strict=True)
+                ]
+            )
         return await self._decision.batch_check_visible(actor, targets)
+
+    async def _creator_grant_allows_delete(
+        self,
+        actor: PermissionActor,
+        target: VerifiedPermissionTarget,
+        action: str,
+    ) -> bool:
+        """Let a service account delete a resource it created.
+
+        The check reads the SQL grant roster, which is the source of truth for
+        the OpenFGA projection, and does not change the authorization model or
+        add a second owner. It allows only when all of these are true:
+
+        - the action is ``delete`` and the subject is a service account (a
+          delegated call or a PAT authorizes as a user and never matches);
+        - the target is in the caller's tenant;
+        - an active "manager" grant that applies to the target has an active
+          CREATOR_GRANT source for this exact service account. For a CUSTOM
+          target that is its local grant. For an INHERIT target (a file or a
+          folder) it is the grant on the nearest CUSTOM ancestor, so the
+          exception follows the inheritance that gives the manager rights.
+
+        When the owner revokes the source or moves it to another model, the
+        exception stops at once. Any read failure denies.
+        """
+
+        if (
+            action != _CREATOR_DELETE_ACTION
+            or actor.subject_type != "service_account"
+            or target.tenant_id != actor.tenant_id
+        ):
+            return False
+        try:
+            catalog = await self._runtime_catalog()
+            models = tuple(
+                item.snapshot
+                for item in catalog.models
+                if item.snapshot.model_key == _CREATOR_DELETE_MODEL_KEY and item.snapshot.active
+            )
+            if not models:
+                return False
+            mode = await self._require_current_target(target)
+            if str(mode.mode).upper() == "CUSTOM":
+                grants = await self._state.load_grants(target=target, models=models)
+            else:
+                inherited = await self._state.inherited_grant_set(target=target, models=models)
+                grants = inherited.grants if inherited is not None else ()
+        except PermissionPublishNotReadyError:
+            return False
+        subject_id = str(actor.subject_id)
+        allowed = any(
+            grant.active
+            and grant.model.active
+            and grant.model.model_key == _CREATOR_DELETE_MODEL_KEY
+            and source.active
+            and source.source_type == "CREATOR_GRANT"
+            and source.subject_type == "service_account"
+            and source.subject_id == subject_id
+            and source.userset_relation is None
+            for grant in grants
+            for source in grant.sources
+        )
+        if allowed:
+            logger.info(
+                "F048 creator delete allowed subject=service_account:{} target={}:{} tenant={}",
+                subject_id,
+                target.resource_type,
+                target.resource_id,
+                target.tenant_id,
+            )
+        return allowed
 
     async def current_catalog(self) -> RuntimeCatalogSnapshot:
         return await self._runtime_catalog()
@@ -199,6 +295,7 @@ class F048PermissionRuntime:
 
         return await self._state.mode_for_target(target)
 
+    @contextual_operation
     async def list_action_objects(
         self,
         actor: PermissionActor,
@@ -214,6 +311,7 @@ class F048PermissionRuntime:
             max_results=max_results,
         )
 
+    @contextual_operation
     async def list_visible_objects(
         self,
         actor: PermissionActor,
@@ -248,6 +346,35 @@ class F048PermissionRuntime:
     ) -> dict[tuple[int, str, str], PermissionResourceSnapshot]:
         return await self._state.permission_snapshots(resources)
 
+    def tenant_use_grant(self, target, catalog):
+        """Build a revocable grant for the current tenant's members."""
+        candidates = [
+            row.snapshot
+            for row in catalog.models
+            if row.snapshot.active
+            and row.snapshot.derived_level is not None
+            and "use" in row.snapshot.action_codes
+            and set(row.snapshot.action_codes) <= {"use", "download"}
+        ]
+        if not candidates:
+            raise PermissionPublishNotReadyError(msg="A use-only permission model is required")
+        model = min(candidates, key=lambda item: (item.derived_level or 0, item.model_key))
+        grant = self._empty_grant(target=target, model=model)
+        source = self._sources.canonicalize_source(
+            source_id=1,
+            subject_type="tenant",
+            subject_id=str(target.tenant_id),
+            source_type="TENANT",
+        )
+        source = replace(
+            source,
+            source_id=stable_assignee_id(
+                grant_key=grant.grant_id,
+                source_fingerprint=source.source_fingerprint,
+            ),
+        )
+        return self._sources.add_source(grant, source)
+
     async def authorize_created(
         self,
         *,
@@ -257,6 +384,7 @@ class F048PermissionRuntime:
         mode: str,
         source_type: str = "CREATOR",
         protected: bool = True,
+        shared_with_tenant: bool = False,
         idempotency_key: str | None = None,
     ):
         if (
@@ -281,6 +409,44 @@ class F048PermissionRuntime:
             source_service=self._sources,
             owner_model=owner_model,
         )
+        creation_grants: tuple[GrantSnapshot, ...] = ()
+        creation_deltas: tuple[ProjectionTupleDelta, ...] = ()
+        if shared_with_tenant:
+            if target.resource_type != "linsight_skill":
+                raise PermissionInvalidResourceError()
+            shared = self.tenant_use_grant(target, catalog)
+            creation_grants = (shared.grant,)
+            creation_deltas = shared.deltas
+        if actor.subject_type == "service_account" and mode.upper() == "CUSTOM":
+            manager_model = next(
+                (
+                    item.snapshot
+                    for item in catalog.models
+                    if item.snapshot.model_key == "manager" and item.snapshot.active
+                ),
+                None,
+            )
+            if manager_model is None:
+                raise PermissionPublishNotReadyError(msg="Manager permission model is unavailable")
+            manager_grant = self._empty_grant(target=target, model=manager_model)
+            provisional = self._sources.canonicalize_source(
+                source_id=1,
+                subject_type="service_account",
+                subject_id=str(actor.subject_id),
+                source_type="CREATOR_GRANT",
+                source_ref=f"{target.resource_type}:{target.resource_id}",
+                protected=False,
+            )
+            creator_source = replace(
+                provisional,
+                source_id=stable_assignee_id(
+                    grant_key=manager_grant.grant_id,
+                    source_fingerprint=provisional.source_fingerprint,
+                ),
+            )
+            creator_mutation = self._sources.add_source(manager_grant, creator_source)
+            creation_grants += (creator_mutation.grant,)
+            creation_deltas += creator_mutation.deltas
         return await self._owner.project_created(
             OwnerProjectionContext(
                 target=target,
@@ -301,6 +467,8 @@ class F048PermissionRuntime:
                     owner_user_id,
                 ),
                 permission_mode=mode.upper(),
+                creation_grants=creation_grants,
+                creation_deltas=creation_deltas,
             )
         )
 
@@ -321,9 +489,12 @@ class F048PermissionRuntime:
         if expected_mode != "CUSTOM":
             raise InvalidPermissionModeError()
         catalog = await self._runtime_catalog()
+        shared = self.tenant_use_grant(target, catalog) if target.resource_type in {"tool", "linsight_skill"} else None
         return await self._owner.project_created(
             OwnerProjectionContext(
                 target=target,
+                creation_grants=(shared.grant,) if shared else (),
+                creation_deltas=shared.deltas if shared else (),
                 owner_grant=None,
                 source_id=1,
                 owner_user_id=None,
@@ -344,6 +515,74 @@ class F048PermissionRuntime:
             )
         )
 
+    async def rollback_created(
+        self,
+        *,
+        actor: PermissionActor,
+        target: VerifiedPermissionTarget,
+        owner_user_id: int,
+    ) -> None:
+        """Undo a fresh file/folder creation using its frozen projection ledger."""
+        if target.resource_type not in {"folder", "knowledge_file", "app"} or target.resource_version != 0:
+            raise PermissionInvalidResourceError()
+        repository = CreationRollbackRepository()
+        creation = await repository.aget_operation_by_idempotency(
+            _idempotency_key("create", target.tenant_id, target.resource_type, target.resource_id, owner_user_id)
+        )
+        if creation is None:
+            # Validation failed before any durable permission mutation was prepared.
+            return
+        original = restore_projection_plan(creation, await repository.aget_operation_tuples(creation.id))
+        if (
+            original.tenant_id != target.tenant_id
+            or original.scope_key != f"{target.resource_type}:{target.resource_id}"
+            or original.operation_type != "RESOURCE_CREATE"
+            or original.expected_version != 0
+            or original.target_version != 1
+            or any(delta.action != "WRITE" for delta in original.deltas)
+        ):
+            raise PermissionInvalidResourceError()
+        catalog = await self._runtime_catalog()
+        if (original.store_id, original.model_id) != (catalog.store_id, catalog.model_id):
+            raise PermissionPublishNotReadyError(msg="Creation rollback catalog changed")
+        # Resolve an uncertain create before issuing its inverse. Fail-closed
+        # operations remain fenced and retain the business row for recovery.
+        await self._projection.execute(original)
+        plan = replace(
+            original,
+            idempotency_key=_idempotency_key("rollback-create", creation.id),
+            operation_type="RESOURCE_CREATE_ROLLBACK",
+            expected_version=1,
+            target_version=2,
+            deltas=tuple(
+                replace(delta, phase="COMMIT", sequence=index, action="DELETE")
+                for index, delta in enumerate(original.deltas)
+            ),
+        )
+        operation = await self._projection.prepare(plan)
+        if str(operation.status) == ProjectionOperationStatus.PREPARED.value:
+            try:
+                current_target = target.model_copy(update={"resource_version": 1})
+                mode = await self._state.mode_for_target(current_target)
+                if (
+                    mode.version != 1
+                    or mode.parent_type != target.parent_type
+                    or mode.parent_id != target.parent_id
+                    or (mode.operation_id, mode.projection_state)
+                    not in {(creation.id, "CURRENT"), (operation.id, "PROJECTING")}
+                ):
+                    raise PermissionVersionConflictError(msg="Resource changed after creation")
+                await self._state.mark_projecting(
+                    target=current_target,
+                    expected_catalog_release_id=catalog.release_id,
+                    operation_id=int(operation.id),
+                )
+            except Exception as exc:
+                await self._projection.abandon_prepared(plan, exc)
+                raise
+        outcome = await self._projection.execute(plan)
+        await repository.purge(target, outcome.operation_id)
+
     async def project_delete(
         self,
         *,
@@ -352,7 +591,6 @@ class F048PermissionRuntime:
         idempotency_key: str | None = None,
     ) -> ProjectionOutcome:
         catalog = await self._runtime_catalog()
-        await self._require_current_target(target)
         plan = build_delete_plan(
             target,
             store_id=catalog.store_id,
@@ -370,6 +608,17 @@ class F048PermissionRuntime:
         operation = await self._projection.prepare(plan)
         if str(operation.status) == ProjectionOperationStatus.PREPARED.value:
             try:
+                mode = await self._state.mode_for_target(target)
+                if (
+                    mode.version != target.resource_version
+                    or mode.parent_type != target.parent_type
+                    or mode.parent_id != target.parent_id
+                    or not (
+                        mode.projection_state == "CURRENT"
+                        or (mode.projection_state == "PROJECTING" and mode.operation_id == int(operation.id))
+                    )
+                ):
+                    raise PermissionPublishNotReadyError(msg="Delete target does not match its projection reservation")
                 await self._state.mark_projecting(
                     target=target,
                     expected_catalog_release_id=catalog.release_id,
@@ -647,6 +896,34 @@ class F048PermissionRuntime:
     ) -> tuple[GrantModelSnapshot, ...]:
         return self._grants.grantable_models(await self.build_grant_context(actor=actor, target=target))
 
+    async def manageable_model_keys(
+        self,
+        *,
+        actor: PermissionActor,
+        target: VerifiedPermissionTarget,
+    ) -> frozenset[str]:
+        """Read existing-binding eligibility without loading the complete roster."""
+
+        await self._require_manage_permission(actor, target)
+        await self._require_current_target(target)
+        catalog = await self._runtime_catalog()
+        return await self._manageable_model_keys(actor, target, catalog)
+
+    async def _manageable_model_keys(
+        self,
+        actor: PermissionActor,
+        target: VerifiedPermissionTarget,
+        catalog: RuntimeCatalogSnapshot,
+    ) -> frozenset[str]:
+        system_authorized = self._system_authorized(actor, target)
+        capabilities = () if system_authorized else await self._grant_capabilities(actor, target)
+        models = self._grants.manageable_models_for_capabilities(
+            models=tuple(item.snapshot for item in catalog.models),
+            capabilities=capabilities,
+            system_authorized=system_authorized,
+        )
+        return frozenset(model.model_key for model in models)
+
     async def mutate_grants(
         self,
         *,
@@ -666,6 +943,77 @@ class F048PermissionRuntime:
             changes=changes,
             expected_resource_version=expected_resource_version,
             expected_catalog_release_id=expected_catalog_release_id,
+            idempotency_key=idempotency_key,
+        )
+
+    async def migrate_capability_default(self, *, actor, target, remove_public_markers: bool):
+        """Replace legacy public access with an ordinary tenant grant atomically."""
+        if target.resource_type not in {"tool", "linsight_skill"} or not actor.super_admin:
+            raise PermissionInvalidResourceError()
+        context = await self.build_grant_context(actor=actor, target=target)
+        shared = self.tenant_use_grant(target, await self.current_catalog())
+        deltas = tuple(
+            ProjectionTupleDelta(
+                phase="STAGE",
+                sequence=index,
+                action="DELETE",
+                user="user:*",
+                relation=relation,
+                object=f"{target.resource_type}:{target.resource_id}",
+            )
+            for index, relation in enumerate(("visible", "system_use_marker") if remove_public_markers else ())
+        )
+        return await self._grants.mutate(
+            context,
+            changes=(
+                CanonicalGrantChange(
+                    operation="ADD", model_key=shared.grant.model.model_key, source=shared.grant.sources[0]
+                ),
+            ),
+            expected_resource_version=target.resource_version,
+            expected_catalog_release_id=context.current_catalog_release_id,
+            idempotency_key=f"capability-default-v1:{target.tenant_id}:{target.resource_type}:{target.resource_id}",
+            migration_deltas=deltas,
+        )
+
+    async def remove_absent_resource_sources(
+        self,
+        *,
+        actor: PermissionActor,
+        tenant_id: int,
+        resource_type: str,
+        resource_id: str,
+        assignees: tuple[tuple[int, int], ...],
+        idempotency_key: str,
+    ):
+        """Remove grant sources left on a resource that no longer exists.
+
+        Resource deletion only closes the ``permission_enabled`` gate; the grant
+        roster stays. The caller must confirm through the business port that the
+        resource is gone. The removal then uses the ordinary Grant mutation, so
+        the SQL roster and the OpenFGA tuples change in one projection operation.
+        ``assignees`` holds (assignee id, expected assignee version) pairs.
+        """
+
+        target = await self._state.absent_resource_target(
+            tenant_id=tenant_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+        )
+        catalog = await self._runtime_catalog()
+        return await self.mutate_grants(
+            actor=actor,
+            target=target,
+            changes=tuple(
+                CanonicalGrantChange(
+                    operation="REMOVE",
+                    assignee_id=assignee_id,
+                    expected_assignee_version=version,
+                )
+                for assignee_id, version in assignees
+            ),
+            expected_resource_version=target.resource_version,
+            expected_catalog_release_id=catalog.release_id,
             idempotency_key=idempotency_key,
         )
 
@@ -771,6 +1119,10 @@ class F048PermissionRuntime:
                         grant_key=target_grant.grant_id,
                         source_fingerprint=source.source_fingerprint,
                     ),
+                )
+                stable_source = await self._state.resolve_business_source_version(
+                    target=target,
+                    source=stable_source,
                 )
                 changes.append(
                     CanonicalGrantChange(
@@ -984,13 +1336,108 @@ class F048PermissionRuntime:
         await self._require_manage_permission(actor, target)
         catalog = await self._runtime_catalog()
         mode = await self._require_current_target(target)
-        return await self._state.load_source_page(
+        rows, has_more = await self._state.load_source_page(
             target=target,
             mode=mode.mode,
             models=tuple(item.snapshot for item in catalog.models),
             after_id=after_id,
             limit=limit,
         )
+        if not any(row.editable for row in rows):
+            return rows, has_more
+        manageable = await self._manageable_model_keys(actor, target, catalog)
+        return tuple(replace(row, editable=row.editable and row.model_key in manageable) for row in rows), has_more
+
+    async def read_effective_action_sources(self, *, target, action):
+        """Trusted business read after its own qualification; not an HTTP roster.
+
+        The owning business service must verify the target and reader first.
+        This does not change the manage_permission gate on ordinary rosters.
+        """
+        catalog = await self._runtime_catalog()
+        models = tuple(item.snapshot for item in catalog.models)
+        before = await self._state.source_read_stamp(target=target, models=models)
+        mode = await self._require_current_target(target)
+        eligible = tuple(model for model in models if action in model.action_codes)
+        rows, after_id = [], 0
+        while eligible:
+            page, more = await self._state.load_source_page(
+                target=target, mode=mode.mode, models=eligible, after_id=after_id, limit=500
+            )
+            rows.extend(page)
+            if len(rows) > 5000:
+                raise PermissionEnumerationIncompleteError(reason="summary_limit")
+            if not more:
+                break
+            next_id = max((row.source_id for row in page), default=after_id)
+            if next_id <= after_id or len(rows) >= 5000:
+                raise PermissionEnumerationIncompleteError(reason="source_pagination_incomplete")
+            after_id = next_id
+        after = await self._state.source_read_stamp(target=target, models=models)
+        latest = await self._runtime_catalog()
+        await self._require_current_target(target)
+        if before != after or (catalog.release_id, catalog.version, catalog.checksum) != (
+            latest.release_id,
+            latest.version,
+            latest.checksum,
+        ):
+            raise PermissionPublishNotReadyError(reason="summary_scope_changed")
+        return tuple(rows)
+
+    async def list_effective_direct_user_ids_by_model(
+        self,
+        *,
+        target: VerifiedPermissionTarget,
+        model_keys: tuple[str, ...],
+    ) -> dict[str, tuple[str, ...]]:
+        """Resolve effective direct-user assignees for trusted server-side routing.
+
+        The caller must first obtain ``target`` from the owning business adapter.
+        This intentionally reads the SQL Grant roster instead of legacy direct
+        OpenFGA relations, and never expands departments or user groups into users.
+        """
+
+        normalized_keys = tuple(dict.fromkeys(key.strip() for key in model_keys if key.strip()))
+        if not normalized_keys:
+            return {}
+
+        catalog = await self._runtime_catalog()
+        mode = await self._require_current_target(target)
+        requested = set(normalized_keys)
+        models = tuple(item.snapshot for item in catalog.models if item.snapshot.model_key in requested)
+        result: dict[str, list[str]] = {key: [] for key in normalized_keys}
+        seen: dict[str, set[str]] = {key: set() for key in normalized_keys}
+        if not models:
+            return dict.fromkeys(normalized_keys, ())
+
+        after_id = 0
+        while True:
+            rows, has_more = await self._state.load_source_page(
+                target=target,
+                mode=mode.mode,
+                models=models,
+                after_id=after_id,
+                limit=500,
+            )
+            for row in rows:
+                if (
+                    row.model_key in requested
+                    and row.subject_type == "user"
+                    and row.userset_relation is None
+                    and row.subject_id not in seen[row.model_key]
+                ):
+                    seen[row.model_key].add(row.subject_id)
+                    result[row.model_key].append(row.subject_id)
+            if not has_more:
+                break
+            if not rows:
+                raise PermissionPublishNotReadyError(msg="Permission source pagination did not advance")
+            next_after_id = max(row.source_id for row in rows)
+            if next_after_id <= after_id:
+                raise PermissionPublishNotReadyError(msg="Permission source pagination did not advance")
+            after_id = next_after_id
+
+        return {key: tuple(result[key]) for key in normalized_keys}
 
     async def _mode_context(
         self,
@@ -1022,6 +1469,7 @@ class F048PermissionRuntime:
             existing_visible_sources=visible_sources,
         )
 
+    @contextual_operation
     async def _grant_capabilities(
         self,
         actor: PermissionActor,
@@ -1036,7 +1484,7 @@ class F048PermissionRuntime:
         consistency = await self._consistency(target)
         checks = [
             {
-                "user": f"user:{actor.user_id}",
+                "user": actor.fga_subject,
                 "relation": f"can_grant_level_{level}",
                 "object": f"{target.resource_type}:{target.resource_id}",
             }

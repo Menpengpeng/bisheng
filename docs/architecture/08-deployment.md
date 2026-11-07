@@ -14,7 +14,7 @@ BiSheng 采用 Docker Compose 编排全部基础设施和应用服务。生产�
 | `bisheng-backend-worker` | `dataelement/bisheng-backend:v2.4.0` | (无) | Celery 全部 Worker + Beat，通过 `entrypoint.sh worker` 启动 |
 | `bisheng-frontend` | `dataelement/bisheng-frontend:v2.4.0` | 3001:3001 | Nginx 托管前端静态资源 |
 | `bisheng-milvus-etcd` | `quay.io/coreos/etcd:v3.5.5` | (无) | Milvus 元数据存储（ETCD） |
-| `bisheng-milvus-minio` | `minio/minio:RELEASE.2023-03-20T20-16-18Z` | 9100:9000, 9101:9001 | Milvus 数据存储（MinIO），同时作为业务对象存储 |
+| `bisheng-milvus-minio` | `minio/minio:RELEASE.2023-03-20T20-16-18Z` | 9100:9000 | Milvus 数据存储（MinIO），同时作为业务对象存储。管理台端口 9001 不对外映射，见 [对象存储凭证与端口](#对象存储凭证与端口) |
 | `bisheng-milvus-standalone` | `milvusdb/milvus:v2.5.10` | 19530:19530, 9091:9091 | 向量数据库，依赖 ETCD 和 MinIO |
 | `bisheng-es` | `bitnamilegacy/elasticsearch:8.12.0` | 9200:9200, 9300:9300 | 全文检索引擎 |
 
@@ -43,7 +43,6 @@ bisheng-milvus-standalone
 
 | 文件 | 容器名 | 镜像 | 端口 | 用途 |
 |------|--------|------|------|------|
-| `docker-compose-ft.yml` | `bisheng-ft-server` | `dataelement/bisheng-ft:v0.5.0` | 8000 | 模型微调服务，需要 GPU（nvidia driver） |
 | `docker-compose-uns.yml` | `bisheng-unstructured` | `dataelement/bisheng-unstructured:v0.0.3.14` | 10001 | 非结构化文档解析服务 |
 | `docker-compose-office.yml` | `bisheng-office` | `onlyoffice/documentserver:7.1.1` | 8701:80 | OnlyOffice 文档预览与编辑 |
 
@@ -78,6 +77,62 @@ bisheng-milvus-standalone
 └─────────────────┘
 ```
 
+### 对象存储凭证与端口
+
+MinIO 保存全部上传文档、知识库文件、报告模板与对话附件，Milvus 的向量段也存在同一个 bucket 里。
+
+**凭证来自 `docker/.env`，compose 不提供默认值**（从 `docker/.env.example` 复制）：
+
+```bash
+cd docker && cp .env.example .env
+echo "MINIO_ROOT_USER=$(openssl rand -hex 8)"      >> .env
+echo "MINIO_ROOT_PASSWORD=$(openssl rand -hex 16)" >> .env
+```
+
+未设置时 `docker compose up` 直接拒绝启动并提示变量名。这一份凭证被 MinIO 服务、后端、异步 worker 和 Milvus 四处引用，compose 已统一注入，无需手工同步。**Milvus 尤其要注意**：不给它凭证时它会回落到内置的厂商默认值，服务照常启动、健康检查照常通过，只有读取向量集合时才报错。轮换凭证后务必做一次知识库检索验证。
+
+**端口**：
+
+| 端口 | 说明 |
+|---|---|
+| 9100 → 9000 | 数据接口，**保留映射**。文档服务（OnlyOffice）是独立的 compose 项目，访问不到容器网络里的 `minio`，报告模板必须通过宿主机地址下载，因此 `BS_MINIO_SHAREPOINT` 需指向宿主机。请限制可访问来源并配置 TLS |
+| 9101 → 9001 | 管理台，**不映射**。它是覆盖全部文件的网页界面，技术栈中无组件依赖它。排查问题用 SSH 隧道：`ssh -L 9001:localhost:9001 <host>`，再访问 `http://localhost:9001` |
+
+**从 3.0.0-beta3 之前的版本升级**
+
+旧版 compose 写死 `minioadmin/minioadmin` 并映射了 9100、9101 两个端口。上面的凭证要求**只作用于我们随包发的 compose 模板**，代码不依赖特定凭证，所以**已有部署保持原样也能正常运行**——升级镜像不会覆盖你自己那份 compose。但那样口子也原样保留。
+
+分两步收，不要一起做：
+
+**第一步（必做，零风险）**：在现有 compose 里删掉 `- "9101:9001"`，执行 `docker compose up -d minio` 重建该容器。不碰凭证、不碰数据、不影响任何功能——技术栈中没有组件访问管理台。需要管理台时改用 SSH 隧道。
+
+**第二步（可选，需停机窗口）**：轮换凭证。凭证必须在 MinIO 服务、后端、worker、**Milvus** 四处同时更新。Milvus 最易遗漏：旧 compose 没给它传凭证，它用的是内置默认值；只改前三处会导致它连不上，而**容器照常启动、健康检查照常通过**，只有检索知识库时才报错。换完务必做一次知识库检索验证，不要只看容器状态。
+
+**不要整份替换 compose**：现有文件通常已改过镜像 tag、端口、`BS_MINIO_SHAREPOINT` 等，整份覆盖会冲掉这些改动。按上面两步挑行修改即可。
+
+### 代码节点开关
+
+工作流「代码节点」默认关闭，由系统配置控制：
+
+```yaml
+workflow:
+  code_node_enabled: false
+```
+
+该节点会执行用户填写的 Python 代码，当前版本**没有执行沙箱**，代码以后端进程的权限运行，可读取服务器文件、环境变量（含数据库与对象存储凭证）并访问内网。因此开启后，**所有能创建或编辑工作流的用户都等同于持有这台服务器的命令执行权限**——这与其在毕昇中的角色无关，也与是否部署在内网无关。仅在「所有能创建应用的人都可信」的环境下开启。
+
+只有字面量 `true` 视为开启；写成 `"true"`、`1`、`yes` 一律按关闭处理。改动约 100 秒生效，无需重启。
+
+关闭状态下运行到该节点的工作流会失败，失败原因中会指明需开启的配置项；编排页的代码节点上也有常驻提示。
+
+> **升级注意**：存量工作流中的代码节点在管理员开启前不可运行。升级前可用以下语句评估影响面：
+>
+> ```sql
+> SELECT COUNT(*) FROM flow WHERE data LIKE '%"type": "code"%';
+> ```
+
+执行沙箱正在开发中，届时本开关将不再是唯一防线。
+
 ### 密码加密
 
 `config.yaml` 中的 `database_url` 和 `redis_url` 密码字段使用 Fernet 对称加密。加密密钥硬编码在 `src/backend/bisheng/core/config/settings.py` 的 `secret_key` 变量中。Settings 类在加载配置时自动解密：
@@ -102,9 +157,41 @@ bisheng-milvus-standalone
 | `logger_conf` | `LoggerConf` | 日志级别与处理器 |
 | `password_conf` | `PasswordConf` | 密码策略（有效期、错误锁定） |
 | `cookie_conf` | `CookieConf` | JWT Cookie 配置（默认过期 86400s） |
+| `jwt_secret` | `str` | 登录态 JWT 签名密钥。**代码无默认值**（F068）：yaml 配了就用；未配置 / 为空 / 等于历史内置默认值时，首次需要的进程随机生成并写入 `config` 表（键 `jwt_secret`），全部进程共用。轮换：改 yaml 或删该记录后重启，全员重登 |
 | `system_login_method` | `SystemLoginMethod` | 登录方式（商业版标识、多端登录） |
 | `mcp` | `McpConf` | MCP 协议配置 |
 | `information_conf` | `IntelligenceCenterConf` | 情报中心配置 |
+| `open_api` | `OpenApiConf` | 开放 API：个人密钥开关、`public_base_url`（对外地址，见下节） |
+
+### 反向代理与对外地址
+
+技能包脚本从**用户自己的电脑**回调平台，所以它需要「用户浏览器访问平台用的地址」。这个地址有两个来源：
+
+1. **配置命令里的浏览器地址（优先）**：「AI 助手接入」弹窗的一键复制命令是 `search.py --configure --base-url <浏览器地址> --api-key <密钥>`，地址取自浏览器的 `window.location.origin`，写入用户本机凭据文件后成为默认地址。浏览器看到的就是正确的协议、域名和端口，也天然适配「内网 IP / 域名 / VPN 多入口」。
+2. **包内烘焙地址（兜底）**：下载 zip 时后端现场渲染，推导顺序在 `bisheng/open_api/api/public_base_url.py`：
+   1. `config.yaml` 的 `open_api.public_base_url`（`scheme://host[:port][/prefix]`，启动期校验）；
+   2. 反向代理传来的 `X-Forwarded-Proto` / `X-Forwarded-Host`（取逗号链首值），退而取 `Host`；
+   3. 进程绑定的 socket。
+   落到第 2 步的 `Host` 或第 3 步时，后端按进程记一次 warning；管理员打开「AI 助手接入」弹窗时，若包内地址与浏览器地址不一致会看到提示。
+
+仓库自带的 nginx（`docker/nginx/conf.d/*.conf`、镜像内 `src/frontend/nginx.conf`）已通过 `map` 传这两个转发头：外层代理已带头则透传，否则用本机 `$scheme` 与含端口的 `$http_host`。部署时按形态核对：
+
+| 形态 | 包内地址会不会对 | 建议 |
+|---|---|---|
+| 单机 compose，浏览器直连 nginx | 对 | 无需配置 |
+| TLS 在 nginx 之前终结（云负载均衡、外层反代） | 外层不传 `X-Forwarded-Proto` 时会变成 `http://` | 外层转发 `X-Forwarded-Proto/Host`，或配 `open_api.public_base_url` |
+| k8s ingress | ingress-nginx 默认 `use-forwarded-headers: false`，会用自己看到的协议覆盖外层头 | 前面还有 TLS 终结时开启 `use-forwarded-headers`，或配配置项 |
+| 商业版网关，前面有仓库 nginx | 对：网关追加而非覆盖转发头，首值仍是 nginx 给的浏览器地址（105 实测） | 无需配置 |
+| 商业版网关直接对外 | 对：网关虽改写 `Host`，但会补上 `X-Forwarded-Host`（用户访问网关用的地址）与协议（105 实测） | 网关之前若还有 TLS 终结，需转发 `X-Forwarded-Proto` 或配配置项 |
+| compose 多节点 | 每台机器各读自己的 `config.yaml` | 配置项要在所有节点一致 |
+| 路径前缀部署 | 只能靠配置项 | 配 `open_api.public_base_url` |
+
+两点取舍：
+
+- 配置项会让**所有人**的包内地址都是同一个值；多入口访问的平台若配了它，某些网络下包内地址反而连不上。这时依赖第 1 个来源即可，包内地址只是兜底。
+- 仓库 nginx 未配 `server_name`，接受任意 `Host`。公网暴露的实例建议配置 `open_api.public_base_url` 或限定 `server_name`，避免包内地址与出站白名单被伪造的 `Host` 带偏。
+
+`open_api.public_base_url` 是 `open_api` 段的子键，只对已认识该段的镜像（3.0.0-beta1+）安全；不要给老镜像的 `config.yaml` 加未注释的 `open_api:` 顶层键。
 
 ## 本地混合开发部署
 
@@ -145,26 +232,18 @@ npm start -- --host 0.0.0.0   # 端口 3001，API 代理到 localhost:7860
 
 ## 远程开发工作流
 
-项目支持本地编辑、远程运行的开发模式。代码在本地 Mac 编辑，通过 rsync 同步到远程服务器执行。
+个人开发机用「git 检出 + systemd」部署：目标机上的 `/opt/bisheng` 是真实的 git 检出，部署就是把它收敛到分支头再重启服务，`git rev-parse HEAD` 就是这台机器的版本。
 
-### 同步脚本
+旧的 rsync 同步脚本 `bisheng-sync.sh`（个人本地文件，已被 `.gitignore` 排除）**不要再用来部署**。rsync 只覆盖有改动的文件，目标机上更早落后的文件和已删除的文件都不会被处理，「目标机是否等于某个提交」无法回答。
 
-项目根目录的 `bisheng-sync.sh` 提供三种同步模式：
+### 114（192.168.106.114）
 
-| 命令 | 说明 |
-|------|------|
-| `./bisheng-sync.sh up` | 本地代码推送到远程服务器 |
-| `./bisheng-sync.sh down` | 远程代码拉取到本地 |
-| `./bisheng-sync.sh watch` | 监听本地文件变化，自动推送到远程 |
-
-### 日常流程
-
-1. 终端 A 常驻 `./bisheng-sync.sh watch`，监听文件变化自动同步
-2. 本地 IDE（Claude Code / Cursor 等）编辑 `/Users/lilu/Projects/bisheng` 下的代码
-3. 改动自动推送到远程服务器，远程进程加载新代码
-4. 浏览器通过 `http://192.168.106.114:8860` 访问（Nginx 反向代理）
-
-注意：如果未开启 watch 模式，修改代码后需手动执行 `./bisheng-sync.sh up` 推送到远程。
+| 项 | 内容 |
+|----|------|
+| 部署 | `bash /opt/bisheng-ops/deploy.sh`（默认分支 `feat/3.0.0-vibe`）。脚本和运维说明在独立的运维仓 `/opt/bisheng-ops/`，不进产品仓，先读它的 README |
+| 后端 | 6 个 systemd unit（`bisheng-api`、4 个 `bisheng-celery-*`、`bisheng-linsight-worker`）+ `bisheng.target` |
+| 入口 | `http://192.168.106.114:4101/`（管理端，vite 开发服务）、`/workspace/`（用户端静态包）、`/apps/<slug>/`（托管应用） |
+| 托管应用运行时层 | 2026-10-27 起以容器运行（协议 v2 + 宿主隔离），`deploy.sh` 不更新它；换镜像的步骤见运维仓 README。为什么不能再用 systemd 形态见 [14-app-factory-deployment.md](14-app-factory-deployment.md) 「形态二」 |
 
 ## Celery Worker 启动模式
 
@@ -194,17 +273,78 @@ npm start -- --host 0.0.0.0   # 端口 3001，API 代理到 localhost:7860
 
 ## 运维管理脚本
 
-`docker/deploy.sh` 提供常用运维操作的快捷命令：
+`scripts/deploy.sh` 提供常用运维操作的快捷命令：
 
 | 命令 | 用法 | 说明 |
 |------|------|------|
-| `logs` | `./deploy.sh logs backend [-n 200]` | 实时跟踪容器日志 |
-| `version` | `./deploy.sh version [v3.0.0]` | 查看或修改镜像版本号 |
-| `exec` | `./deploy.sh exec backend` | 进入容器 Shell |
-| `update` | `./deploy.sh update [backend]` | 拉取最新镜像并重启 |
-| `restart` | `./deploy.sh restart [backend worker]` | 重启指定服务 |
+| `logs` | `bash scripts/deploy.sh logs backend [-n 200]` | 实时跟踪容器日志 |
+| `version` | `bash scripts/deploy.sh version [v3.0.0]` | 查看或修改镜像版本号 |
+| `exec` | `bash scripts/deploy.sh exec backend` | 进入容器 Shell |
+| `update` | `bash scripts/deploy.sh update [backend]` | 拉取最新镜像并重启 |
+| `restart` | `bash scripts/deploy.sh restart [backend worker]` | 重启指定服务 |
 
 支持的 service 别名：`backend`、`worker`（backend_worker）、`frontend`、`mysql`、`redis`、`es`（elasticsearch）、`minio`、`milvus`、`etcd`。
+
+### Existing-environment updates
+
+Compose image references live in `.env`; use the template when adding new
+settings manually. `BISHENG_SANDBOX_IMAGE` replaces `SANDBOX_IMAGE_TAG`.
+
+Use `bash scripts/deploy.sh` from the matching release checkout to update an existing Compose
+deployment. Keep the release's Compose file, mounted entrypoint and image versions
+together. Run one deployment job in a maintenance window; control ingress and
+queue consumers according to the environment's release procedure.
+
+### Work knowledge retrieval
+
+The backend image must include the Work knowledge registration script from PR
+#2546. Set the intended image version with `bash scripts/deploy.sh version <tag>`,
+then preview the target image against the service's existing configuration:
+
+```bash
+bash scripts/deploy.sh upgrade-preview
+```
+
+This pulls the configured backend image and runs a read-only catalog/permission
+preview in a disposable container with the backend service's mounts, environment
+and network. Existing infrastructure must be running. The preview requires a
+compatible database schema and CURRENT F048 permission runtime; complete their
+version-specific prerequisites when the preview reports an error.
+
+Use the preview's Store ID and the actual audit operator's user ID to update:
+
+```bash
+bash scripts/deploy.sh update --confirm-store-id <store-id> --operator-id <user-id>
+# To update only the backend:
+bash scripts/deploy.sh update backend --confirm-store-id <store-id> --operator-id <user-id>
+```
+
+For an update containing `backend`, the release script:
+
+1. Validates the required confirmation arguments before Docker operations.
+2. Pulls the selected images, starts the backend and waits up to 180 seconds for
+   readiness. The API entrypoint owns the schema migration.
+3. Executes the knowledge tool's registration and permission reconciliation using
+   the running backend's configuration. Apply exits successfully only after the
+   tool exists and its permission projection is CURRENT.
+4. Updates the remaining selected services, waits for readiness, and reports
+   completion after the service status command succeeds.
+
+Any failed stage returns a nonzero exit status and stops subsequent stages. If
+knowledge maintenance fails, the backend has already been updated; maintain the
+release window, resolve the reported error and repeat the same update command.
+Registration and permission reconciliation support repeated execution. The
+deployment script leaves schema/data recovery to the release operator.
+
+Worker-only and frontend-only updates retain their selected service scope.
+`restart` restarts the existing deployment. Direct `docker compose up` and external
+deployment pipelines must explicitly run the same maintenance operation and
+require its successful exit before declaring their release complete; see
+[`src/backend/scripts/README.md`](../../src/backend/scripts/README.md).
+
+After deployment, verify ordinary-user tool discovery and single-space plus K1/K2
+multi-space retrieval with the expected document citations. Deployment checks and
+real-account acceptance are recorded separately.
 
 ## 升级 checklist
 
@@ -256,6 +396,18 @@ compose 下 `backend` 与 `backend_worker` 恰好 bind-mount 同一个 `/app/dat
   本地缓存目录由 `linsight.skills_cache_dir` 指定（留空 = 进程缓存目录下的 `linsight_skills`）。
   **不要**把缓存目录指向共享卷。
 
+### v3.0 · 登录态 JWT 签名密钥不再内置（F068）
+
+< v3.0.0-beta2 的代码里带有一个公开的 `jwt_secret` 默认值，默认部署从未覆盖它，任何人都能用它伪造超管登录态（NVDB 报告）。升级后：
+
+| 情况 | 升级后行为 | 用户影响 |
+|------|-----------|---------|
+| `config.yaml` 从未配置 `jwt_secret`（绝大多数） | 首次启动自动生成随机密钥写入 `config.jwt_secret`，所有 api / worker 进程共用 | 全员重新登录一次 |
+| `config.yaml` 配了自己的私有值 | 继续使用 | 无感 |
+| `config.yaml` 抄了老代码里的默认值 | 命中黑名单，等同未配置 | 全员重新登录一次 |
+
+无需手动步骤。个人访问令牌与开放 API 凭据不走这把密钥，不受影响。要主动轮换：改 yaml 的值，或 `DELETE FROM config WHERE key='jwt_secret'` 后重启全部后端进程。
+
 ## 多节点部署
 
 官方 `docker/docker-compose.yml` 是**单机单副本**编排，但组件本身按多节点设计（`entrypoint.sh` 中
@@ -273,8 +425,22 @@ ownership）。横向扩容时按下表核对。
 [C8](../constitution.md#c8-no-shared-state-on-the-local-filesystem)。单机 compose 下 `backend` 与
 `backend_worker` 共享同一个 `/app/data`，会让「跨进程传文件」看起来能用——这是巧合，不是保证。
 
+## 备份
+
+权威存储只有三处，备份也只看这三处：**MySQL / DM8**（全部业务元数据）、**MinIO**（知识库文件、
+灵思技能 bundle、托管应用代码包等对象）、**Redis**（缓存与队列，可丢，重启后自愈）。节点本地磁盘
+（`/app/data`、进程缓存目录）不在备份范围内——它们是缓存，见上文「多节点部署」。
+
+装了应用工场运行时层的环境**多一处**：托管应用的 SQLite 库放在 runtime-manager 所在机器的本机磁盘
+（`{data_root}/apps/{app_id}/db/`），既不在 MySQL 也不在 MinIO 里，平台本体的备份**覆盖不到它**。
+它的快照方法（WAL 库不能裸 tar）、对象存储里哪些前缀属于托管应用、以及恢复顺序，见
+[`14-app-factory-deployment.md`](14-app-factory-deployment.md) 的「备份与恢复」一节。
+
 ## 相关文档
 
 - 系统架构总览 -- `docs/architecture/01-architecture-overview.md`
 - 配置系统详解 -- Settings 类定义在 `src/backend/bisheng/core/config/settings.py`
 - 开发指南 -- `docs/architecture/09-development-guide.md`
+- **应用工场部署与配置** -- `docs/architecture/14-app-factory-deployment.md`（v3.0 新增的托管应用
+  运行时层：runtime-manager / app-proxy 两个服务、`/apps/` 的 nginx location、`app_runtime` 与
+  `open_platform` 配置项、⚠️ 加键与发版的先后顺序。**这一层默认不安装**，不装时本文其余内容不受影响）

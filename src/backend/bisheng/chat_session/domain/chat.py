@@ -2,6 +2,7 @@ import json
 from typing import TYPE_CHECKING
 
 from loguru import logger
+from sqlmodel import col, select
 
 if TYPE_CHECKING:
     from bisheng.api.v1.schema.chat_schema import ChatMessageHistoryResponse
@@ -12,7 +13,10 @@ from bisheng.api.v1.schema.base_schema import PageList
 from bisheng.api.v1.schema.chat_schema import AppChatList
 from bisheng.api.v1.schema.workflow import WorkflowEventType
 from bisheng.api.v1.schemas import ChatList
+from bisheng.chat_session.domain.repositories.workflow_file_repository import WorkflowFileRepository
 from bisheng.chat_session.domain.services.chat_message_service import _resolve_leaf_tenant_id
+from bisheng.chat_session.domain.services.workflow_file_service import WorkflowFileService
+from bisheng.chat_session.domain.session_subject import SessionSubject
 from bisheng.chat_session.utils import get_session_app_type
 from bisheng.common.constants.enums.telemetry import BaseTelemetryTypeEnum
 from bisheng.common.dependencies.user_deps import UserPayload
@@ -20,16 +24,20 @@ from bisheng.common.errcode.http_error import NotFoundError, UnAuthorizedError
 from bisheng.common.schemas.telemetry.event_data_schema import DeleteMessageSessionEventData, NewMessageSessionEventData
 from bisheng.common.services import telemetry_service
 from bisheng.common.services.base import BaseService
+from bisheng.core.context.tenant import bypass_tenant_filter
 from bisheng.core.logger import trace_id_var
+from bisheng.core.storage.minio.minio_manager import get_minio_storage
 from bisheng.database.models.assistant import AssistantDao
 from bisheng.database.models.flow import FlowDao, FlowType
 from bisheng.database.models.mark_record import MarkRecordDao, MarkRecordStatus
 from bisheng.database.models.mark_task import MarkTaskDao
-from bisheng.core.storage.minio.minio_manager import get_minio_storage
 from bisheng.database.models.message import ChatMessageDao
 from bisheng.database.models.session import MessageSession, MessageSessionDao, SensitiveStatus
 from bisheng.database.models.user_group import UserGroupDao
 from bisheng.user.domain.models.user import UserDao
+
+if TYPE_CHECKING:
+    from bisheng.api.v1.schema.chat_schema import ChatMessageHistoryResponse
 
 
 class ChatSessionService:
@@ -45,7 +53,7 @@ class ChatSessionService:
         if not chat_id or not flow_id:
             return []
         session_info = await MessageSessionDao.async_get_one(chat_id=chat_id)
-        if not session_info or session_info.flow_id != flow_id:
+        if not session_info or session_info.is_delete or session_info.flow_id != flow_id:
             return []
 
         history = await ChatMessageDao.afilter_message_by_chat_id(
@@ -57,12 +65,55 @@ class ChatSessionService:
         return history
 
     @staticmethod
-    async def get_session_info(chat_id: str) -> MessageSession | None:
+    async def get_session_info(
+        chat_id: str,
+        subject: SessionSubject | None = None,
+    ) -> MessageSession | None:
         """Get session details with logo URL resolved."""
         res = await MessageSessionDao.async_get_one(chat_id)
+        if res and res.is_delete:
+            res = None
+        if subject is not None and (res is None or not subject.matches(res)):
+            raise NotFoundError.http_exception()
         if res:
             res.flow_logo = WorkFlowService.get_logo_share_link(res.flow_logo)
         return res
+
+    @staticmethod
+    async def get_subject_session(chat_id: str, subject: SessionSubject) -> MessageSession:
+        session = await MessageSessionDao.async_get_one(chat_id)
+        if session is None or not subject.matches(session):
+            raise NotFoundError.http_exception()
+        return session
+
+    @staticmethod
+    async def get_subject_session_if_exists(
+        chat_id: str,
+        subject: SessionSubject,
+    ) -> MessageSession | None:
+        session = await MessageSessionDao.async_get_one(chat_id)
+        if session is not None and not subject.matches(session):
+            raise NotFoundError.http_exception()
+        return session
+
+    @staticmethod
+    async def get_public_session_for_resolution(chat_id: str) -> MessageSession | None:
+        """Resolve a public-v3 row, allowing an unpersisted draft to have no title."""
+
+        with bypass_tenant_filter():
+            session = await MessageSessionDao.async_get_one(chat_id)
+        if session is None:
+            return None
+        if session.is_delete or session.api_subject_type != "public_v3":
+            raise NotFoundError.http_exception()
+        return session
+
+    @staticmethod
+    async def create_subject_session(
+        session: MessageSession,
+        subject: SessionSubject,
+    ) -> MessageSession:
+        return await MessageSessionDao.async_insert_one(subject.stamp(session))
 
     @staticmethod
     async def rename_session(conversation_id: str, name: str) -> None:
@@ -72,12 +123,11 @@ class ChatSessionService:
     @staticmethod
     async def _own_conversation_or_raise(chat_id: str, login_user: UserPayload) -> MessageSession:
         """Load a conversation, refusing anyone who doesn't own it."""
-        session_chat = await MessageSessionDao.async_get_one(chat_id)
-        if not session_chat or session_chat.is_delete:
-            raise NotFoundError.http_exception()
-        if session_chat.user_id != login_user.user_id:
-            raise UnAuthorizedError.http_exception()
-        return session_chat
+        subject = SessionSubject.natural_person(
+            tenant_id=_resolve_leaf_tenant_id(login_user),
+            user_id=login_user.user_id,
+        )
+        return await ChatSessionService.get_subject_session(chat_id, subject)
 
     @staticmethod
     def _attachments_of(messages: list) -> list[dict]:
@@ -95,6 +145,19 @@ class ChatSessionService:
         return attachments
 
     @staticmethod
+    def _attachment_objects(messages: list, owner) -> list[dict]:
+        attachments = ChatSessionService._attachments_of(messages)
+        return [
+            *attachments,
+            *[
+                {**asset, "_workflow_image": True}
+                for attachment in attachments
+                for asset in (attachment.get("derived_assets") or [])
+                if isinstance(asset, dict) and WorkflowFileService.is_owned_image(asset, owner.tenant_id, owner.user_id)
+            ],
+        ]
+
+    @staticmethod
     async def _remove_attachments(chat_id: str) -> None:
         """Drop the files a deleted conversation was holding.
 
@@ -103,9 +166,14 @@ class ChatSessionService:
         the user staring at a conversation that refuses to disappear.
         """
         try:
-            messages = await ChatMessageDao.aget_messages_by_chat_id(chat_id=chat_id, limit=1000)
+            messages = await WorkflowFileRepository.attachment_messages(chat_id)
+            owner = await MessageSessionDao.async_get_one(chat_id)
+            if owner is None:
+                return
             object_names = {
-                f["object_name"] for f in ChatSessionService._attachments_of(messages) if f.get("object_name")
+                f["object_name"]
+                for f in ChatSessionService._attachment_objects(messages, owner)
+                if f.get("object_name")
             }
             if not object_names:
                 return
@@ -128,13 +196,15 @@ class ChatSessionService:
         caller-supplied name would open the whole bucket to anyone with an
         account.
         """
-        await ChatSessionService._own_conversation_or_raise(chat_id, login_user)
+        owner = await ChatSessionService._own_conversation_or_raise(chat_id, login_user)
 
-        messages = await ChatMessageDao.aget_messages_by_chat_id(chat_id=chat_id, limit=1000)
-        for attachment in ChatSessionService._attachments_of(messages):
+        messages = await WorkflowFileRepository.attachment_messages(chat_id)
+        for attachment in ChatSessionService._attachment_objects(messages, owner):
             if str(attachment.get("file_id")) != str(file_id):
                 continue
             object_name = attachment.get("object_name")
+            if attachment.get("_workflow_image") and attachment.get("state") != "ready":
+                raise NotFoundError.http_exception()
             if not object_name:
                 # Written before attachments were made permanent: the file is
                 # gone with the temp bucket. Say so rather than guess.
@@ -149,7 +219,17 @@ class ChatSessionService:
         """Delete a session with audit logging and telemetry."""
         session_chat = await MessageSessionDao.async_get_one(chat_id)
 
-        if not session_chat or session_chat.is_delete:
+        if not session_chat:
+            return
+        if (
+            session_chat.user_id != login_user.user_id
+            or session_chat.tenant_id != _resolve_leaf_tenant_id(login_user)
+            or session_chat.api_subject_type is not None
+        ):
+            raise NotFoundError.http_exception()
+        if session_chat.is_delete:
+            # Keep manifests after soft deletion so a failed object removal can be retried.
+            await ChatSessionService._remove_attachments(chat_id)
             return
 
         if session_chat.flow_type == FlowType.ASSISTANT.value:
@@ -163,7 +243,9 @@ class ChatSessionService:
             if flow_info and flow_info.flow_type == FlowType.WORKFLOW.value:
                 await AuditLogService.delete_chat_workflow(login_user, request_ip, flow_info)
 
-        await MessageSessionDao.delete_session(chat_id)
+        await WorkflowFileRepository.soft_delete_owned_session(
+            chat_id, user_id=login_user.user_id, tenant_id=session_chat.tenant_id
+        )
         await ChatSessionService._remove_attachments(chat_id)
 
         await telemetry_service.log_event(
@@ -269,18 +351,18 @@ class ChatSessionService:
         return PageList(list=result, total=total)
 
     @staticmethod
-    def get_user_session_list(user_id: int, page: int = 1, limit: int = 10) -> list[ChatList]:
+    def get_subject_session_list(
+        subject: SessionSubject,
+        page: int = 1,
+        limit: int = 10,
+    ) -> list[ChatList]:
         """List daily chat and linsight sessions for a user, sorted by update_time descending."""
         allowed_flow_types = [FlowType.WORKSTATION.value, FlowType.LINSIGHT.value]
-
-        res = MessageSessionDao.filter_session(
-            user_ids=[user_id],
-            flow_type=allowed_flow_types,
-            page=page,
-            limit=limit,
-            include_delete=False,
-            order_by_update_time=True,
+        statement = subject.filter_statement(select(MessageSession)).where(
+            col(MessageSession.flow_type).in_(allowed_flow_types)
         )
+        statement = statement.order_by(col(MessageSession.update_time).desc())
+        res = MessageSessionDao.get_statement_results_sync(statement, page=page, limit=limit)
 
         if not res:
             return []
@@ -308,15 +390,29 @@ class ChatSessionService:
         ]
 
     @staticmethod
+    def get_user_session_list(
+        login_user: UserPayload,
+        page: int = 1,
+        limit: int = 10,
+    ) -> list[ChatList]:
+        subject = SessionSubject.natural_person(
+            tenant_id=_resolve_leaf_tenant_id(login_user),
+            user_id=login_user.user_id,
+        )
+        return ChatSessionService.get_subject_session_list(subject, page, limit)
+
+    @staticmethod
     def get_or_create_session(
         chat_id: str,
         flow_id: str,
         login_user: UserPayload,
         request_ip: str,
     ) -> MessageSession | None:
-        """Get existing session or create a new one with audit log and telemetry.
+        """Get or create a session for Gateway's violation-message logging.
 
-        Used when adding messages to ensure a session exists.
+        Called by ``ChatMessageService.add_qa_messages`` when Gateway persists a
+        violation Q&A record. New sessions are intentionally marked as
+        ``SensitiveStatus.VIOLATIONS``; existing sessions are returned unchanged.
 
         F017 §5.4: new MessageSession rows carry ``tenant_id = user's leaf
         tenant`` (NOT the resource tenant) per INV-T13. Refuse to persist

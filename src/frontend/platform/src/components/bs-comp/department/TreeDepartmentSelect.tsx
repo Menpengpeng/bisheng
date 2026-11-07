@@ -1,3 +1,5 @@
+import { Button } from '@bisheng/ui';
+import { Outlined } from "bisheng-icons";
 /**
  * 树状部门选择器（TreeDepartmentSelect）
  *
@@ -5,18 +7,19 @@
  * F038：数据不再由父组件传整树，而是组件内部经 `useLazyDepartmentTree` 懒加载
  * （`GET /api/v1/departments/{children,search,{id}/path-tree}`），大组织下秒开。
  */
-import { Button } from "@/components/bs-ui/button"
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/bs-ui/popover"
-import { captureAndAlertRequestErrorHoc } from "@/controllers/request"
-import { getDepartmentPathTreeApi } from "@/controllers/API/department"
-import { DepartmentSearchResult, DepartmentTreeNode } from "@/types/api/department"
-import { cn } from "@/utils"
-import { ChevronDown } from "lucide-react"
-import type { ReactNode } from "react"
-import { useEffect, useState } from "react"
-import { useTranslation } from "react-i18next"
-import { LazyDepartmentTree } from "./LazyDepartmentTree"
-import { useLazyDepartmentTree } from "./useLazyDepartmentTree"
+
+import { Popover,PopoverContent,PopoverTrigger } from "@/components/bs-ui/popover";
+import { getDepartmentPathTreeApi } from "@/controllers/API/department";
+import { showApiError } from "@/controllers/request";
+import { DepartmentSearchResult,DepartmentTreeNode } from "@/types/api/department";
+import { cn } from "@/utils";
+
+import type { ReactNode } from "react";
+import { useEffect,useState } from "react";
+import { useTranslation } from "react-i18next";
+import { departmentDisplayName } from "./departmentDisplayName";
+import { LazyDepartmentTree } from "./LazyDepartmentTree";
+import { useLazyDepartmentTree,type UseLazyDepartmentTreeOptions } from "./useLazyDepartmentTree";
 
 export type TreeDepartmentSelectValue = number | null
 
@@ -42,6 +45,8 @@ export interface TreeDepartmentSelectProps {
   modal?: boolean
   /** 物化路径前缀；隐藏该子树（移动部门时禁止选自身/后代作为新父级）。 */
   excludeSubtreePath?: string
+  /** Optional candidate source for pickers with additional eligibility rules. */
+  dataSource?: Pick<UseLazyDepartmentTreeOptions, "cacheKey" | "fetchChildren" | "fetchSearch" | "fetchPathTree">
 }
 
 /** 在树中按主键 id 查找节点（保留供仍持有整树的调用方使用）。 */
@@ -92,12 +97,12 @@ export function findDepartmentAncestorIds(
 }
 
 /** Join a single-path pruned tree (path-tree response) into a `a / b / c` label. */
-function pathLabelOf(tree: DepartmentSearchResult | null): string {
+function pathLabelOf(tree: DepartmentSearchResult | null, defaultName: string): string {
   if (!tree) return ""
   const names: string[] = []
   let cur: DepartmentTreeNode | undefined = tree.roots[0]
   while (cur) {
-    names.push(cur.name)
+    names.push(departmentDisplayName(cur, defaultName))
     cur = cur.children?.[0]
   }
   return names.join(" / ")
@@ -117,14 +122,16 @@ export function TreeDepartmentSelect({
   searchPlaceholder,
   modal = true,
   excludeSubtreePath,
+  dataSource,
 }: TreeDepartmentSelectProps) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
-  const [labelPath, setLabelPath] = useState("")
+  const [labelTree, setLabelTree] = useState<DepartmentSearchResult | null>(null)
+  const labelPath = pathLabelOf(labelTree, t("bs:department.defaultOrganization"))
   // Pickers never offer archived departments as new picks (the backend excludes
   // them from children/search); an archived current value can still be echoed
   // via path-tree (AC-18). Load only while the popover is open.
-  const tree = useLazyDepartmentTree({ includeArchived: false, autoLoad: open, excludeSubtreePath })
+  const tree = useLazyDepartmentTree({ ...dataSource, includeArchived: false, autoLoad: open, excludeSubtreePath })
 
   const ph = placeholder ?? t("system.treeDepartmentSelectPlaceholder")
   const searchPh = searchPlaceholder ?? t("bs:department.search")
@@ -134,7 +141,7 @@ export function TreeDepartmentSelect({
 
   // Reveal (expand + highlight) the current value each time the popover opens.
   useEffect(() => {
-    if (open && value != null) void tree.reveal(value)
+    if (open && value != null) void tree.reveal(value).catch(showApiError)
     if (!open) tree.setKeyword("")
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, value])
@@ -143,13 +150,13 @@ export function TreeDepartmentSelect({
   // even for a deep or archived current value without loading the whole tree).
   useEffect(() => {
     if (value == null) {
-      setLabelPath("")
+      setLabelTree(null)
       return
     }
     let cancelled = false
-    captureAndAlertRequestErrorHoc(getDepartmentPathTreeApi(value)).then((res) => {
-      if (!cancelled) setLabelPath(pathLabelOf((res as DepartmentSearchResult | null) ?? null))
-    })
+    getDepartmentPathTreeApi(value).then((res) => {
+      if (!cancelled) setLabelTree((res as DepartmentSearchResult | null) ?? null)
+    }).catch(showApiError)
     return () => {
       cancelled = true
     }
@@ -169,25 +176,18 @@ export function TreeDepartmentSelect({
     <Popover open={open} onOpenChange={setOpen} modal={modal}>
       <div className={cn("w-full", className)}>
         <PopoverTrigger asChild>
-          <Button
-            type="button"
-            variant="outline"
-            disabled={disabled}
-            className={cn(
+          <Button type="button" variant="outlined" disabled={disabled} className={cn(
               "h-9 w-full justify-between px-3 font-normal text-foreground hover:bg-background",
               !value && !allowNone && "text-muted-foreground",
               triggerClassName
-            )}
-            aria-expanded={open}
-            aria-haspopup="listbox"
-          >
+            )} aria-expanded={open} aria-haspopup="listbox" color="default">
             <span
               className="min-w-0 flex-1 truncate text-left"
               title={value != null ? displayLabel : undefined}
             >
               {displayLabel}
             </span>
-            <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-60" />
+            <Outlined.Down className="ml-2 h-4 w-4 shrink-0 opacity-60" />
           </Button>
         </PopoverTrigger>
       </div>

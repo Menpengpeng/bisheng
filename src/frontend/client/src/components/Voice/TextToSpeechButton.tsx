@@ -1,9 +1,13 @@
-// @ts-strict-ignore
 "use client"
 
+import { isApiError } from "@bisheng/api-client"
+import { showApiError } from "~/api/request"
+
 import { Outlined } from "bisheng-icons"
-import { textToSpeech } from "~/api"
-import { useGetWorkbenchModelsQuery } from "~/hooks/queries/data-provider"
+import { readVoiceAudioPath, synthesizeVoice } from "~/api/voice"
+import { NotificationSeverity } from "~/common"
+import { useLocalize } from "~/hooks"
+import { useVoiceModels, useVoiceTarget } from "~/hooks/useVoice"
 import { useToastContext } from "~/Providers"
 import { cn } from "~/utils"
 import {
@@ -20,6 +24,8 @@ interface TextToSpeechButtonProps {
 export const TextToSpeechButton = ({ messageId, text, className }: TextToSpeechButtonProps) => {
     const { activeMessageId, isLoadingAudio, isPlaying, playAudio, pauseAudio, resumeAudio } = useAudioPlayer()
     const { showToast } = useToastContext()
+    const localize = useLocalize()
+    const voiceTarget = useVoiceTarget()
 
     // Check current message playback state
     const isCurrentMessage = activeMessageId === messageId
@@ -29,22 +35,17 @@ export const TextToSpeechButton = ({ messageId, text, className }: TextToSpeechB
     // Fetch audio URL from API
     const fetchAudioUrl = async (content: string): Promise<string> => {
         try {
-            const response = await textToSpeech(content)
+            const response = await synthesizeVoice(content, voiceTarget)
 
             // Parse API response to get audio path
-            let audioPath = ""
-            if (typeof response === "string") {
-                audioPath = response
-            } else if (response?.data) {
-                audioPath = typeof response.data === "string" ? response.data : response.data?.data || ""
-            }
+            const audioPath = readVoiceAudioPath(response)
 
             if (!audioPath) {
                 throw new Error("Failed to parse audio path from response")
             }
 
             // Construct full URL
-            return `${__APP_ENV__.BASE_URL}${audioPath}`
+            return /^https?:\/\//i.test(audioPath) ? audioPath : `${__APP_ENV__.BASE_URL}${audioPath}`
         } catch (error) {
             console.error("Failed to fetch audio URL:", error)
             // Re-throw as-is (not wrapped) so a backend business error (e.g. TTS
@@ -76,15 +77,8 @@ export const TextToSpeechButton = ({ messageId, text, className }: TextToSpeechB
             await playAudio(messageId, () => fetchAudioUrl(text))
         } catch (error) {
             console.error("Failed to play audio:", error)
-            // A backend business error (e.g. TTS synthesis failure, code 10026)
-            // already got its localized toast from the request interceptor
-            // (skip403Redirect path) — only show the generic fallback here for
-            // errors that never reached that path (network failure, malformed
-            // response, etc.), so the user doesn't see two toasts. State reset
-            // on error is handled inside the store.
-            if (!(error as any)?.status_code) {
-                showToast({ message: "播放功能不可用，请联系管理员", status: "error" })
-            }
+            if (isApiError(error)) showApiError(error)
+            else showToast({ message: localize('com_voice.playback_unavailable'), severity: NotificationSeverity.WARNING })
         }
     }
 
@@ -112,7 +106,7 @@ export const TextToSpeechButton = ({ messageId, text, className }: TextToSpeechB
     }
 
     // Disabled when tts_model is not configured
-    const { data: modelData } = useGetWorkbenchModelsQuery()
+    const { data: modelData } = useVoiceModels()
     if (!modelData?.tts_model?.id) return null
 
     return (
@@ -126,5 +120,3 @@ export const TextToSpeechButton = ({ messageId, text, className }: TextToSpeechB
         </button>
     )
 }
-
-

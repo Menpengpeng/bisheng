@@ -1,13 +1,9 @@
+import { ApiRequestFailure } from "~/components/ApiRequestFailure";
+import { Tooltip as SharedTooltip, TooltipProvider as SharedTooltipProvider } from '@bisheng/ui';
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { useRecoilState } from "recoil";
 import { Outlined } from "bisheng-icons";
 import { TextareaAutosize } from "~/components/ui";
-import {
-    Tooltip,
-    TooltipContent,
-    TooltipProvider,
-    TooltipTrigger,
-} from "~/components/ui/Tooltip2";
+
 import AiChatMessages from "~/components/Chat/AiChatMessages";
 import { ArticleQAIllustration } from "~/components/illustrations";
 import AiModelSelect from "~/components/Chat/AiModelSelect";
@@ -16,11 +12,14 @@ import { SendIcon } from "~/components/svg";
 import { useLocalize, usePrefersMobileLayout } from "~/hooks";
 import { useAuthContext } from "~/hooks/AuthContext";
 import { useGetBsConfig, useGetWorkbenchModelsQuery } from "~/hooks/queries/data-provider";
-import useChatModelMemo from "~/hooks/useChatModelMemo";
+import {
+    readAdminDefaultModelId,
+    type ChatModelOption,
+} from "~/hooks/useChatModelResolution";
+import { useSurfaceModel } from "~/hooks/useSurfaceModel";
 import useFileChat from "~/hooks/useFileChat";
 import { useConfirm } from "~/Providers";
 import { cn } from "~/utils";
-import store from "~/store";
 
 interface FileAiDockProps {
     /** Knowledge space id. */
@@ -33,6 +32,8 @@ interface ModelSelectProps {
     options?: any[];
     value?: any;
     onChange: (val: string) => void;
+    /** Value repair by AiModelSelect — applied but never remembered. */
+    onAutoChange?: (val: string) => void;
     disabled?: boolean;
 }
 
@@ -100,6 +101,7 @@ function DockInput({
             value={model.value}
             options={model.options}
             onChange={model.onChange}
+            onAutoChange={model.onAutoChange}
         />
     ) : null;
 
@@ -194,7 +196,19 @@ export function FileAiDock({ spaceId, fileId }: FileAiDockProps) {
     const assistantTitle =
         bsConfig?.knowledge_space?.assistant_name?.trim() ||
         localize("com_knowledge.ai_assistant");
-    const [chatModel, setChatModel] = useRecoilState(store.chatModel);
+    // Own model selection, isolated from /c: picking a model here must not
+    // change what the main chat shows (see useSurfaceModel).
+    const { data: workbenchCfg } = useGetWorkbenchModelsQuery();
+    const {
+        model: surfaceModel,
+        selectModel,
+        repairModel,
+    } = useSurfaceModel({
+        userId: user?.id,
+        surfaceKey: 'fileAi',
+        models: (bsConfig?.models || []) as ChatModelOption[],
+        adminDefaultId: readAdminDefaultModelId(workbenchCfg, 'daily'),
+    });
     const [open, setOpen] = useState(false);
     const [inputText, setInputText] = useState("");
     const isH5 = usePrefersMobileLayout();
@@ -244,24 +258,23 @@ export function FileAiDock({ spaceId, fileId }: FileAiDockProps) {
         conversationId,
         title,
         isLoading,
+        historyError,
+        isClearing,
+        retryHistory,
         isStreaming,
         sendMessage,
         stopGenerating,
         clearConversation,
         regenerate,
-    } = useFileChat(spaceId, fileId);
-
-    useChatModelMemo(user, bsConfig as any);
+    } = useFileChat(spaceId, fileId, surfaceModel);
 
     const modelOptions = bsConfig?.models;
     const model: ModelSelectProps = {
         options: modelOptions,
-        value: chatModel.id,
+        value: surfaceModel.id,
         disabled: !modelOptions?.length,
-        onChange: (val) => {
-            const m = modelOptions?.find((x) => x.id === val);
-            setChatModel({ id: Number(val), name: m?.displayName || "" });
-        },
+        onChange: selectModel,
+        onAutoChange: repairModel,
     };
 
     const placeholder = localize("com_knowledge.ai_input_placeholder_short");
@@ -328,7 +341,7 @@ export function FileAiDock({ spaceId, fileId }: FileAiDockProps) {
                 {messageHeader}
 
                 <div className="relative min-h-0 flex-1">
-                    <AiChatMessages
+                    {historyError ? <ApiRequestFailure error={historyError} onRetry={retryHistory} /> : (<AiChatMessages
                         messages={messages}
                         conversationId={conversationId}
                         title={title}
@@ -343,7 +356,7 @@ export function FileAiDock({ spaceId, fileId }: FileAiDockProps) {
                         emptyStateIllustration={<ArticleQAIllustration grey className="mx-auto block size-[80px]" />}
                         onPresetClick={(q) => setInputText(q)}
                         onRegenerate={regenerate}
-                    />
+                    />)}
                     <div
                         aria-hidden
                         className="pointer-events-none absolute inset-x-0 bottom-0 z-[1] h-10 bg-gradient-to-t from-white to-white/0"
@@ -363,7 +376,7 @@ export function FileAiDock({ spaceId, fileId }: FileAiDockProps) {
                         onChange={setInputText}
                         onSend={handleSend}
                         model={model}
-                        disabled={!modelOptions?.length}
+                        disabled={Boolean(historyError) || isLoading || isClearing || !modelOptions?.length}
                         isStreaming={isStreaming}
                         placeholder={placeholder}
                         variant="box"
@@ -409,23 +422,14 @@ export function FileAiDock({ spaceId, fileId }: FileAiDockProps) {
                     )}
                 >
                     {!open && messages.length > 0 && (
-                        <TooltipProvider>
-                            <Tooltip>
-                                <TooltipTrigger asChild>
-                                    <button
+                        <SharedTooltipProvider ><SharedTooltip  content={<><p>{localize("com_ui_expand")}</p></>} ><button
                                         type="button"
                                         onClick={() => setOpen(true)}
                                         aria-label={localize("com_ui_expand")}
                                         className="absolute bottom-full right-0 z-10 mb-2.5 flex size-8 items-center justify-center rounded-[20px] border border-[#EBEBEB] bg-white text-text-3 drop-shadow-[0_0_8px_rgba(3,7,117,0.05)] transition-colors hover:text-text-2"
                                     >
                                         <Outlined.DoubleDown className="size-4 rotate-180" />
-                                    </button>
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                    <p>{localize("com_ui_expand")}</p>
-                                </TooltipContent>
-                            </Tooltip>
-                        </TooltipProvider>
+                                    </button></SharedTooltip></SharedTooltipProvider>
                     )}
 
                     <div
@@ -444,44 +448,26 @@ export function FileAiDock({ spaceId, fileId }: FileAiDockProps) {
                                 <div className="min-w-0 flex-1" aria-hidden />
                                 {/* Clear · DoubleDown — bare 16px icons, 12px gap, right-aligned (matches the knowledge dock). */}
                                 <div className="flex shrink-0 items-center justify-end gap-3 py-1">
-                                    <TooltipProvider>
-                                        <Tooltip>
-                                            <TooltipTrigger asChild>
-                                                <button
+                                    <SharedTooltipProvider ><SharedTooltip  content={<><p>{localize("com_subscription.clear_chat")}</p></>} ><button
                                                     type="button"
                                                     onClick={handleClear}
                                                     aria-label={localize("com_subscription.clear_chat")}
                                                     className="inline-flex size-4 shrink-0 items-center justify-center text-text-1 transition-colors hover:text-text-2"
                                                 >
                                                     <Outlined.Delete className="size-4 shrink-0" />
-                                                </button>
-                                            </TooltipTrigger>
-                                            <TooltipContent>
-                                                <p>{localize("com_subscription.clear_chat")}</p>
-                                            </TooltipContent>
-                                        </Tooltip>
-                                    </TooltipProvider>
-                                    <TooltipProvider>
-                                        <Tooltip>
-                                            <TooltipTrigger asChild>
-                                                <button
+                                                </button></SharedTooltip></SharedTooltipProvider>
+                                    <SharedTooltipProvider ><SharedTooltip  content={<><p>{localize("com_ui_collapse")}</p></>} side="top" ><button
                                                     type="button"
                                                     onClick={() => setOpen(false)}
                                                     aria-label={localize("com_ui_collapse")}
                                                     className="inline-flex size-4 shrink-0 items-center justify-center text-text-3 transition-colors hover:text-text-2"
                                                 >
                                                     <Outlined.DoubleDown className="size-4 shrink-0" />
-                                                </button>
-                                            </TooltipTrigger>
-                                            <TooltipContent side="top">
-                                                <p>{localize("com_ui_collapse")}</p>
-                                            </TooltipContent>
-                                        </Tooltip>
-                                    </TooltipProvider>
+                                                </button></SharedTooltip></SharedTooltipProvider>
                                 </div>
                             </div>
 
-                            <AiChatMessages
+                            {historyError ? <ApiRequestFailure error={historyError} onRetry={retryHistory} /> : (<AiChatMessages
                                 messages={messages}
                                 conversationId={conversationId}
                                 title={title}
@@ -496,7 +482,7 @@ export function FileAiDock({ spaceId, fileId }: FileAiDockProps) {
                                 emptyStateIllustration={<ArticleQAIllustration grey className="mx-auto block size-[80px]" />}
                                 onPresetClick={(q) => setInputText(q)}
                                 onRegenerate={regenerate}
-                            />
+                            />)}
                         </div>
                     </div>
 
@@ -505,7 +491,7 @@ export function FileAiDock({ spaceId, fileId }: FileAiDockProps) {
                         onChange={setInputText}
                         onSend={handleSend}
                         model={model}
-                        disabled={!modelOptions?.length}
+                        disabled={Boolean(historyError) || isLoading || isClearing || !modelOptions?.length}
                         isStreaming={isStreaming}
                         placeholder={placeholder}
                         variant={open ? "line" : "box"}

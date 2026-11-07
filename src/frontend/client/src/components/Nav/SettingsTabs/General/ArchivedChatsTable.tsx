@@ -1,7 +1,7 @@
 // @ts-strict-ignore
+import { Tooltip as SharedTooltip } from '@bisheng/ui';
 import { useState, useCallback, useMemo } from 'react';
 import {
-  Search,
   TrashIcon,
   ChevronLeft,
   ChevronRight,
@@ -11,19 +11,8 @@ import {
   ArchiveRestore,
 } from 'lucide-react';
 import type { TConversation } from '~/types/chat';
-import {
-  Table,
-  Input,
-  Button,
-  TableRow,
-  Skeleton,
-  Separator,
-  TableCell,
-  TableBody,
-  TableHead,
-  TableHeader,
-  TooltipAnchor,
-} from '~/components';
+import { SearchInput } from '@bisheng/ui';
+import { Table, Button, TableRow, Skeleton, Separator, TableCell, TableBody, TableHead, TableHeader } from '~/components';
 import { useConversationsInfiniteQuery, useArchiveConvoMutation } from '~/hooks/queries/data-provider';
 import { useDeleteConversationConfirm } from '~/components/Conversations/ConvoOptions';
 import { useAuthContext, useLocalize, usePrefersMobileLayout } from '~/hooks';
@@ -116,16 +105,15 @@ export default function ArchivedChatsTable() {
       )}
       onMouseEnter={() => setIsOpened(true)}
     >
-      <div className="flex items-center">
-        <Search className="size-4 text-text-secondary" />
-        <Input
-          type="text"
-          placeholder={localize('com_nav_search_placeholder')}
-          value={searchQuery}
-          onChange={(e) => handleSearch(e.target.value)}
-          className="w-full border-none placeholder:text-text-secondary"
-        />
-      </div>
+      {/* Spec SearchInput in `borderless` form — the Separator below draws the line. */}
+      <SearchInput
+        borderless
+        className="w-full"
+        placeholder={localize('com_nav_search_placeholder')}
+        value={searchQuery}
+        onChange={(e) => handleSearch(e.target.value)}
+        clearLabel={localize('com_ui_clear')}
+      />
       <Separator />
       {conversations.length === 0 ? (
         <div className="mt-4 text-text-secondary">{localize('com_nav_no_search_results')}</div>
@@ -186,10 +174,7 @@ export default function ArchivedChatsTable() {
                       isSmallScreen ? 'justify-end' : 'justify-end gap-2',
                     )}
                   >
-                    <TooltipAnchor
-                      description={localize('com_ui_unarchive')}
-                      render={
-                        <Button
+                    <SharedTooltip  content={localize('com_ui_unarchive')}  ><Button
                           type="button"
                           aria-label="Unarchive conversation"
                           variant="ghost"
@@ -204,14 +189,9 @@ export default function ArchivedChatsTable() {
                           }}
                         >
                           <ArchiveRestore className={cn('size-4', isSmallScreen && 'size-3.5')} />
-                        </Button>
-                      }
-                    />
+                        </Button></SharedTooltip>
 
-                    <TooltipAnchor
-                      description={localize('com_ui_delete')}
-                      render={
-                        <Button
+                    <SharedTooltip  content={localize('com_ui_delete')}  ><Button
                           type="button"
                           aria-label="Delete archived conversation"
                           variant="ghost"
@@ -226,9 +206,7 @@ export default function ArchivedChatsTable() {
                           }
                         >
                           <TrashIcon className={cn('size-4', isSmallScreen && 'size-3.5')} />
-                        </Button>
-                      }
-                    />
+                        </Button></SharedTooltip>
                   </TableCell>
                 </TableRow>
               ))}

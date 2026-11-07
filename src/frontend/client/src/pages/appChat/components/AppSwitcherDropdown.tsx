@@ -1,8 +1,9 @@
 // @ts-strict-ignore
+import { Tooltip as SharedTooltip, TooltipProvider as SharedTooltipProvider } from '@bisheng/ui';
 import { ArrowLeftRight, Loader2, Search, Pin } from 'lucide-react';
 import type { AppItem } from '~/@types/app';
 import { Popover, PopoverContent, PopoverTrigger } from '~/components/ui/Popover';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '~/components/ui/Tooltip2';
+
 import { cn } from '~/utils';
 import AppAvator from '~/components/Avator';
 import { useAppSwitcher } from '~/pages/appChat/hooks/useAppSwitcher';
@@ -39,12 +40,7 @@ export function AppSwitcherDropdown() {
   // When disabled, just show tooltip with no popover
   if (disabled) {
     return (
-      <TooltipProvider delayDuration={200}>
-        <Tooltip>
-          <TooltipTrigger asChild>{trigger}</TooltipTrigger>
-          <TooltipContent>{localize('com_app_switcher_no_apps_tooltip')}</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      <SharedTooltipProvider delayDuration={200}><SharedTooltip  content={localize('com_app_switcher_no_apps_tooltip')} ><span className="inline-flex" tabIndex={0}>{trigger}</span></SharedTooltip></SharedTooltipProvider>
     );
   }
 
@@ -58,7 +54,7 @@ export function AppSwitcherDropdown() {
       >
         {/* Search input */}
         <div className="px-[12px] pt-[12px] pb-[8px] shrink-0">
-          <div className="flex items-center gap-[6px] h-[28px] px-[8px] border border-border-base rounded-md focus-within:border-[#DDDDDD] focus-within:shadow-[0_0_0_2px_#F1F5F9] transition-[border-color,box-shadow]">
+          <div className="flex items-center gap-[6px] h-[28px] px-[8px] border border-border-base rounded-md focus-within:border-border-deep focus-within:shadow-focus transition-[border-color,box-shadow]">
             <Search size={14} className="text-[#a9aeb8] shrink-0" />
             <input
               value={searchQuery}

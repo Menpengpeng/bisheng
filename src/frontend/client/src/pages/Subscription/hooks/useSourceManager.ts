@@ -1,15 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { type InformationSource, type SourceType } from "~/api/channels";
 import {
     ChannelBusinessType,
+    getChannelsApi,
     listManagerSourcesApi,
     searchManagerSourcesApi,
+    SortType,
     type ManagerSource,
     addWechatSourceApi
 } from "~/api/channels";
 import { useLocalize } from "~/hooks";
+import { useEffectiveQuota } from "~/hooks/useEffectiveQuota";
 import { useConfirm } from "~/Providers";
-import { extractApiStatusCode } from "../errorUtils";
+import { isApiError } from "@bisheng/api-client";
 import { normalizeUrlForSearch } from "../urlNormalize";
 
 const PAGE_SIZE = 20;
@@ -47,6 +51,17 @@ export function useSourceManager(
     const [wechatSources, setWechatSources] = useState<InformationSource[]>([]);
     const [websiteSources, setWebsiteSources] = useState<InformationSource[]>([]);
     const [loadingSources, setLoadingSources] = useState(false);
+    const [sourceListError, setSourceListError] = useState<unknown>(null);
+    const [failedMore, setFailedMore] = useState(false);
+    const [retrySeq, setRetrySeq] = useState(0);
+    const requestKey = `${expanded}:${activeTab}:${searchKeyword}`;
+    const requestKeyRef = useRef(requestKey);
+    requestKeyRef.current = requestKey;
+    const recordListError = (error: unknown, more = false) => {
+        if (isApiError(error) && error.kind === 'canceled') return;
+        setSourceListError(error);
+        setFailedMore(more);
+    };
     const [listPageMap, setListPageMap] = useState<Record<ChannelBusinessType, number>>({
         wechat: 1,
         website: 1,
@@ -79,6 +94,10 @@ export function useSourceManager(
             hideCancel: true,
         });
     };
+
+    const invalidateWechatRequest = useCallback((token: number) => {
+        if (wechatRequestTokenRef.current === token) wechatRequestTokenRef.current++;
+    }, []);
 
     const abortWechatRequest = () => {
         wechatAbortRef.current?.abort();
@@ -133,6 +152,40 @@ export function useSourceManager(
     const canSelectMore = true;
     const isAtLimit = false;
 
+    // `info_source_subscribe` role quota preview: mirrors the backend's own dedup
+    // check (QuotaService.check_info_source_subscribe_limit) — usage is the union
+    // of source ids across every channel the user has created, so a source already
+    // used by another of the user's channels never consumes an extra slot here.
+    // Legacy roles without this key saved yet must still read as the product
+    // default (200), not "unlimited" — only an explicit backend value (including
+    // an explicit -1 for admin exemption) overrides it.
+    const INFO_SOURCE_SUBSCRIBE_DEFAULT_LIMIT = 200;
+    const { quotas } = useEffectiveQuota();
+    const sourceQuotaLimit = quotas["info_source_subscribe"]?.effective ?? INFO_SOURCE_SUBSCRIBE_DEFAULT_LIMIT;
+    const { data: ownedChannels = [] } = useQuery({
+        queryKey: ["channels", "created", SortType.RECENT_UPDATE],
+        queryFn: () => getChannelsApi({ type: "created", sortBy: SortType.RECENT_UPDATE }),
+        staleTime: 30_000,
+    });
+    const otherUsedSourceIds = useMemo(() => {
+        const ids = new Set<string>();
+        ownedChannels.forEach((c) => (c.source_list || []).forEach((id) => ids.add(id)));
+        return ids;
+    }, [ownedChannels]);
+    const sourceQuotaUsedIds = useMemo(() => {
+        const ids = new Set(otherUsedSourceIds);
+        pendingSources.forEach((s) => ids.add(s.id));
+        return ids;
+    }, [otherUsedSourceIds, pendingSources]);
+    const sourceQuotaUsed = sourceQuotaUsedIds.size;
+    // A source not already counted (neither used elsewhere nor already pending)
+    // is blocked only once adding it would push the deduped total past the limit.
+    const isSourceQuotaBlocked = (sourceId: string) => {
+        if (sourceQuotaLimit === -1) return false;
+        if (sourceQuotaUsedIds.has(sourceId)) return false;
+        return sourceQuotaUsed >= sourceQuotaLimit;
+    };
+
     // 当外部 sources 在面板展开期间新增时（例如通过爬取新网址信源），
     // 自动将新增的信源合并进 pendingSources，并保持选中态。
     useEffect(() => {
@@ -152,20 +205,23 @@ export function useSourceManager(
     }, [expanded, sources]);
 
     const viewMode: ViewMode = useMemo(() => {
-        if (!searchKeyword.trim()) return "list";
+        if (loadingSources || sourceListError || !searchKeyword.trim()) return "list";
         if (filteredSources.length > 0) return "list";
         if (looksLikeWechatArticleUrl(searchKeyword)) return "wechatProcessing";
         return looksLikeUrl(searchKeyword) ? "noResultUrl" : "noResultNonUrl";
-    }, [searchKeyword, filteredSources.length]);
+    }, [searchKeyword, filteredSources.length, loadingSources, sourceListError]);
 
     // Load source list from API
     useEffect(() => {
         if (!expanded) return;
         if (searchKeyword.trim()) return;
+        let active = true;
+        setSourceListError(null);
         const load = async (business_type: ChannelBusinessType) => {
             setLoadingSources(true);
             try {
                 const res = await listManagerSourcesApi({ business_type, page: 1, page_size: PAGE_SIZE });
+                if (!active) return;
                 const mapped: InformationSource[] = (res.sources || []).map((s: ManagerSource) => ({
                     id: s.id,
                     name: s.name,
@@ -180,22 +236,25 @@ export function useSourceManager(
                     ...prev,
                     [business_type]: res.total > mapped.length,
                 }));
-            } catch {
-                // Silent fail, keep current list
+            } catch (error) {
+                if (active) recordListError(error);
             } finally {
-                setLoadingSources(false);
+                if (active) setLoadingSources(false);
             }
         };
         const currentType: ChannelBusinessType =
             activeTab === "official_account" ? "wechat" : "website";
-        load(currentType);
-    }, [expanded, activeTab, searchKeyword]);
+        void load(currentType);
+        return () => { active = false; };
+    }, [expanded, activeTab, searchKeyword, retrySeq]);
 
     useEffect(() => {
         if (!expanded) return;
         const kw = searchKeyword.trim();
         if (!kw) return;
 
+        let active = true;
+        setSourceListError(null);
         const load = async () => {
             setLoadingSources(true);
             try {
@@ -204,6 +263,7 @@ export function useSourceManager(
                     page: 1,
                     page_size: PAGE_SIZE,
                 });
+                if (!active) return;
                 const mapped: InformationSource[] = (res.sources || []).map((s: ManagerSource) => ({
                     id: s.id,
                     name: s.name,
@@ -217,17 +277,21 @@ export function useSourceManager(
                 setWebsiteSources(website);
                 setSearchPage(1);
                 setSearchHasMore(res.total > mapped.length);
-            } catch {
+            } catch (error) {
+                if (active) recordListError(error);
             } finally {
-                setLoadingSources(false);
+                if (active) setLoadingSources(false);
             }
         };
 
-        load();
-    }, [expanded, searchKeyword]);
+        void load();
+        return () => { active = false; };
+    }, [expanded, searchKeyword, retrySeq]);
 
     const loadMoreSources = async () => {
         if (!expanded || loadingSources) return;
+        const key = requestKey;
+        setSourceListError(null);
         const kw = searchKeyword.trim();
 
         if (kw) {
@@ -240,6 +304,7 @@ export function useSourceManager(
                     page: nextPage,
                     page_size: PAGE_SIZE,
                 });
+                if (requestKeyRef.current !== key) return;
                 const mapped: InformationSource[] = (res.sources || []).map((s: ManagerSource) => ({
                     id: s.id,
                     name: s.name,
@@ -259,9 +324,10 @@ export function useSourceManager(
                 });
                 setSearchPage(nextPage);
                 setSearchHasMore(nextPage * PAGE_SIZE < res.total);
-            } catch {
+            } catch (error) {
+                if (requestKeyRef.current === key) recordListError(error, true);
             } finally {
-                setLoadingSources(false);
+                if (requestKeyRef.current === key) setLoadingSources(false);
             }
             return;
         }
@@ -277,6 +343,7 @@ export function useSourceManager(
                 page: nextPage,
                 page_size: PAGE_SIZE,
             });
+            if (requestKeyRef.current !== key) return;
             const mapped: InformationSource[] = (res.sources || []).map((s: ManagerSource) => ({
                 id: s.id,
                 name: s.name,
@@ -300,9 +367,17 @@ export function useSourceManager(
                 ...prev,
                 [business_type]: nextPage * PAGE_SIZE < res.total,
             }));
+        } catch (error) {
+            if (requestKeyRef.current === key) recordListError(error, true);
         } finally {
-            setLoadingSources(false);
+            if (requestKeyRef.current === key) setLoadingSources(false);
         }
+    };
+
+    const retrySources = () => {
+        if (loadingSources) return;
+        if (failedMore) return loadMoreSources();
+        setRetrySeq(n => n + 1);
     };
 
     // Auto-detect and process WeChat article URLs
@@ -357,10 +432,9 @@ export function useSourceManager(
                     });
                 } catch (error) {
                     if (wechatRequestTokenRef.current !== token) return;
-                    const code = extractApiStatusCode(error);
-                    if (code == null) {
-                        showWechatLinkError();
-                    }
+                    if (isApiError(error) && (error.kind === 'canceled' || error.presentation === 'global')) return;
+                    showWechatLinkError();
+                    if (isApiError(error)) error.presentation = 'inline';
                 } finally {
                     if (wechatRequestTokenRef.current !== token) return;
                     // Clear controller for this run
@@ -372,17 +446,18 @@ export function useSourceManager(
 
         return () => {
             clearTimeout(timer);
+            invalidateWechatRequest(token);
             // If effect is cleaned up (keyword changes/unmount), abort request
             abortWechatRequest();
         };
-    }, [expanded, viewMode, searchKeyword, submitSeq]);
+    }, [expanded, viewMode, searchKeyword, submitSeq, invalidateWechatRequest]);
 
     const toggleSource = (source: InformationSource) => {
         if (selectedIds.has(source.id)) {
             const next = workingSources.filter((s) => s.id !== source.id);
             if (expanded) setPendingSources(next);
             else onSourcesChange(next);
-        } else if (canSelectMore) {
+        } else if (canSelectMore && !isSourceQuotaBlocked(source.id)) {
             const next = [...workingSources, source];
             if (expanded) setPendingSources(next);
             else onSourcesChange(next);
@@ -430,10 +505,15 @@ export function useSourceManager(
         submitSearch,
         pendingSources,
         loadingSources,
+        sourceListError,
+        retrySources,
         filteredSources,
         isSearchMode,
         selectedIds,
         isAtLimit,
+        sourceQuotaUsed,
+        sourceQuotaLimit,
+        isSourceQuotaBlocked,
         viewMode,
         toggleSource,
         loadMoreSources,

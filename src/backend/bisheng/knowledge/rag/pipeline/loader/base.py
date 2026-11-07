@@ -1,4 +1,5 @@
 import os
+from collections.abc import Callable
 
 from langchain_core.document_loaders import BaseLoader
 
@@ -28,8 +29,18 @@ class BaseBishengLoader(BaseLoader):
       - unique within self.local_image_dir (collisions overwrite content).
     """
 
-    def __init__(self, file_path: str, file_metadata: dict, file_extension: str, tmp_dir: str,
-                 image_object_dir: str | None = None, *args, **kwargs):
+    def __init__(
+        self,
+        file_path: str,
+        file_metadata: dict,
+        file_extension: str,
+        tmp_dir: str,
+        image_object_dir: str | None = None,
+        image_url_builder: Callable[[str], str] | None = None,
+        split_for_retrieval: bool = True,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.file_path = file_path
         self.file_name = os.path.basename(file_path)
@@ -46,6 +57,9 @@ class BaseBishengLoader(BaseLoader):
         # TempFilePipeline), build_image_url() falls back to the local absolute
         # path and no upload occurs.
         self.image_object_dir = image_object_dir
+        self.image_url_builder = image_url_builder
+        self.split_for_retrieval = split_for_retrieval
+        self._image_urls: dict[str, str] = {}
 
         # Flat directory on local disk where the loader stages image bytes.
         # ImageUploadTransformer reads from here via non-recursive os.listdir.
@@ -60,6 +74,7 @@ class BaseBishengLoader(BaseLoader):
     def _minio_bucket(self) -> str:
         """Lazily resolve the MinIO bucket name (only needed when building URLs)."""
         from bisheng.core.storage.minio.minio_manager import get_minio_storage_sync
+
         return get_minio_storage_sync().bucket
 
     def ensure_local_image_dir(self) -> str:
@@ -81,6 +96,10 @@ class BaseBishengLoader(BaseLoader):
         - image_object_dir unset: returns the absolute local path (legacy
           fallback for transient pipelines that never persist images).
         """
+        if self.image_url_builder:
+            if filename not in self._image_urls:
+                self._image_urls[filename] = self.image_url_builder(filename)
+            return self._image_urls[filename]
         if self.image_object_dir:
             return f"/{self._minio_bucket}/{self.image_object_dir}/{filename}"
         if self.local_image_dir:
@@ -91,14 +110,18 @@ class BaseBishengLoader(BaseLoader):
         """Replace absolute-local-path image refs with final MinIO URLs.
 
         Used by non-OCR loaders whose markdown utility (docx_handler / pptx_handler
-        / pdf_handler / ...) writes absolute local paths into the markdown. The
-        rewrite is safe because non-OCR loaders do NOT populate
-        ``metadata.indexes`` — there is nothing to misalign.
+        / pdf_handler / ...) writes absolute local paths into the markdown.
+        Word / PPT loaders still skip ``metadata.indexes``. LocalPdfLoader
+        re-aligns indexes against this rewritten string, so the replace stays
+        safe there as well.
         """
         if not content or not self.local_image_dir or not self.image_object_dir:
+            return content
+        if self.image_url_builder:
+            for filename in sorted(os.listdir(self.local_image_dir), key=len, reverse=True):
+                content = content.replace(os.path.join(self.local_image_dir, filename), self.build_image_url(filename))
             return content
         return content.replace(
             self.local_image_dir,
             f"/{self._minio_bucket}/{self.image_object_dir}",
         )
-

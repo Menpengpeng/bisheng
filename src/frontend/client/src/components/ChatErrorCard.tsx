@@ -13,7 +13,7 @@
  * move and is kept — renaming ~20 keys across three locales would change nothing
  * a user sees.
  */
-import { ChevronDown, ChevronRight, CircleAlert } from 'lucide-react';
+import { Outlined } from 'bisheng-icons';
 import { useState } from 'react';
 import { useLocalize } from '~/hooks';
 import { ServiceBusyNotice } from '~/components/ServiceBusyNotice';
@@ -29,6 +29,15 @@ interface ChatErrorCardProps {
         ExecutionFlow via continueConversation and on daily chat via regenerate;
         omitted on /c and history views. */
     onRetry?: () => void;
+    /** disables the retry button + spins its icon while a retry is in flight */
+    retrying?: boolean;
+    /** Replaces the per-type description on the failure card. Daily chat uses it
+        when a stream fails *after* emitting an answer: the specific reason is noise,
+        what matters is that the reply above is cut short. */
+    description?: string;
+    /** Drops the per-type "建议…" line. Daily chat sets it when the card carries a
+        plain backend message as its description — a hint would just repeat it. */
+    hideHint?: boolean;
 }
 
 // error_type values that have their own localized copy; anything else (or a
@@ -36,10 +45,21 @@ interface ChatErrorCardProps {
 const KNOWN_TYPES = new Set([
     'content_filter',
     'quota_exhausted',
+    // The user's own monthly credits on this platform (client module) are used
+    // up — the remedy is the admin's credit settings, not the provider account.
+    'credit_exhausted',
     'rate_limit',
     'service_unavailable',
     'network_timeout',
     'auth_error',
+    // The content no longer fits the model's context window (F087). Terminal: a
+    // retry would send the same content again.
+    'context_overflow',
+    // Task mode only: condensing earlier steps into a summary failed (F087).
+    'context_compress_failed',
+    // Task mode only: the model spent its whole output budget (usually on
+    // reasoning) without a tool call or an answer, even after one retry.
+    'output_truncated',
     // Attachment parsing (OCR / ETL) — daily-mode chat only.
     'file_parse_busy',
     'file_parse_failed',
@@ -70,43 +90,66 @@ export function isTransientErrorType(errorType?: string): boolean {
     return !!errorType && TRANSIENT_TYPES.has(errorType);
 }
 
-export function ChatErrorCard({ errorType, detail, fallbackMessage, onRetry }: ChatErrorCardProps) {
+export function ChatErrorCard({
+    errorType,
+    detail,
+    fallbackMessage,
+    onRetry,
+    retrying,
+    description,
+    hideHint,
+}: ChatErrorCardProps) {
     const localize = useLocalize();
     const [showDetail, setShowDetail] = useState(false);
 
     const key = errorType && KNOWN_TYPES.has(errorType) ? errorType : 'unknown';
     const title = localize(`com_linsight_error_title_${key}`);
-    const desc = localize(`com_linsight_error_desc_${key}`);
-    const hint = localize(`com_linsight_error_hint_${key}`);
+    const desc = description ?? localize(`com_linsight_error_desc_${key}`);
+    const hint = hideHint ? '' : localize(`com_linsight_error_hint_${key}`);
     const rawDetail = detail || fallbackMessage || '';
 
     // Transient → calm neutral notice (with retry where the surface wires it).
     if (TRANSIENT_TYPES.has(key)) {
-        return <ServiceBusyNotice title={title} desc={desc} detail={rawDetail} onRetry={onRetry} />;
+        const isRateLimit = key === 'rate_limit';
+        return (
+            <ServiceBusyNotice
+                title={title}
+                desc={desc}
+                // The animated gauge is reserved for the rate-limit (service
+                // load) family; timeout / unavailable are outages, so they get
+                // the static gray attention mark.
+                icon={isRateLimit ? 'gauge' : 'attention'}
+                detail={isRateLimit ? undefined : rawDetail}
+                onRetry={onRetry}
+                retrying={retrying}
+            />
+        );
     }
 
-    // Terminal / unknown → the informative (red) failure card.
+    // Terminal / unknown → the informative failure card. Same neutral surface
+    // and text ramp as ServiceBusyNotice — the warning-orange is confined to
+    // the icon, so a wall of failed turns doesn't read as a wall of color.
     return (
-        <div className="my-2 rounded-2xl border border-red-100 bg-red-50/60 p-4 text-sm">
+        <div className="my-2 rounded-2xl border border-border bg-bg-page p-4 text-sm">
             <div className="flex items-start gap-2.5">
-                <CircleAlert size={18} className="mt-0.5 shrink-0 text-red-500" />
+                <Outlined.Attention size={16} className="mt-0.5 shrink-0 text-warning" />
                 <div className="min-w-0 flex-1">
-                    <div className="font-medium text-red-700">{title}</div>
-                    <p className="mt-1 whitespace-pre-wrap break-words leading-relaxed text-red-600/90">{desc}</p>
-                    {hint && <p className="mt-1.5 leading-relaxed text-red-600/80">{hint}</p>}
+                    <div className="font-medium text-text-2">{title}</div>
+                    <p className="mt-1 whitespace-pre-wrap break-words leading-relaxed text-text-3">{desc}</p>
+                    {hint && <p className="mt-1.5 leading-relaxed text-text-3">{hint}</p>}
 
                     {rawDetail && (
-                        <div className="mt-3">
+                        <div className="mt-2.5">
                             <button
                                 type="button"
                                 onClick={() => setShowDetail((v) => !v)}
-                                className="inline-flex items-center gap-1 text-xs text-red-600/70 transition-colors hover:text-red-700"
+                                className="inline-flex items-center gap-1 text-body text-gray-400 transition-colors hover:text-gray-600"
                             >
-                                {showDetail ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                                 {localize(showDetail ? 'com_linsight_error_hide_detail' : 'com_linsight_error_view_detail')}
+                                {showDetail ? <Outlined.Down size={14} /> : <Outlined.Right size={14} />}
                             </button>
                             {showDetail && (
-                                <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-red-100/50 p-2.5 text-xs leading-relaxed text-red-700/80">
+                                <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-100 p-2.5 text-xs leading-relaxed text-gray-500">
                                     {rawDetail}
                                 </pre>
                             )}

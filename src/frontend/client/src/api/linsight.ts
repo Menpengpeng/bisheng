@@ -1,6 +1,7 @@
 // @ts-strict-ignore
 import {LinsightInfo} from "~/store/linsight";
 import request from "./request";
+import { getShareTokenFromPath } from "~/utils/shareToken";
 
 // 获取灵思会话信息
 export function getLinsightSessionVersionList(ConversationId: string, shareToken: string): Promise<any> {
@@ -36,6 +37,16 @@ export function getLinsightTaskList(versionId: string, linsight: LinsightInfo, s
                 ...item,
                 status: item.status === 'in_progress' ? 'terminated' : item.status
             }))
+        }
+        if (linsight.status === 'completed') {
+            // Same leftover close as the backend completion sweep. A finished
+            // run can still return in_progress / not_started rows; without this
+            // the reloaded panel keeps spinning at "任务已完成 0/N".
+            const keep = new Set(['success', 'failed', 'terminated']);
+            return res.data.map(item => ({
+                ...item,
+                status: keep.has(item.status) ? item.status : 'terminated',
+            }));
         }
         return res.data
     });
@@ -84,6 +95,8 @@ export interface SelectableSkill {
     name: string;
     display_name: string;
     description: string;
+    /** Admin-preselected: starts out selected when the user enters task mode. */
+    default_checked?: boolean;
 }
 
 export function getSelectableSkills(): Promise<SelectableSkill[]> {
@@ -98,6 +111,8 @@ export function getSelectableSkills(): Promise<SelectableSkill[]> {
 export interface LinsightModelConfig {
     models?: { id: string | number; name?: string; displayName?: string }[];
     linsight_default_model_id?: string | null;
+    /** Admin-configured default model for new daily-mode conversations. */
+    chat_default_model_id?: string | null;
 }
 
 export function getLinsightModelConfig(): Promise<LinsightModelConfig> {
@@ -117,17 +132,29 @@ export function getPersonalKnowledgeInfo(): Promise<any> {
 }
 
 // 获取组织知识库
-export function getKnowledgeInfo({page = 1, name = '', page_size = 200, sort_by = 'update_time', preferred_ids = ''}: {
-    page?: number,
-    name?: string,
-    page_size?: number,
-    sort_by?: string,
+export interface OrgKnowledgeQuery {
+    cursor?: string;
+    name?: string;
+    page_size?: number;
+    sort_by?: string;
     /** Comma-separated ids pinned to the top of the global sort (admin-configured orgKbs). */
-    preferred_ids?: string,
-}): Promise<any> {
-    const base = `/api/v1/knowledge?page_num=${page}&page_size=${page_size}&type=0&name=${encodeURIComponent(name)}&sort_by=${sort_by}`;
+    preferred_ids?: string;
+    action?: 'visible' | 'use';
+}
+
+export interface OrgKnowledgePage {
+    data: Array<{ id: string | number; name: string; update_time?: string | null }>;
+    page_size: number;
+    has_more: boolean;
+    next_cursor: string | null;
+}
+
+export function getKnowledgeInfo({cursor, name = '', page_size = 200, sort_by = 'update_time', preferred_ids = '', action}: OrgKnowledgeQuery): Promise<{ data: OrgKnowledgePage }> {
+    const base = `/api/v1/knowledge?page_size=${page_size}&type=0&name=${encodeURIComponent(name)}&sort_by=${sort_by}`;
     const pinned = preferred_ids ? `&preferred_ids=${encodeURIComponent(preferred_ids)}` : '';
-    return request.get(`${base}${pinned}`);
+    const permissionAction = action ? `&action=${action}` : '';
+    const nextPage = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
+    return request.get<{ data: OrgKnowledgePage }>(`${base}${pinned}${permissionAction}${nextPage}`);
 }
 
 // 获取linsight剩余次数
@@ -192,12 +219,32 @@ export function getCaseDetail(sop_id: string): Promise<any> {
 export function getMdDownload(file_info: {
     file_url: string;
     file_name: string
-}, to_type: 'pdf' | 'docx'): Promise<any> {
+}, to_type: 'pdf' | 'docx', sessionVersionId?: string): Promise<any> {
+    const shareToken = getShareTokenFromPath();
     return request.post('/api/v1/linsight/workbench/download-md-to-pdf-or-docx', {
             file_info: file_info,
-            to_type: to_type
+            to_type: to_type,
+            // Lets the backend embed the md's workspace images into the document.
+            session_version_id: sessionVersionId || null,
         }
         , {
-            responseType: 'blob' // 确保这里设置了 responseType
+            responseType: 'blob', // 确保这里设置了 responseType
+            headers: shareToken ? { 'share-token': shareToken } : {},
         })
+}
+
+/**
+ * Markdown deliverable with the workspace images it references: a zip
+ * (`application/zip`) when at least one image resolves, else the md itself.
+ */
+export function getMdBundle(params: {
+    session_version_id: string;
+    file_url: string;
+    file_name: string;
+}): Promise<Blob> {
+    const shareToken = getShareTokenFromPath();
+    return request.post('/api/v1/linsight/workbench/download-md-bundle', params, {
+        responseType: 'blob',
+        headers: shareToken ? { 'share-token': shareToken } : {},
+    });
 }

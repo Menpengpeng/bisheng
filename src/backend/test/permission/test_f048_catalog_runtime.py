@@ -678,7 +678,12 @@ async def test_catalog_publish_stages_complete_release_and_switches_once(
                     "user": "user:*",
                     "relation": "active",
                     "object": (f"permission_catalog_release:{result['release_key']}"),
-                }
+                },
+                {
+                    "user": "service_account:*",
+                    "relation": "active",
+                    "object": (f"permission_catalog_release:{result['release_key']}"),
+                },
             ],
             [
                 {
@@ -757,9 +762,11 @@ async def test_catalog_create_is_idempotent_and_current_shape_is_complete(
     assert count == 1
 
 
+@pytest.mark.parametrize("model_active", [True, False])
 async def test_permission_roster_sql_cursor_reads_only_one_bounded_page(
     session_factory: SessionFactory,
     monkeypatch,
+    model_active,
 ) -> None:
     source_service = GrantSourceService()
     sources = [
@@ -821,7 +828,7 @@ async def test_permission_roster_sql_cursor_reads_only_one_bounded_page(
     models = (
         GrantModelSnapshot(
             model_key="viewer",
-            active=True,
+            active=model_active,
             action_codes=("visible",),
             derived_level=1,
         ),
@@ -849,9 +856,11 @@ async def test_permission_roster_sql_cursor_reads_only_one_bounded_page(
     assert second_has_more is False
 
 
+@pytest.mark.parametrize("model_active", [True, False])
 async def test_inherited_roster_uses_nearest_custom_ancestor(
     session_factory: SessionFactory,
     monkeypatch,
+    model_active,
 ) -> None:
     source_service = GrantSourceService()
     root_source = source_service.canonicalize_source(
@@ -959,7 +968,7 @@ async def test_inherited_roster_uses_nearest_custom_ancestor(
     models = (
         GrantModelSnapshot(
             model_key="viewer",
-            active=True,
+            active=model_active,
             action_codes=("visible",),
             derived_level=1,
         ),

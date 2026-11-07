@@ -18,7 +18,6 @@ interface QRPhaseProps {
   otpauthUrl: string;
   onNext: () => void;
   onSuccess?: () => void;
-  onError?: (error: Error) => void;
 }
 
 export const QRPhase: React.FC<QRPhaseProps> = ({ secret, otpauthUrl, onNext }) => {
@@ -46,7 +45,7 @@ export const QRPhase: React.FC<QRPhaseProps> = ({ secret, otpauthUrl, onNext }) 
             {localize('com_ui_secret_key')}
           </Label>
           <div className="flex gap-2">
-            <Input value={secret} readOnly className="font-mono text-lg tracking-wider" />
+            <Input value={secret} readOnly className="flex-1" inputClassName="font-mono tracking-wider" />
             <Button
               size="sm"
               variant="outline"

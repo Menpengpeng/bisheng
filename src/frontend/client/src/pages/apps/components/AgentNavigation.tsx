@@ -16,12 +16,19 @@ interface Category {
 
 interface AgentNavigationProps {
     onCategoryChange: (categoryId: number | string) => void
+    onCategoryLoadError?: () => void
     onRefresh: () => void
+    /**
+     * A keyword search is running. Search results span every category, so no
+     * tab is highlighted while one is active — clicking a tab ends the search
+     * (the parent clears the keyword) and the highlight comes back.
+     */
+    searchActive?: boolean
 }
 
 const UNCATEGORIZED = 'uncategorized'
 
-export function AgentNavigation({ onCategoryChange, onRefresh }: AgentNavigationProps) {
+export function AgentNavigation({ onCategoryChange, onCategoryLoadError, onRefresh, searchActive = false }: AgentNavigationProps) {
     const { user } = useAuthContext();
     const localize = useLocalize();
 
@@ -42,23 +49,29 @@ export function AgentNavigation({ onCategoryChange, onRefresh }: AgentNavigation
     }, [onCategoryChange])
 
     const fetchCategoryTags = useCallback(async () => {
-        const tags = await getHomeLabelApi()
-        const next: Category[] = tags.data.map(tag => ({
-            label: tag.name,
-            value: tag.id,
-            selected: true
-        }))
-        setCategories(next)
+        try {
+            const tags = await getHomeLabelApi()
+            const next: Category[] = tags.data.map(tag => ({
+                label: tag.name,
+                value: tag.id,
+                selected: true
+            }))
+            setCategories(next)
 
-        // Keep the current tab if it survived (the tag list is editable from
-        // here), otherwise fall back to the first tag — or to Uncategorized,
-        // which is the only tab left when no tags are configured at all.
-        const current = activeCategoryRef.current
-        const stillListed = current === UNCATEGORIZED || next.some((category) => category.value === current)
-        if (current === null || !stillListed) {
-            selectCategory(next[0]?.value ?? UNCATEGORIZED)
+            // Keep the current tab if it survived (the tag list is editable from
+            // here), otherwise fall back to the first tag — or to Uncategorized,
+            // which is the only tab left when no tags are configured at all.
+            const current = activeCategoryRef.current
+            const stillListed = current === UNCATEGORIZED || next.some((category) => category.value === current)
+            if (current === null || !stillListed) {
+                selectCategory(next[0]?.value ?? UNCATEGORIZED)
+            }
+        } catch (error) {
+            console.error("Failed to load app categories:", error)
+            setCategories([])
+            if (activeCategoryRef.current === null) onCategoryLoadError?.()
         }
-    }, [selectCategory])
+    }, [onCategoryLoadError, selectCategory])
 
     // Initial data load
     useEffect(() => {
@@ -93,7 +106,7 @@ export function AgentNavigation({ onCategoryChange, onRefresh }: AgentNavigation
     }
 
     const renderTab = (id: number | string, label: string) => {
-        const isActive = activeCategory === id;
+        const isActive = !searchActive && activeCategory === id;
         return (
             <button
                 key={id}

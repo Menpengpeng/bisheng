@@ -133,6 +133,93 @@ def snapshot_file_paths(file_dir: str) -> set[str]:
     return set(util.read_files_in_directory(file_dir))
 
 
+def snapshot_file_fingerprints(file_dir: str) -> dict[str, str]:
+    """Absolute path → md5 for every file currently in ``file_dir``.
+
+    Same moment as :func:`snapshot_file_paths`, plus the digest so a later
+    overwrite of an inherited ``output/*.md`` is distinguishable from a leftover.
+    """
+    if not file_dir or not os.path.exists(file_dir):
+        return {}
+    fingerprints: dict[str, str] = {}
+    for path in util.read_files_in_directory(file_dir):
+        try:
+            fingerprints[path] = util.calculate_md5(path)
+        except OSError:
+            continue
+    return fingerprints
+
+
+def fingerprint_file(path: str) -> str:
+    """md5 of one file; empty string when the path cannot be read."""
+    try:
+        return util.calculate_md5(path)
+    except OSError:
+        return ""
+
+
+def _baseline_path_set(
+    baseline_paths: set[str] | dict[str, str] | None,
+) -> set[str] | None:
+    if baseline_paths is None:
+        return None
+    if isinstance(baseline_paths, dict):
+        return set(baseline_paths)
+    return baseline_paths
+
+
+def _is_unmodified_leftover(
+    file_info: dict,
+    baseline_paths: set[str] | dict[str, str] | None,
+) -> bool:
+    """True when this path was already present at start with the same bytes."""
+    if not isinstance(baseline_paths, dict):
+        return False
+    path = file_info.get("file_path") or ""
+    start_md5 = baseline_paths.get(path) or baseline_paths.get(os.path.normpath(path))
+    current_md5 = file_info.get("file_md5")
+    return bool(start_md5) and bool(current_md5) and start_md5 == current_md5
+
+
+# Text deliverables whose body can link to sibling files (charts, images).
+_REFERENCING_EXTS = frozenset({".md", ".markdown", ".html", ".htm"})
+# Reports are small; the cap only guards against a pathological file.
+_REFERENCE_SCAN_LIMIT = 2 * 1024 * 1024
+
+
+def _leftovers_referenced_by(fresh: list[dict], leftovers: list[dict]) -> list[dict]:
+    """Leftover files that a fresh markdown/html deliverable links to.
+
+    Matched by the leftover's path relative to the referencing file's directory
+    (``charts/x.png`` from ``output/report.md``) or by its workspace-relative path.
+    """
+    if not leftovers:
+        return []
+    texts: list[tuple[str, str]] = []
+    for info in fresh:
+        path = info.get("file_path") or ""
+        if os.path.splitext(path)[1].lower() not in _REFERENCING_EXTS:
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                texts.append((os.path.dirname(info.get("rel_path") or ""), f.read(_REFERENCE_SCAN_LIMIT)))
+        except OSError:
+            continue
+    if not texts:
+        return []
+    referenced = []
+    for info in leftovers:
+        rel_path = (info.get("rel_path") or "").replace(os.sep, "/")
+        if not rel_path:
+            continue
+        for base_dir, text in texts:
+            relative = os.path.relpath(rel_path, base_dir or ".").replace(os.sep, "/")
+            if relative in text or rel_path in text:
+                referenced.append(info)
+                break
+    return referenced
+
+
 def _zone_of(rel_path: str) -> str:
     """First path segment of a workspace-relative path ('' for root-level files)."""
     head = rel_path.replace(os.sep, "/").split("/", 1)
@@ -184,6 +271,137 @@ def _type_rank(file_info: dict) -> int:
     return _DELIVERABLE_TYPE_RANK.get(ext, _DEFAULT_TYPE_RANK)
 
 
+# Plain-text formats a task writes first and then renders into what the user asked
+# for: the office skills draft 报告.md and build 报告.docx / .pptx from it. When the
+# rendered sibling exists, the draft is an intermediate, not the deliverable.
+_DRAFT_EXTS = frozenset({".md", ".markdown", ".txt"})
+_IMAGE_TYPE_RANK = 4
+
+
+def _draft_key(file_info: dict) -> tuple[str, str]:
+    rel_path = (file_info.get("rel_path") or file_info.get("file_name") or "").replace(os.sep, "/")
+    stem = os.path.splitext(os.path.basename(rel_path))[0].lower()
+    return os.path.dirname(rel_path), stem
+
+
+def _deliverable_sort_keys(selected: list[dict]) -> dict[int, tuple[int, int, float]]:
+    """Sort key per file: (effective type rank, is demoted draft, -mtime).
+
+    Recency cannot separate a draft from its rendering: both are written in the
+    same run, and the draft is often touched last (a final edit, or a workspace
+    sync that rewrites mtimes). So a draft that has a rendered sibling — same
+    directory, same stem, a non-draft and non-image extension — takes that
+    sibling's rank and sorts right after it. A draft without one keeps its own rank.
+    """
+    rendered_rank: dict[tuple[str, str], int] = {}
+    for info in selected:
+        ext = os.path.splitext(info.get("file_name") or "")[1].lower()
+        rank = _type_rank(info)
+        if ext in _DRAFT_EXTS or rank >= _IMAGE_TYPE_RANK:
+            continue
+        key = _draft_key(info)
+        rendered_rank[key] = min(rank, rendered_rank.get(key, rank))
+
+    keys: dict[int, tuple[int, int, float]] = {}
+    for info in selected:
+        ext = os.path.splitext(info.get("file_name") or "")[1].lower()
+        mtime = -(info.get("file_mtime") or 0.0)
+        sibling_rank = rendered_rank.get(_draft_key(info)) if ext in _DRAFT_EXTS else None
+        if sibling_rank is not None:
+            keys[id(info)] = (sibling_rank, 1, mtime)
+        else:
+            keys[id(info)] = (_type_rank(info), 0, mtime)
+    return keys
+
+
+# --- Deliverable format guard ------------------------------------------------
+# Leading bytes every container format is REQUIRED to start with. A run that
+# cannot actually build one of these has been observed writing prose under the
+# name instead — a 310-byte outline opening with 「虚拟生成的PPT文件内容」 saved as
+# ``output/presentation.pptx`` — and every downstream check passed it: right zone,
+# new file, non-empty. The user downloads something PowerPoint refuses to open and
+# nothing in the run says why.
+#
+# Only formats whose first bytes are FIXED appear here. A text deliverable
+# (.md / .csv / .html / .svg / .txt) may legitimately begin with any byte, so it
+# has no entry and is never judged; neither is an extension outside this table.
+# Being narrow is the point: a wrongly dropped real deliverable is worse than a
+# fake one getting through, since the fake at least leaves the answer to explain.
+_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_OLE2_SIGNATURE = (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",)
+_FORMAT_SIGNATURES: dict[str, tuple[bytes, ...]] = {
+    # OOXML and OpenDocument are zip containers
+    ".docx": _ZIP_SIGNATURES,
+    ".xlsx": _ZIP_SIGNATURES,
+    ".pptx": _ZIP_SIGNATURES,
+    ".odt": _ZIP_SIGNATURES,
+    ".ods": _ZIP_SIGNATURES,
+    ".odp": _ZIP_SIGNATURES,
+    # legacy Office is an OLE2 compound file
+    ".doc": _OLE2_SIGNATURE,
+    ".xls": _OLE2_SIGNATURE,
+    ".ppt": _OLE2_SIGNATURE,
+    ".pdf": (b"%PDF-",),
+    ".png": (b"\x89PNG\r\n\x1a\n",),
+    ".jpg": (b"\xff\xd8\xff",),
+    ".jpeg": (b"\xff\xd8\xff",),
+    ".gif": (b"GIF87a", b"GIF89a"),
+}
+_SIGNATURE_READ_BYTES = 8
+
+
+def deliverable_format_error(file_info: dict) -> str | None:
+    """Why this file cannot be what its name promises — ``None`` when it can.
+
+    Reads the first few bytes only. Deliberately silent (returns ``None``) for
+    formats with no fixed header, extensions outside the table, and files that
+    could not be opened at all: an unreadable file is a different failure that the
+    upload reports on its own, and accusing it here would just add noise.
+    """
+    name = file_info.get("file_name") or os.path.basename(file_info.get("file_path") or "")
+    ext = os.path.splitext(name)[1].lower()
+    signatures = _FORMAT_SIGNATURES.get(ext)
+    if not signatures:
+        return None
+    try:
+        with open(file_info.get("file_path") or "", "rb") as fh:
+            head = fh.read(_SIGNATURE_READ_BYTES)
+    except OSError:
+        return None
+    if any(head.startswith(signature) for signature in signatures):
+        return None
+    return f"content does not match its {ext} extension (starts with {head!r})"
+
+
+def detect_invalid_deliverables(
+    file_details: list[dict], baseline_paths: set[str] | dict[str, str] | None = None
+) -> list[dict]:
+    """Selected deliverables whose bytes contradict the format their name promises.
+
+    The diagnostic twin of :func:`detect_phantom_deliverables`: that one reports a
+    file the answer claims but the run never wrote, this one reports a file that
+    exists but is not what it says it is. Both only ever describe — the fake is
+    dropped from the result, never "repaired" into something it isn't, because a
+    repair would once again leave the run looking healthy.
+
+    Judged over :func:`select_deliverables` rather than the whole listing: a stray
+    half-written file under ``scratch/`` is not being delivered to anyone, and
+    reporting it would bury the finding that matters.
+    """
+    invalid: list[dict] = []
+    for file_info in select_deliverables(file_details, baseline_paths):
+        reason = deliverable_format_error(file_info)
+        if reason:
+            invalid.append(
+                {
+                    "file_name": file_info.get("file_name"),
+                    "rel_path": file_info.get("rel_path"),
+                    "reason": reason,
+                }
+            )
+    return invalid
+
+
 # Read File Directory File Details
 async def read_file_directory(file_dir: str) -> list[dict[str, Any]]:
     """Read file details in file directory"""
@@ -215,14 +433,23 @@ async def read_file_directory(file_dir: str) -> list[dict[str, Any]]:
     return file_details
 
 
-def select_deliverables(file_details: list[dict], baseline_paths: set[str] | None = None) -> list[dict]:
+def select_deliverables(
+    file_details: list[dict], baseline_paths: set[str] | dict[str, str] | None = None
+) -> list[dict]:
     """Pick the run's deliverables out of the working-dir listing, best first.
 
     Two ordered criteria, no text matching:
 
     1. **The ``output/`` zone** — the delivery contract every writer is pointed at
        (the code interpreter now relocates root-level writes into it, and the
-       kernel prompt tells ``write_file`` to use it).
+       kernel prompt tells ``write_file`` to use it). A follow-up turn inherits
+       the previous ``output/``, so an unmodified leftover (same path + md5 as
+       the start-of-run fingerprint dict) is not this run's deliverable, unless
+       a fresh markdown/html deliverable links to it. If nothing there is fresh,
+       the zone is treated as empty so a missing ``write_file`` falls through to
+       fallback instead of republishing last turn's report. A path-only ``set``
+       baseline cannot tell overwrite from leftover, so this filter is skipped
+       for that shape (older callers / tests).
     2. **Files this run created**, when ``output/`` came up empty — a deliverable
        written to an off-contract path is still a deliverable. Requires the task's
        start-of-run ``baseline_paths``; without it this criterion is skipped rather
@@ -242,7 +469,8 @@ def select_deliverables(file_details: list[dict], baseline_paths: set[str] | Non
     real ``output/`` file and become the headline artifact).
 
     The two criteria are mutually exclusive. The result is ordered by file TYPE
-    first and recency second (see ``_DELIVERABLE_TYPE_RANK``), so ``files[0]`` — the
+    first and recency second (see ``_DELIVERABLE_TYPE_RANK``; a draft sorts right
+    after its rendered sibling, see ``_deliverable_sort_keys``), so ``files[0]`` — the
     frontend's "已为您整理好 X" headline — is a deliberate pick rather than whatever
     ``os.walk`` happened to enumerate first (previously that was filesystem-
     dependent, and since ``os.walk`` is top-down it favoured root-level files over
@@ -257,41 +485,71 @@ def select_deliverables(file_details: list[dict], baseline_paths: set[str] | Non
         candidates.append((file_info, zone))
 
     selected = [info for info, zone in candidates if zone == OUTPUT_ZONE]
-    if not selected and baseline_paths is not None:
+    # Fingerprint dict only: deliver what this run wrote or overwrote, per file.
+    # A follow-up turn inherits the whole previous output/, so keeping the zone
+    # whenever anything in it changed republished every earlier deliverable (a
+    # turn asking for one docx came back with the previous turns' pptx/html/xlsx
+    # too). Leftovers a fresh report links to stay: the preview resolves a
+    # markdown image against the delivered file list, so dropping one breaks it.
+    if selected and isinstance(baseline_paths, dict):
+        fresh = [info for info in selected if not _is_unmodified_leftover(info, baseline_paths)]
+        leftovers = [info for info in selected if _is_unmodified_leftover(info, baseline_paths)]
+        selected = fresh + _leftovers_referenced_by(fresh, leftovers) if fresh else []
+
+    path_set = _baseline_path_set(baseline_paths)
+    if not selected and path_set is not None:
         # `is not None`, not truthiness: an EMPTY baseline is the common case (a task
         # with no uploaded files prefetches nothing), and it is precisely the case
         # where every file present was produced by this run. Only `None` — no
         # baseline captured at all — means "cannot tell", and then we do not guess.
-        selected = [info for info, _ in candidates if info.get("file_path") not in baseline_paths]
+        selected = [info for info, _ in candidates if info.get("file_path") not in path_set]
 
     # Type first, recency second. The frontend takes ``[0]`` as the headline file
     # and lists the rest under it, so this ordering is user-visible: it must be a
     # deliberate "which of these IS the deliverable" answer, not enumeration order.
-    selected.sort(key=lambda info: (_type_rank(info), -(info.get("file_mtime") or 0.0)))
+    # A draft with a rendered sibling (报告.md next to 报告.docx) sorts after it.
+    sort_keys = _deliverable_sort_keys(selected)
+    selected.sort(key=lambda info: sort_keys[id(info)])
     return selected
 
 
 # Get the final result file
 async def get_final_result_file(
-    session_model: LinsightSessionVersion, file_details, baseline_paths: set[str] | None = None
+    session_model: LinsightSessionVersion,
+    file_details,
+    baseline_paths: set[str] | dict[str, str] | None = None,
 ) -> list[dict]:
     """
     Get the final result file
     :param file_details:
     :param session_model: LinsightSessionVersion Model Instance
-    :param baseline_paths: absolute paths present at task start (see snapshot_file_paths)
+    :param baseline_paths: start-of-run paths (set) or path→md5 fingerprints (dict)
     :return: List containing final result file information
     """
-    # Final Result File
-    final_result_files = [
-        {
-            "file_name": file_info["file_name"],
-            "file_path": file_info["file_path"],
-            "file_md5": file_info["file_md5"],
-            "file_id": file_info["file_id"],
-        }
-        for file_info in select_deliverables(file_details, baseline_paths)
-    ]
+    # Final Result File. A file whose bytes contradict its extension is dropped
+    # here rather than uploaded: handing the user a .pptx PowerPoint cannot open is
+    # worse than handing them nothing, and "nothing" is at least visible. The drop
+    # is recorded on the session by the caller (detect_invalid_deliverables) and
+    # logged here so it is never silent.
+    final_result_files = []
+    for file_info in select_deliverables(file_details, baseline_paths):
+        reason = deliverable_format_error(file_info)
+        if reason:
+            logger.warning(
+                "[linsight-invalid-deliverable] session={} dropping {!r}: {}",
+                session_model.id,
+                file_info.get("rel_path") or file_info.get("file_name"),
+                reason,
+            )
+            continue
+        final_result_files.append(
+            {
+                "file_name": file_info["file_name"],
+                "file_path": file_info["file_path"],
+                "file_md5": file_info["file_md5"],
+                "file_id": file_info["file_id"],
+            }
+        )
 
     async def upload_file_to_minio(final_file_info: dict) -> dict | None:
         """Upload files toMinIOand returns file information"""
@@ -477,6 +735,9 @@ async def build_fallback_report_file(session_model: LinsightSessionVersion, answ
     if not answer:
         return []
     try:
+        from bisheng.citation.domain.services.citation_prompt_helper import unescape_citation_markers
+
+        answer = unescape_citation_markers(answer)
         output_dir = os.path.join(file_dir, "output")
         os.makedirs(output_dir, exist_ok=True)
         local_path = os.path.join(output_dir, FALLBACK_REPORT_NAME)
@@ -537,6 +798,8 @@ async def check_and_terminate_incomplete_tasks(node_id: str) -> None:
 
             tasks_to_terminate = []
             user_ids_to_rollback = set()
+            # Sessions whose owner still had a heartbeat key on the first look.
+            looks_alive: list[tuple[Any, str]] = []
 
             for session in incomplete_tasks:
                 session_id = session.id
@@ -545,25 +808,34 @@ async def check_and_terminate_incomplete_tasks(node_id: str) -> None:
                 owner_key = f"linsight:task:owner:{session_id}"
                 owner_node_id = await redis_client.aget(owner_key)
 
-                should_terminate = False
-
                 if not owner_node_id:
                     # No owned node, task needs to be cleaned up.
-                    should_terminate = True
                     logger.warning(f"Task {session_id} has no owner in Redis. Marking as failed.")
-                else:
-                    # There is an owned node, check if the node is alive
-                    is_alive = await node_manager.is_node_alive(owner_node_id)
-                    if not is_alive:
-                        # Node is dead, task needs to be cleaned up.
-                        should_terminate = True
-                        logger.warning(f"Task {session_id} owner {owner_node_id} is dead. Marking as failed.")
-                    else:
-                        # Node is alive, skip cleanup
-                        logger.info(f"Task {session_id} is running on active node {owner_node_id}. Skipping.")
-
-                if should_terminate:
                     tasks_to_terminate.append(session_id)
+                    user_ids_to_rollback.add(session.user_id)
+                elif not await node_manager.is_node_alive(owner_node_id):
+                    # Node is dead, task needs to be cleaned up.
+                    logger.warning(f"Task {session_id} owner {owner_node_id} is dead. Marking as failed.")
+                    tasks_to_terminate.append(session_id)
+                    user_ids_to_rollback.add(session.user_id)
+                else:
+                    looks_alive.append((session, owner_node_id))
+
+            # A heartbeat key outlives its node by up to one TTL. A replacement pod
+            # usually starts within seconds of the old one being killed (eviction:
+            # old pod ended 15:07:20, new one started 15:07:24), so on the first
+            # look the dead node's key is still there and its tasks were skipped
+            # for good: this sweep runs once, and nothing else ever fails them.
+            # Wait one TTL and look again. A live node refreshes its key every
+            # ``interval`` seconds and is still there; a dead node's key is gone.
+            if looks_alive:
+                await asyncio.sleep(node_manager.ttl + 1)
+                for session, owner_node_id in looks_alive:
+                    if await node_manager.is_node_alive(owner_node_id):
+                        logger.info(f"Task {session.id} is running on active node {owner_node_id}. Skipping.")
+                        continue
+                    logger.warning(f"Task {session.id} owner {owner_node_id} stopped its heartbeat. Marking as failed.")
+                    tasks_to_terminate.append(session.id)
                     user_ids_to_rollback.add(session.user_id)
 
             # 3. Batch-terminate only the sessions selected above.
@@ -583,6 +855,9 @@ async def check_and_terminate_incomplete_tasks(node_id: str) -> None:
                         LinsightExecuteTask.status != ExecuteTaskStatusEnum.FAILED,
                     ),
                 )
+
+                for session_version_id in tasks_to_terminate:
+                    await announce_stranded_session_failure(session_version_id)
 
             logger.warning(f"Terminated {len(tasks_to_terminate)} incomplete tasks due to worker node crash.")
 
@@ -608,6 +883,63 @@ async def check_and_terminate_incomplete_tasks(node_id: str) -> None:
         except Exception as e:
             logger.error(f"Exception occurred while checking and terminating incomplete tasks: {e}")
             return
+
+
+async def announce_stranded_session_failure(session_version_id: str) -> None:
+    """Deliver the terminal events of a task whose worker died before sending them.
+
+    A failure recorded by anyone other than the run itself (the worker-startup
+    crash sweep, the worker's force-fail backstop) used to write the DB only. The
+    task panel learns about the end of a run solely from the task-message-stream
+    queue, and its on-open DB reconcile cannot help either: when the pod restarts,
+    the client relinks before the new worker's sweep has run, sees IN_PROGRESS,
+    and then waits on a queue nobody will ever write to again. Measured on a
+    customer site: the DB said FAILED while the page spun for two hours.
+
+    So mirror ``_handle_task_failure``: land the failed turn in the conversation,
+    overwrite the Redis copies that still say in-progress, push TASK_END for every
+    converged task row and close with ERROR_MESSAGE. Caller must have already
+    written the FAILED status. Best-effort: one session's failure here must not
+    stop the sweep over the rest.
+    """
+    from bisheng.linsight.domain.services.state_message_manager import (
+        LinsightStateMessageManager,
+        MessageData,
+        MessageEventType,
+    )
+
+    try:
+        session_model = await LinsightSessionVersionDao.get_by_id(session_version_id)
+        if session_model is None:
+            return
+        output = session_model.output_result or {}
+        state_manager = LinsightStateMessageManager(session_version_id)
+
+        await state_manager.set_session_version_info(session_model)
+        await persist_task_turn_message(session_model)
+
+        task_models = await LinsightExecuteTaskDao.get_by_session_version_id(session_version_id=session_version_id)
+        if task_models:
+            await state_manager.set_execution_tasks(task_models)
+        for task_model in task_models:
+            if task_model.status == ExecuteTaskStatusEnum.FAILED:
+                await state_manager.push_message(
+                    MessageData(event_type=MessageEventType.TASK_END, data=task_model.model_dump())
+                )
+
+        await state_manager.push_message(
+            MessageData(
+                event_type=MessageEventType.ERROR_MESSAGE,
+                data={
+                    "error": output.get("error_message") or "",
+                    "error_code": output.get("error_code"),
+                    "error_type": output.get("error_type") or "unknown",
+                    "detail": output.get("detail"),
+                },
+            )
+        )
+    except Exception as e:
+        logger.error(f"Failed to announce stranded session failure {session_version_id}: {e}")
 
 
 async def enqueue_session_for_execution(session_model: LinsightSessionVersion) -> None:
@@ -661,6 +993,7 @@ async def persist_task_turn_message(session_model: LinsightSessionVersion) -> Ch
     existing_rows = await ChatMessageDao.aget_messages_by_chat_id(
         chat_id=session_model.session_id, category_list=["task"], limit=1000
     )
+    matched = []
     for row in existing_rows:
         if not row.is_bot:
             continue
@@ -669,8 +1002,21 @@ async def persist_task_turn_message(session_model: LinsightSessionVersion) -> Ch
         except (json.JSONDecodeError, TypeError):
             row_svid = None
         if row_svid == svid:
-            row.message = answer
-            return await ChatMessageDao.aupdate_message_model(row)
+            matched.append(row)
+    if matched:
+        if len(matched) > 1:
+            # The upsert has no unique key, so two writers racing on an empty
+            # conversation each insert a row and the task panel renders twice.
+            # The API-side writers now persist before enqueueing (the worker's
+            # start-time call then only updates), so this should not recur —
+            # log it loudly if it does instead of silently picking one row.
+            logger.warning(
+                f"persist_task_turn_message: {len(matched)} task rows for svid={svid} "
+                f"chat_id={session_model.session_id} ids={[r.id for r in matched]}; updating the first"
+            )
+        row = matched[0]
+        row.message = answer
+        return await ChatMessageDao.aupdate_message_model(row)
 
     return await ChatMessageDao.ainsert_one(
         ChatMessage(

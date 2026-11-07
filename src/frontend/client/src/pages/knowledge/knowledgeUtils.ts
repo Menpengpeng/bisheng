@@ -1,5 +1,18 @@
 import { FileStatus, FileType, type KnowledgeFile } from "~/api/knowledge";
 import i18next from "i18next";
+import { resolveKnowledgePreviewUrl } from "./FilePreview/previewUrlUtils";
+
+/**
+ * Which semantic color a file's status tag speaks in (组件-Tag标签.md §3.1),
+ * shared by the desktop list row, the card and the H5 row so the same state
+ * cannot come out grey in one view and red in another.
+ *
+ * `approving` is not `brand`: 审批中 is one of the two colors the design system
+ * freezes to blue in BOTH brand themes (色彩规范 §4). The hand-rolled pills this
+ * replaced used `bg-blue-50`, which turns green under the green theme — exactly
+ * what that exception exists to prevent.
+ */
+export type KnowledgeStatusTone = "default" | "danger" | "approving";
 
 /** List/card: only folders and successfully parsed files are clickable; violation files stay grayed out. */
 export function isKnowledgeItemPreviewable(file: KnowledgeFile): boolean {
@@ -47,12 +60,12 @@ export function isKnowledgeItemPending(file: KnowledgeFile): boolean {
     if (file.approvalStatus) {
         return file.approvalStatus === "pending_review";
     }
-    // Folder rows have no `status`; treat as pending only when children are
-    // still in an in-progress state (PROCESSING / WAITING / REBUILDING).
+    // Folder rows have no `status`; treat as pending only when their subtree
+    // still has an in-progress file (PROCESSING / WAITING / REBUILDING).
     // Terminal failures (FAILED / TIMEOUT / VIOLATION) must NOT keep the
     // auto-refresh polling alive — e.g. 8 success + 1 failed is a stable state.
     if (file.type === FileType.FOLDER) {
-        return file.processingFileNum != null && file.processingFileNum > 0;
+        return file.hasProcessingFiles === true;
     }
     return Boolean(
         file.status && [
@@ -60,6 +73,19 @@ export function isKnowledgeItemPending(file: KnowledgeFile): boolean {
             FileStatus.WAITING,
             FileStatus.REBUILDING,
             FileStatus.UPLOADING,
+        ].includes(file.status)
+    );
+}
+
+export function isKnowledgeItemRetryable(file: KnowledgeFile): boolean {
+    if (file.type === FileType.FOLDER) {
+        return file.hasFailedFiles === true;
+    }
+    return Boolean(
+        file.status && [
+            FileStatus.FAILED,
+            FileStatus.TIMEOUT,
+            FileStatus.VIOLATION,
         ].includes(file.status)
     );
 }
@@ -245,14 +271,11 @@ export function getFileTypeFromName(name: string): FileType {
 /**
  * Trigger browser download from a URL.
  * Supports both absolute URLs (http/https) and relative paths from the backend.
- * For relative paths: Full URL = window.location.origin + BASE_URL + relativeUrl
+ * Uses the same object-storage routing as file previews.
  */
 export function triggerUrlDownload(url: string, filename?: string) {
-    const fullUrl = /^https?:\/\//.test(url)
-        ? url
-        : `${window.location.origin}${__APP_ENV__.BASE_URL}${url}`;
     const a = document.createElement("a");
-    a.href = fullUrl;
+    a.href = resolveKnowledgePreviewUrl(url);
     if (filename) a.download = filename;
     a.target = "_blank";
     document.body.appendChild(a);
@@ -383,4 +406,66 @@ export function validateFileForUpload(
         return i18next.t("com_knowledge.unsupported_file_format", { 0: file.name });
     }
     return null;
+}
+
+/**
+ * Whether selecting a space should also rewrite the URL to that space's page.
+ *
+ * The sidebar auto-selects a first space as soon as its lists land, and that runs
+ * through the same handler as an explicit click. On a share route that navigation
+ * replaced `/knowledge/share/:id` with the recipient's own default space before the
+ * share preview could open, so the shared space was never shown. The auto-selected
+ * space may render behind the preview; the share URL has to survive.
+ */
+export function shouldNavigateOnSpaceSelect(params: {
+    isShareRoute: boolean;
+    urlFolderId?: string;
+    urlSpaceId?: string;
+    targetSpaceId: string;
+}): boolean {
+    const { isShareRoute, urlFolderId, urlSpaceId, targetSpaceId } = params;
+    if (isShareRoute) return false;
+    return Boolean(urlFolderId) || urlSpaceId !== targetSpaceId;
+}
+
+/**
+ * Does this viewer already have the space open to them?
+ *
+ * A share link is a way in. Only the creator was let straight through, so a
+ * member — or someone granted the space through their department — landed on
+ * the intro-and-apply preview for a space already listed in their own sidebar.
+ *
+ * `role` cannot decide it: `/info` leaves it unset for a non-member and the
+ * client maps unset to MEMBER, the same value a real member carries. The
+ * effective F048 actions do, and `visible` is the very decision the space's own
+ * pages enforce. The creator is admitted first, whatever the actions say.
+ */
+export function canOpenSharedSpace(info: {
+    actions?: readonly string[] | null;
+    role?: string;
+}): boolean {
+    // Creator first and unconditionally: this is their own space, and letting
+    // them in can never be the wrong answer — where an empty action list would
+    // otherwise lock the owner out of their own share link.
+    if (info?.role === "creator") return true;
+    return Array.isArray(info?.actions) && info.actions.includes("visible");
+}
+
+/** Router state key the knowledge page hands to the settings page on entry. */
+export const SETTINGS_RETURN_STATE_KEY = "returnTo";
+
+/**
+ * Where the space settings page goes back to on save / cancel / back.
+ *
+ * Entering settings from the knowledge page records the location the user was
+ * browsing (space + folder), so leaving settings resumes there — even when the
+ * settings belonged to another space opened from the sidebar. A settings URL
+ * opened directly carries no such state and falls back to `fallback`.
+ * Only in-app knowledge paths are honored, never an arbitrary URL.
+ */
+export function resolveSettingsReturnPath(state: unknown, fallback: string): string {
+    const returnTo = (state as Record<string, unknown> | null | undefined)?.[SETTINGS_RETURN_STATE_KEY];
+    if (typeof returnTo !== "string") return fallback;
+    if (!/^\/knowledge(?:[/?]|$)/.test(returnTo)) return fallback;
+    return returnTo;
 }

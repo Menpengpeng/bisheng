@@ -67,8 +67,94 @@ PASSWORD_STRENGTH_PATTERN = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W
 
 class UserService:
     @classmethod
+    def list_management_users(cls, user_ids=None, keyword=None, page=0, limit=0):
+        from bisheng.user.domain.repositories.management_search_repository import ManagementSearchRepository
+
+        try:
+            return ManagementSearchRepository.list_users(user_ids, keyword, page, limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @staticmethod
+    def _dsh_enabled() -> bool:
+        configuration = getattr(settings, "dsh", {})
+        return configuration.get("enabled") is True if isinstance(configuration, dict) else bool(configuration.enabled)
+
+    @classmethod
+    def _persist_profile_in_session(cls, session, changed: User) -> User:
+        from bisheng.user.domain.repositories.dsh_profile import UserDshProfileRepository
+
+        user, profile_changed = UserDshProfileRepository.apply_detached_changes(session, changed)
+        if cls._dsh_enabled() and profile_changed:
+            cls._record_profile_in_session(session, user)
+        return UserDshProfileRepository.detach(session, user)
+
+    @staticmethod
+    def _record_profile_in_session(session, user: User):
+        from bisheng.user.domain.repositories.dsh_profile import UserDshProfileRepository
+
+        snapshot = UserDshProfileRepository.bump_snapshot(session, user)
+        return snapshot
+
+    @classmethod
+    def persist_profile_update(cls, changed: User, *, session_scope=None) -> User:
+        """Persist user changes and local profile version in the same transaction."""
+        from bisheng.user.domain.repositories.dsh_profile import UserDshProfileRepository
+
+        with (session_scope or UserDshProfileRepository.transaction)() as session:
+            return cls._persist_profile_in_session(session, changed)
+
+    @classmethod
+    async def apersist_profile_update(cls, changed: User) -> User:
+        async with get_async_db_session() as session:
+            user = await session.run_sync(lambda sync: cls._persist_profile_in_session(sync, changed))
+            await session.commit()
+            return user
+
+    @classmethod
+    async def activate_tenant_with_profile(cls, user_id: int, tenant_id: int):
+        """Keep membership, JWT version and local profile version in one transaction."""
+        from bisheng.user.domain.repositories.dsh_profile import UserDshProfileRepository
+
+        async with get_async_db_session() as session:
+
+            def activate(sync):
+                user = UserDshProfileRepository.activate_tenant(sync, user_id, tenant_id)
+                cls._record_profile_in_session(sync, user)
+
+            await session.run_sync(activate)
+            await session.commit()
+
+    @staticmethod
+    async def batch_dsh_profiles(user_ids: list[int]) -> dict[int, dict]:
+        from bisheng.user.domain.repositories.dsh_profile import UserDshProfileRepository
+
+        async with get_async_db_session() as session:
+            return await session.run_sync(lambda sync: UserDshProfileRepository.batch_snapshot(sync, user_ids))
+
+    @classmethod
+    async def scan_dsh_profiles(cls, *, after_user_id: int = 0, limit: int = 100):
+        """Read a bounded authoritative cursor page for monotonic projection repair."""
+        from bisheng.user.domain.repositories.dsh_profile import UserDshProfileRepository
+
+        if not cls._dsh_enabled():
+            return {"items": [], "next_user_id": after_user_id, "has_more": False}
+        async with get_async_db_session() as session:
+
+            def scan(sync):
+                ids = UserDshProfileRepository.cursor_ids(sync, after_user_id=after_user_id, limit=limit)
+                snapshots = UserDshProfileRepository.batch_snapshot(sync, ids)
+                return {
+                    "items": list(snapshots.values()),
+                    "next_user_id": ids[-1] if ids else after_user_id,
+                    "has_more": len(ids) == limit,
+                }
+
+            return await session.run_sync(scan)
+
+    @classmethod
     async def ainvalidate_jwt_after_account_disabled(cls, user_id: int) -> None:
-        """禁用账号后立刻让已签发的 JWT 失效（F012 ``token_version``），并清理管理端 scope 缓存。"""
+        """Invalidate issued JWTs through token_version and clear cached administrator scope."""
         try:
             await UserDao.aincrement_token_version(user_id)
         except Exception as exc:
@@ -77,7 +163,6 @@ class UserService:
                 user_id,
                 exc,
             )
-            return
         try:
             from bisheng.admin.domain.services.tenant_scope import TenantScopeService
 
@@ -85,6 +170,25 @@ class UserService:
         except Exception as exc:
             logger.debug(
                 "clear_on_token_version_bump failed after account disabled user_id=%s: %s",
+                user_id,
+                exc,
+            )
+        try:
+            from bisheng.database.models.tenant import UserTenantDao
+            from bisheng.open_api.domain.models.api_credential import REVOKE_REASON_SUBJECT_DISABLED
+            from bisheng.open_api.domain.services.personal_token_service import PersonalTokenService
+
+            membership = await UserTenantDao.aget_active_user_tenant(user_id)
+            if membership is not None:
+                await PersonalTokenService.cascade_revoke(
+                    tenant_id=membership.tenant_id,
+                    user_id=user_id,
+                    reason=REVOKE_REASON_SUBJECT_DISABLED,
+                )
+        except Exception as exc:
+            # Resolver still rejects the disabled holder after its short cache expires.
+            logger.warning(
+                "personal token revoke failed after account disabled user_id={}: {}",
                 user_id,
                 exc,
             )
@@ -143,7 +247,7 @@ class UserService:
 
     @classmethod
     def decrypt_password_plain(cls, password: str) -> str:
-        """RSA 解密得到明文密码（未做 MD5）；无 RSA 配置时视为明文开发模式。"""
+        """Decrypt RSA before hashing; without RSA configuration use the development plaintext input."""
         if value := get_redis_client_sync().get(RSA_KEY):
             private_key = value[1]
             return rsa.decrypt(b64decode(password), private_key).decode("utf-8")
@@ -260,7 +364,7 @@ class UserService:
             raise UserValidateError(msg="Person ID already exists")
         db_user.external_id = person_id
 
-        # 允许用户名重复；人员唯一性由 external_id / user_id 等保证
+        # Names may repeat; external_id and user_id identify the person.
         if len(db_user.user_name) > 30:
             raise UserNameTooLongError()
         db_user.password = cls.decrypt_md5_password_strict(user.password)
@@ -311,7 +415,7 @@ class UserService:
 
     @classmethod
     async def _ensure_user_guest_department_membership(cls, user_id: int) -> None:
-        """注册完成后自动加入“临时访客”部门（主部门）。"""
+        """Join the default temporary guest department after registration."""
         from sqlmodel import select
 
         from bisheng.database.models.department import Department, UserDepartment
@@ -390,9 +494,13 @@ class UserService:
         role_ids: list[int] | None = None,
         is_department_admin: bool | None = None,
     ) -> UnifiedResponseModel | None:
-        """无角色且非部门/用户组管理员时拒绝登录；有角色但生效菜单既不包含工作台也不包含管理后台时拒绝登录。
+        """Reject users without any role or organizational administration, or without an effective entry menu.
 
-        需审批模式下角色可仅勾选一级菜单（workstation/admin）而无二级项，仍视为有菜单权限，允许登录。
+        In approval mode, a top-level workstation or admin menu alone is sufficient for entry.
+
+        No service-account guard is needed here: service accounts are not rows
+        of ``user`` (F053 design K15 / K17), so no login path can ever hand one
+        in as ``db_user``.
         """
         # Pre-tenant-context check: any role/dept/group access across all tenants
         # qualifies for login. Without bypass, every DAO below trips
@@ -435,10 +543,10 @@ class UserService:
             if not user.captcha_key or not await verify_captcha(user.captcha, user.captcha_key):
                 raise CaptchaError()
 
-        # 支持用户名或 external_id；重名时对候选用户依次校验密码
+        # Accept names or external_id; check each matching account when names repeat.
         candidates = await UserDao.aget_login_candidates_by_account(user.user_name)
         if not candidates:
-            # 禁用账号不会进入候选列表；单独提示，避免与「账号或密码错误」混淆
+            # Disabled users are excluded from candidates; report the disabled account separately.
             if await UserDao.aexists_disabled_login_account(user.user_name):
                 return UserForbiddenError.return_resp()
             return UserValidateError.return_resp()
@@ -457,7 +565,7 @@ class UserService:
             except UserPasswordMaxTryError:
                 raise
             except UserValidateError:
-                # 该候选用户密码不匹配，尝试下一个同名账号
+                # Try the next account with the same name when the password does not match.
                 continue
         if not db_user:
             return UserValidateError.return_resp()
@@ -519,7 +627,7 @@ class UserService:
             active_tenants = [t for t in user_tenants if t.get("status") == "active"]
 
             if len(active_tenants) == 0:
-                # 注册/历史数据可能未写入 user_tenant；若默认租户存在则自动挂接，避免无法登录
+                # Attach legacy users without membership to the configured default tenant when available.
                 code = (settings.multi_tenant.default_tenant_code or "default").strip() or "default"
                 with bypass_tenant_filter():
                     default_tenant = await TenantDao.aget_by_code(code)
@@ -675,9 +783,9 @@ class UserService:
     def get_user_all_info(
         cls,
         *,
-        start_time: datetime = None,
-        end_time: datetime = None,
-        user_ids: list[int] = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        user_ids: list[int] | None = None,
         page: int = 1,
         page_size: int = 100,
     ) -> list[User]:
