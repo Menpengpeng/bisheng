@@ -1241,7 +1241,7 @@ bash scripts/backfill_user_tenant_associations.sh apply    # 写入
 
 背景：写 `department:{parent}#parent@department:{child}` 边的只有 F002 手动建/移部门；SSO 同步及早期 f006 迁移进来的部门在 FGA 里没有这条边，导致部门 admin 的 FGA 继承对其失效。SSO 同步链路已修复为实时维护 parent 边，本脚本按 DB 当前树形一次性补齐**存量**部门的边。
 
-遍历所有 `status='active'` 且 `parent_id` 非空的部门（全租户、全来源），每个发一条 `write department:{parent_id}#parent department:{id}`。`batch_write_tuples` 对重复写幂等，可反复跑。
+遍历所有 `status='active'` 且 `parent_id` 非空的部门（全租户、全来源），每个发一条 `write department:{parent_id}#parent department:{id}`。`--apply` 写入前会先读回已存在的边并跳过，因此可反复跑（OpenFGA 对重复 tuple 的写入返回 400，不做这层过滤第二次执行就会失败）。
 
 > 运行顺序：在 `backfill_departments_under_single_root.py`（定型 parent_id）**之后**运行，会一并补上被收编部门的 root→顶层 边。
 

@@ -17,9 +17,9 @@ OpenFGA 模型里 ``department#admin`` 通过 ``parent`` 关系从父部门继�
 发一条 ``write department:{parent_id}#parent department:{id}``，经
 ``PermissionService.batch_write_tuples`` 写入 OpenFGA。
 
-**只加不删（additive）**：不删除任何已存在的边。``batch_write_tuples`` 对"重复写"
-幂等（已存在视为成功），因此本脚本可安全反复运行。根部门（``parent_id`` 为空）无父边，
-天然跳过。
+**只加不删（additive）**：不删除任何已存在的边。``--apply`` 写入前会先读回已存在的
+``department#parent`` 边并跳过——OpenFGA 对重复 tuple 的写入直接返回 400，不做这层
+过滤脚本就无法重跑。根部门（``parent_id`` 为空）无父边，天然跳过。
 
 ## 运行顺序
 
@@ -85,6 +85,38 @@ async def _collect_parent_edges() -> list[tuple[int, int]]:
     return edges
 
 
+async def _drop_existing_edges(permissions, ops: list) -> list:
+    """Filter out ``department#parent`` edges already present in OpenFGA.
+
+    OpenFGA rejects a write when the tuple already exists, and one duplicate
+    fails the whole batch — so a second ``--apply`` would error out instead of
+    succeeding. Read the current parent edges per child and keep the missing
+    ones only.
+    """
+    from bisheng.permission.application import PermissionObject
+
+    by_child: dict[str, list] = {}
+    for op in ops:
+        by_child.setdefault(op.relation.resource.resource_id, []).append(op)
+
+    existing: set[tuple[str, str]] = set()
+    for child_id in by_child:
+        rows = await permissions.list_relations(
+            resource=PermissionObject("department", child_id),
+            relation="parent",
+        )
+        for row in rows:
+            if row.subject.subject_type != "department" or row.subject.relation is not None:
+                continue
+            existing.add((row.resource.resource_id, row.subject.subject_id))
+
+    return [
+        op
+        for op in ops
+        if (op.relation.resource.resource_id, op.relation.subject.subject_id) not in existing
+    ]
+
+
 async def run(apply: bool) -> int:
     from bisheng.core.context.tenant import bypass_tenant_filter
     from bisheng.department.domain.services.department_change_handler import (
@@ -116,8 +148,14 @@ async def run(apply: bool) -> int:
             return 0
 
         permissions = await get_permission_relation_api()
-        await permissions.apply_changes(tuple(ops))
-        logger.info("完成。已写入 {} 条 department#parent 边。", len(ops))
+        pending = await _drop_existing_edges(permissions, ops)
+        if not pending:
+            logger.info("完成。{} 条 department#parent 边均已存在，无需写入。", len(ops))
+            return 0
+        if len(pending) != len(ops):
+            logger.info("跳过 {} 条已存在的 department#parent 边。", len(ops) - len(pending))
+        await permissions.apply_changes(tuple(pending))
+        logger.info("完成。已写入 {} 条 department#parent 边。", len(pending))
         return 0
 
 
@@ -139,6 +177,15 @@ def main() -> int:
 
         await initialize_app_context(config=settings)
         try:
+            # ``permission_runtime`` 是懒加载 Context, 只有 API / worker 进程会注册.
+            # 脚本进程不注册的话 get_permission_relation_api() 会直接报
+            # "Context 'permission_runtime' not found".
+            from bisheng.permission.application.process_runtime import (
+                initialize_f048_background_runtime,
+                register_f048_permission_runtime_context,
+            )
+
+            register_f048_permission_runtime_context(initialize_f048_background_runtime)
             return await run(apply=args.apply)
         finally:
             await close_app_context()
