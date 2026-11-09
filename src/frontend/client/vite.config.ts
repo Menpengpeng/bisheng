@@ -279,7 +279,8 @@ export default defineConfig(({ command, mode }) => {
           manualChunks(id: string, { getModuleInfo }) {
             if (!firstScreenModules) {
               firstScreenModules = new Set();
-              const root = path.join(__dirname, 'src/main.jsx');
+              // Windows 下 rollup 的模块 id 使用正斜杠，path.join 结果是反斜杠，这里统一转成正斜杠
+              const root = path.join(__dirname, 'src/main.jsx').replace(/\\/g, '/');
               if (!getModuleInfo(root)) throw new Error(`manualChunks: first-screen root not found: ${root}`);
               const queue = [root];
               while (queue.length) {
