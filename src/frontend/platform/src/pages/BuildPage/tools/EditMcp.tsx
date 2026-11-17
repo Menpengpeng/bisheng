@@ -43,7 +43,7 @@ const TestDialog = forwardRef((props, ref) => {
         // const requiredParams = Object.entries(toolData.inputSchema.properties)
         //     .filter(([_, schema]) => schema.required)
         //     .map(([name]) => name);
-        const requiredParams = toolData.inputSchema.required
+        const requiredParams = toolData.inputSchema.required ?? [];
 
         const errors = requiredParams.filter(name => !params[name]);
         if (errors.length > 0) {
