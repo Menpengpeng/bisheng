@@ -119,6 +119,11 @@ class ToolExecutor(BaseTool):
     async def _ensure_use_permission_async(cls, tool_type: GptsToolsType, user_id: int) -> None:
         if not tool_type.id or not tool_type.tenant_id:
             raise PermissionError("Permission denied: use")
+        from bisheng.utils.http_middleware import _check_is_global_super
+
+        # System Admin 调用工具时不受工具组 use 授权限制；实际业务数据权限仍由下游服务校验。
+        if await _check_is_global_super(user_id):
+            return
         login_user = await cls._build_permission_user(
             user_id,
             int(tool_type.tenant_id),

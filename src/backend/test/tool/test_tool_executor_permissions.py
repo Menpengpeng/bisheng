@@ -10,8 +10,8 @@ from bisheng.tool.domain.services.executor import ToolExecutor, ToolInitializati
 
 
 @pytest.mark.asyncio
-async def test_preset_tool_execution_still_checks_exact_use_action(monkeypatch):
-    check_action = AsyncMock(return_value=True)
+async def test_system_admin_skips_tool_use_permission_check(monkeypatch):
+    check_action = AsyncMock(return_value=False)
     check_global_super = AsyncMock(return_value=True)
     monkeypatch.setattr(
         "bisheng.tool.domain.services.executor.check_business_action",
@@ -29,16 +29,8 @@ async def test_preset_tool_execution_still_checks_exact_use_action(monkeypatch):
 
     await ToolExecutor._ensure_use_permission_async(tool_type, user_id=7)
 
-    login_user = check_action.await_args.args[0]
-    assert login_user.user_id == 7
-    assert login_user.tenant_id == 5
-    assert login_user.is_global_super is True
     check_global_super.assert_awaited_once_with(7)
-    assert check_action.await_args.kwargs == {
-        "resource_type": "tool",
-        "resource_id": 10,
-        "action": "use",
-    }
+    check_action.assert_not_awaited()
 
 
 @pytest.mark.asyncio
