@@ -147,6 +147,16 @@ const comptibleStart = (node) => {
         })
         node.v = 3
     }
+    const globalParams = node.group_params?.[1]?.params
+    if (globalParams && !globalParams.some((param) => param.key === 'wms_user_token')) {
+        globalParams.splice(1, 0, {
+            "key": "wms_user_token",
+            "global": "key",
+            "label": "true",
+            "type": "var",
+            "value": "",
+        })
+    }
 }
 
 

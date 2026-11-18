@@ -305,6 +305,9 @@
       "user_info": {
         "label": "用户信息"
       },
+      "wms_user_token": {
+        "label": "WMS用户令牌"
+      },
       "current_time": {
         "label": "当前时间"
       },

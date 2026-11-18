@@ -8,7 +8,7 @@ import pytest
 from bisheng.common.errcode.tool import ToolMcpStdioError
 from bisheng.core.config.settings import McpConf
 from bisheng.mcp_manage.clients import streamable as streamable_module
-from bisheng.mcp_manage.clients.base import use_wms_user_token
+from bisheng.mcp_manage.clients.base import BaseMcpClient, use_wms_user_token
 from bisheng.mcp_manage.clients.sse import SseClient
 from bisheng.mcp_manage.clients.streamable import StreamableClient
 from bisheng.mcp_manage.constant import McpClientType
@@ -77,6 +77,23 @@ async def test_streamable_client_forwards_wms_user_token_only_when_enabled(monke
         pass
 
     assert "Authorization" not in requests[1]["headers"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_unwraps_transport_exception_group():
+    class FailingClient(BaseMcpClient):
+        @asynccontextmanager
+        async def get_transport(self):
+            yield None, None
+
+        @asynccontextmanager
+        async def get_tool_transport(self):
+            raise ExceptionGroup("unhandled errors in a TaskGroup", [Exception("401 Unauthorized")])
+            yield None, None
+
+    result = await FailingClient().call_tool("get_current_user")
+
+    assert result == "Tool call failed: 401 Unauthorized"
 
 
 @pytest.mark.asyncio

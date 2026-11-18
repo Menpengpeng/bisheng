@@ -9,6 +9,7 @@ from bisheng.database.models.department import UserDepartmentDao, DepartmentDao
 from bisheng.database.models.group import GroupDao
 from bisheng.database.models.role import RoleDao
 from bisheng.database.models.user_group import UserGroupDao
+from bisheng.mcp_manage.clients.base import get_wms_user_token
 from bisheng.user.domain.models.user import UserDao
 from bisheng.user.domain.models.user_role import UserRoleDao
 from bisheng.workflow.callback.event import GuideQuestionData, GuideWordData
@@ -80,6 +81,8 @@ class StartNode(BaseNode):
             'chat_history': '',
             'preset_question': new_preset_question,
             'user_info': self._user_info,
+            # 仅在本次请求期间从 WMS 请求头注入，不保存至工作流定义或执行日志。
+            'wms_user_token': get_wms_user_token() or '',
             'custom_variables': custom_vars
         }
 

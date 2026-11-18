@@ -264,6 +264,13 @@ const workflowTemplate = [
                         "value": "",
                     },
                     {
+                        "key": "wms_user_token",
+                        "global": "key",
+                        "label": "true",
+                        "type": "var",
+                        "value": "",
+                    },
+                    {
                         "key": "current_time",
                         "global": "key",
                         "label": "true",

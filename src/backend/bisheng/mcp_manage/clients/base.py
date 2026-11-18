@@ -1,3 +1,4 @@
+import asyncio
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -6,6 +7,15 @@ from typing import Any
 from mcp import ClientSession
 
 _wms_user_token: ContextVar[str | None] = ContextVar("wms_user_token", default=None)
+
+
+def _flatten_mcp_error(exc: BaseException) -> str:
+    """展开 MCP SDK 包装的异常组，保留实际传输失败原因。"""
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        messages = [_flatten_mcp_error(item) for item in nested]
+        return "; ".join(message for message in messages if message) or str(exc)
+    return str(exc).strip() or type(exc).__name__
 
 
 @asynccontextmanager
@@ -57,11 +67,13 @@ class BaseMcpClient(ABC):
         """
         Call a tool.
         """
-        async with self.get_tool_transport() as (read, write):
-            async with ClientSession(read, write) as client_session:
-                await client_session.initialize()
-                try:
+        try:
+            async with self.get_tool_transport() as (read, write):
+                async with ClientSession(read, write) as client_session:
+                    await client_session.initialize()
                     resp = await client_session.call_tool(name, arguments)
-                except Exception as e:
-                    return f"Tool call failed: {str(e)}"
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            return f"Tool call failed: {_flatten_mcp_error(exc)}"
         return resp.model_dump_json()
