@@ -40,10 +40,17 @@ FRONTEND_CONTAINER="bisheng-frontend"
 BACKEND_HEALTH_TIMEOUT="${BACKEND_HEALTH_TIMEOUT:-120}"
 BACKEND_HEALTH_INTERVAL="${BACKEND_HEALTH_INTERVAL:-5}"
 
-# 镜像 tag（最终打成的 tag，与 compose 文件引用一致）
-FINAL_IMAGE_TAG="${FINAL_IMAGE_TAG:-v2.6.0}"
+# 镜像 ref / 网络名：3.0 起由 compose 目录的 .env 驱动，脚本不再硬编码。
+#   BISHENG_BACKEND_IMAGE → 后端镜像完整 ref（如 cr.dataelem.com/dataelement/bisheng-backend:v3.0.0）
+#   BISHENG_NETWORK_NAME  → default 网络的真实名字（如 bisheng-network）
+# 读不到时回退到旧版硬编码（v2.6.0 / <project>_default），保证老环境仍可用。
 SOURCE_IMAGE_TAG="${SOURCE_IMAGE_TAG:-dev-local}"
 IMAGE_NAME="dataelement/bisheng-backend"
+FINAL_IMAGE_TAG="${FINAL_IMAGE_TAG:-v2.6.0}"   # 仅作 .env 缺失时的回退
+ENV_FILE_OVERRIDE="${ENV_FILE:-}"              # 显式指定 ENV_FILE 时优先，否则用 $COMPOSE_DIR/.env
+ENV_FILE=""
+BACKEND_IMAGE_REF=""                           # 由 load_compose_env() 填充
+EXPECTED_NETWORK=""                            # 由 load_compose_env() 填充
 
 # ─── 颜色输出 ────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -137,11 +144,56 @@ check_prerequisites() {
     fi
 }
 
+# ─── 读取 compose .env ───────────────────────────────────────
+# 3.0 起后端镜像与网络名都由 .env 驱动，脚本不能再硬编码。
+read_env_var() {
+    local key="$1" value
+    [[ -f "$ENV_FILE" ]] || return 1
+    # 取第一处 key=value，忽略注释行；去掉 CR（防 Windows 编辑过的 .env）、行尾空白和引号
+    value=$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$ENV_FILE" \
+        | head -n1 | tr -d '\r' | sed 's/[[:space:]]*$//')
+    value="${value#\"}"; value="${value%\"}"
+    value="${value#\'}"; value="${value%\'}"
+    [[ -n "$value" ]] || return 1
+    printf '%s' "$value"
+}
+
+load_compose_env() {
+    header "读取 compose 环境"
+
+    ENV_FILE="${ENV_FILE_OVERRIDE:-$COMPOSE_DIR/.env}"
+    local ref="" net=""
+
+    if [[ -f "$ENV_FILE" ]]; then
+        info "env 文件: $ENV_FILE"
+        ref=$(read_env_var BISHENG_BACKEND_IMAGE || true)
+        net=$(read_env_var BISHENG_NETWORK_NAME || true)
+    else
+        warn ".env 不存在: $ENV_FILE（将回退到旧版硬编码）"
+    fi
+
+    if [[ -n "$ref" ]]; then
+        BACKEND_IMAGE_REF="$ref"
+        info "后端镜像 ref: $BACKEND_IMAGE_REF（来自 .env）"
+    else
+        BACKEND_IMAGE_REF="$IMAGE_NAME:$FINAL_IMAGE_TAG"
+        warn "未读到 BISHENG_BACKEND_IMAGE，回退: $BACKEND_IMAGE_REF"
+    fi
+
+    if [[ -n "$net" ]]; then
+        EXPECTED_NETWORK="$net"
+    else
+        EXPECTED_NETWORK="${COMPOSE_PROJECT}_default"
+        warn "未读到 BISHENG_NETWORK_NAME，回退: $EXPECTED_NETWORK"
+    fi
+    info "期望网络: $EXPECTED_NETWORK"
+}
+
 # ─── 网络一致性检查 ───────────────────────────────────────────
 check_network_consistency() {
     header "网络一致性检查"
 
-    local expected_network="${COMPOSE_PROJECT}_default"
+    local expected_network="${EXPECTED_NETWORK}"
     local containers=($BACKEND_CONTAINER $WORKER_CONTAINER $FRONTEND_CONTAINER)
     local net_ok=true
 
@@ -175,11 +227,14 @@ load_backend_image() {
     fi
     info "镜像加载完成"
 
-    step "2/6" "打成 compose 引用的 tag: $IMAGE_NAME:$FINAL_IMAGE_TAG"
-    docker tag "$IMAGE_NAME:$SOURCE_IMAGE_TAG" "$IMAGE_NAME:$FINAL_IMAGE_TAG"
+    step "2/6" "打成 compose 引用的镜像 ref: $BACKEND_IMAGE_REF"
+    if ! docker tag "$IMAGE_NAME:$SOURCE_IMAGE_TAG" "$BACKEND_IMAGE_REF"; then
+        error "docker tag 失败：$IMAGE_NAME:$SOURCE_IMAGE_TAG → $BACKEND_IMAGE_REF"
+        exit 1
+    fi
     info "镜像 tag 完成"
 
-    docker images "$IMAGE_NAME" --format "{{.Repository}}:{{.Tag}}  {{.Size}}"
+    docker images --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | grep -F "${BACKEND_IMAGE_REF%%:*}" || true
 }
 
 # ─── 重建后端容器 ────────────────────────────────────────────
@@ -428,7 +483,7 @@ final_verification() {
     fi
 
     info "5. 网络一致性..."
-    local expected_network="${COMPOSE_PROJECT}_default"
+    local expected_network="${EXPECTED_NETWORK}"
     for c in "$BACKEND_CONTAINER" "$WORKER_CONTAINER" "$FRONTEND_CONTAINER"; do
         local net
         net=$(docker inspect "$c" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null || echo "<not exists>")
@@ -479,7 +534,14 @@ BiSheng 本地构建产物一键部署脚本
 
 环境变量（可覆盖默认值）:
   UPLOAD_DIR, BACKEND_TAR, FRONTEND_ARCHIVE, CLIENT_ARCHIVE, COMPOSE_DIR, COMPOSE_PROJECT
-  BACKEND_HEALTH_TIMEOUT, FINAL_IMAGE_TAG, SOURCE_IMAGE_TAG
+  BACKEND_HEALTH_TIMEOUT, SOURCE_IMAGE_TAG
+  ENV_FILE                  compose .env 路径（默认: \$COMPOSE_DIR/.env）
+  FINAL_IMAGE_TAG           .env 缺少 BISHENG_BACKEND_IMAGE 时的回退 tag（默认: v2.6.0）
+
+镜像 ref 与网络名从 .env 读取：
+  BISHENG_BACKEND_IMAGE     后端镜像完整 ref，脚本按它 docker tag（3.0+）
+  BISHENG_NETWORK_NAME      default 网络真实名（3.0+，如 bisheng-network）
+  读不到时回退到 dataelement/bisheng-backend:<FINAL_IMAGE_TAG> 与 <project>_default
 
 示例:
   $0                                          # 默认：后端 + platform + client
@@ -497,6 +559,7 @@ EOF
         esac
     done
 
+    load_compose_env
     check_prerequisites
     check_network_consistency
 
