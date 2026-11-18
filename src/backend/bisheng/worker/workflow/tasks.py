@@ -11,6 +11,7 @@ from bisheng.common.services.config_service import settings
 from bisheng.core.logger import trace_id_var
 from bisheng.database.models.flow import FlowDao
 from bisheng.open_api.domain.services.execution_context import restore_execution_context
+from bisheng.mcp_manage.clients.base import use_wms_user_token_context
 from bisheng.permission.application.business_authorization import require_business_action
 from bisheng.permission.application.identity import get_current_permission_actor
 from bisheng.public_endpoints.domain.services.guest_policy import should_skip_public_workflow_use
@@ -89,7 +90,8 @@ def _execute_workflow(unique_id: str, workflow_id: str, chat_id: str, user_id: i
             flow_user_id=flow_user_id,
         )
         redis_callback.workflow = workflow
-        status, reason = workflow.run()
+        with use_wms_user_token_context(redis_callback.get_wms_user_token()):
+            status, reason = workflow.run()
         _judge_workflow_status(redis_callback, workflow)
     except IgnoreException as e:
         logger.warning(f"execute_workflow ignore error: {e}")
@@ -179,7 +181,8 @@ def _continue_workflow(unique_id: str, workflow_id: str, chat_id: str, user_id: 
         if not user_input:
             raise IgnoreException("workflow continue not found user input")
         redis_callback.set_workflow_status(WorkflowStatus.RUNNING.value)
-        status, reason = workflow.run(user_input)
+        with use_wms_user_token_context(redis_callback.get_wms_user_token()):
+            status, reason = workflow.run(user_input)
         _judge_workflow_status(redis_callback, workflow)
     except IgnoreException as e:
         logger.warning(f"continue_workflow ignore error: {e}")

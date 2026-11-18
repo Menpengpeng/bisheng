@@ -58,6 +58,7 @@ async def invoke_workflow(body: OpenWorkflowInvokeRequest, request: Request):
         override=body.override,
         user_input=body.input,
         message_id=body.message_id,
+        wms_user_token=request.headers.get("X-WMS-User-Token"),
     )
     session_id = invocation.session_id
     logger.debug(f"waiting workflow over or input: {workflow_id}, {session_id}")

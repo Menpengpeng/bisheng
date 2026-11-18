@@ -57,6 +57,7 @@ class PublishedWorkflowService:
         override: dict | None,
         user_input: dict | None,
         message_id: int | None,
+        wms_user_token: str | None = None,
     ) -> WorkflowInvocation:
         workflow_info = await cls.get_workflow(workflow_id)
         if not session_id:
@@ -83,6 +84,7 @@ class PublishedWorkflowService:
             )
 
         callback = RedisCallback(unique_id, workflow_id, chat_id, operator_user_id, source="api")
+        callback.set_wms_user_token(wms_user_token)
         worker = await workflow_stateful_worker.find_task_node(chat_id)
         status_info = callback.get_workflow_status()
         snapshot_data = execution_snapshot.model_dump(mode="json")

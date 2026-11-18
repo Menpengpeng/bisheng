@@ -1,6 +1,6 @@
 import asyncio
 from abc import ABC, abstractmethod
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import Any
 
@@ -18,14 +18,21 @@ def _flatten_mcp_error(exc: BaseException) -> str:
     return str(exc).strip() or type(exc).__name__
 
 
-@asynccontextmanager
-async def use_wms_user_token(token: str | None):
+@contextmanager
+def use_wms_user_token_context(token: str | None):
     """在单次 Workflow 执行期间保存 WMS 用户令牌。"""
     context_token = _wms_user_token.set(token.strip() if token else None)
     try:
         yield
     finally:
         _wms_user_token.reset(context_token)
+
+
+@asynccontextmanager
+async def use_wms_user_token(token: str | None):
+    """异步 Workflow 调用链使用的 WMS 用户令牌上下文。"""
+    with use_wms_user_token_context(token):
+        yield
 
 
 def get_wms_user_token() -> str | None:

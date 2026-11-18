@@ -8,7 +8,12 @@ import pytest
 from bisheng.common.errcode.tool import ToolMcpStdioError
 from bisheng.core.config.settings import McpConf
 from bisheng.mcp_manage.clients import streamable as streamable_module
-from bisheng.mcp_manage.clients.base import BaseMcpClient, use_wms_user_token
+from bisheng.mcp_manage.clients.base import (
+    BaseMcpClient,
+    get_wms_user_token,
+    use_wms_user_token,
+    use_wms_user_token_context,
+)
 from bisheng.mcp_manage.clients.sse import SseClient
 from bisheng.mcp_manage.clients.streamable import StreamableClient
 from bisheng.mcp_manage.constant import McpClientType
@@ -49,6 +54,13 @@ def test_sse_and_streamable_still_construct():
     streamable = ClientManager.sync_connect_mcp_from_json(_STREAMABLE_SCHEMA)
     assert isinstance(sse, SseClient)
     assert isinstance(streamable, StreamableClient)
+
+
+def test_sync_wms_token_context_is_available_to_worker_code():
+    with use_wms_user_token_context("worker-wms-token"):
+        assert get_wms_user_token() == "worker-wms-token"
+
+    assert get_wms_user_token() is None
 
 
 async def test_streamable_client_forwards_wms_user_token_only_when_enabled(monkeypatch):

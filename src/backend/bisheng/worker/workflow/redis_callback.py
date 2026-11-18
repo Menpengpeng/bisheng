@@ -83,6 +83,7 @@ class RedisCallback(BaseCallback):
         self.workflow_event_key = f"workflow:{unique_id}:event"
         self.workflow_input_key = f"workflow:{unique_id}:input"
         self.workflow_stop_key = f"workflow:{unique_id}:stop"
+        self.workflow_wms_user_token_key = f"workflow:{unique_id}:wms_user_token"
         self.workflow_expire_time = settings.get_workflow_conf().timeout * 60 + 60
 
     def set_workflow_data(self, data: dict, override: dict = None):
@@ -118,6 +119,16 @@ class RedisCallback(BaseCallback):
     def get_workflow_data(self) -> dict:
         return self.redis_client.get(self.workflow_data_key)
 
+    def set_wms_user_token(self, token: str | None):
+        """保存仅供本次异步工作流 Worker 使用的 WMS 用户令牌。"""
+        if token:
+            self.redis_client.set(self.workflow_wms_user_token_key, token, expiration=self.workflow_expire_time)
+            return
+        self.redis_client.delete(self.workflow_wms_user_token_key)
+
+    def get_wms_user_token(self) -> str | None:
+        return self.redis_client.get(self.workflow_wms_user_token_key)
+
     def set_workflow_status(self, status: str, reason: str = None):
         self.redis_client.set(
             self.workflow_status_key,
@@ -128,6 +139,7 @@ class RedisCallback(BaseCallback):
             # Message Events and StatuskeyConsumption may also be required
             self.redis_client.delete(self.workflow_data_key)
             self.redis_client.delete(self.workflow_input_key)
+            self.redis_client.delete(self.workflow_wms_user_token_key)
 
     async def async_set_workflow_status(self, status: str, reason: str = None):
         await self.redis_client.aset(
@@ -139,6 +151,7 @@ class RedisCallback(BaseCallback):
             # Message Events and StatuskeyConsumption may also be required
             await self.redis_client.adelete(self.workflow_data_key)
             await self.redis_client.adelete(self.workflow_input_key)
+            await self.redis_client.adelete(self.workflow_wms_user_token_key)
 
     def get_workflow_status(self) -> dict | None:
         workflow_status = self.redis_client.get(self.workflow_status_key)
@@ -152,11 +165,13 @@ class RedisCallback(BaseCallback):
         self.redis_client.delete(self.workflow_status_key)
         self.redis_client.delete(self.workflow_stop_key)
         self.redis_client.delete(self.workflow_data_key)
+        self.redis_client.delete(self.workflow_wms_user_token_key)
 
     async def async_clear_workflow_status(self):
         await self.redis_client.adelete(self.workflow_status_key)
         await self.redis_client.adelete(self.workflow_stop_key)
         await self.redis_client.adelete(self.workflow_data_key)
+        await self.redis_client.adelete(self.workflow_wms_user_token_key)
 
     def insert_workflow_response(self, event: dict):
         self.redis_client.rpush(self.workflow_event_key, json.dumps(event), expiration=self.workflow_expire_time)
