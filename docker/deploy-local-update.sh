@@ -300,6 +300,42 @@ wait_backend_healthy() {
     exit 1
 }
 
+# ─── 后端重建后刷新 nginx ─────────────────────────────────────
+# nginx 启动时解析并缓存 upstream IP；backend 容器重建后 IP 变了，
+# 不 reload 就会一直 502（--no-frontend 时尤其容易踩到）。
+reload_frontend_nginx() {
+    header "刷新 nginx 与后端连接"
+
+    if ! docker inspect "$FRONTEND_CONTAINER" --format '{{.State.Status}}' 2>/dev/null | grep -q running; then
+        warn "$FRONTEND_CONTAINER 未运行，跳过 nginx reload"
+        return 0
+    fi
+
+    if docker exec "$FRONTEND_CONTAINER" nginx -s reload >/dev/null 2>&1; then
+        info "nginx 已 reload"
+    else
+        warn "nginx reload 失败（可手动执行：docker exec $FRONTEND_CONTAINER nginx -s reload）"
+    fi
+
+    # 复测代理：动态解析生效可能需要几秒，最多重试 5 次
+    local code=""
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        sleep 2
+        code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/api/v1/env 2>/dev/null || echo "000")
+        # 401 说明请求已到达后端（未登录），同样算转发正常
+        [[ "$code" =~ ^(200|401)$ ]] && break
+    done
+
+    if [[ "$code" =~ ^(200|401)$ ]]; then
+        info "前端→后端 API 代理正常 (HTTP $code)"
+    else
+        warn "前端→后端 API 代理仍异常: HTTP $code（第 $attempt 次复测）"
+        warn "  排查：docker exec $FRONTEND_CONTAINER nginx -T | grep -E 'resolver|proxy_pass'"
+        warn "  配置里应有 resolver 127.0.0.11 且 proxy_pass 用变量，否则每次重建 backend 都会 502"
+    fi
+}
+
 # ─── 解压前端归档（tar.gz / zip 自动识别）────────────────────
 extract_frontend() {
     local archive="$1" dest="$2"
@@ -567,6 +603,7 @@ EOF
         load_backend_image
         recreate_backend
         wait_backend_healthy
+        reload_frontend_nginx
     else
         info "跳过后端更新（--no-backend）"
     fi
