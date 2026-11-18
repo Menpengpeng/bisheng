@@ -1,11 +1,14 @@
 """STDIO MCP is frozen off: create and execute both raise 15025, no process spawn."""
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from bisheng.common.errcode.tool import ToolMcpStdioError
 from bisheng.core.config.settings import McpConf
+from bisheng.mcp_manage.clients import streamable as streamable_module
+from bisheng.mcp_manage.clients.base import use_wms_user_token
 from bisheng.mcp_manage.clients.sse import SseClient
 from bisheng.mcp_manage.clients.streamable import StreamableClient
 from bisheng.mcp_manage.constant import McpClientType
@@ -46,6 +49,34 @@ def test_sse_and_streamable_still_construct():
     streamable = ClientManager.sync_connect_mcp_from_json(_STREAMABLE_SCHEMA)
     assert isinstance(sse, SseClient)
     assert isinstance(streamable, StreamableClient)
+
+
+async def test_streamable_client_forwards_wms_user_token_only_when_enabled(monkeypatch):
+    requests = []
+
+    @asynccontextmanager
+    async def fake_streamable_http_client(**kwargs):
+        requests.append(kwargs)
+        yield None, None, None
+
+    monkeypatch.setattr(streamable_module, "streamablehttp_client", fake_streamable_http_client)
+    client = StreamableClient(
+        "http://wms.example/mcp",
+        headers={"Authorization": "Bearer discovery-token"},
+        forwardWmsUserToken=True,
+    )
+
+    async with use_wms_user_token("current-wms-user-token"):
+        async with client.get_transport():
+            pass
+
+    assert requests[0]["headers"]["Authorization"] == "Bearer current-wms-user-token"
+    assert client.kwargs["headers"]["Authorization"] == "Bearer discovery-token"
+
+    async with client.get_tool_transport():
+        pass
+
+    assert "Authorization" not in requests[1]["headers"]
 
 
 @pytest.mark.asyncio

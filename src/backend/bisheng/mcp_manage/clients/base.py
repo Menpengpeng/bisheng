@@ -1,8 +1,26 @@
-from abc import abstractmethod, ABC
+from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from mcp import ClientSession
+
+_wms_user_token: ContextVar[str | None] = ContextVar("wms_user_token", default=None)
+
+
+@asynccontextmanager
+async def use_wms_user_token(token: str | None):
+    """在单次 Workflow 执行期间保存 WMS 用户令牌。"""
+    context_token = _wms_user_token.set(token.strip() if token else None)
+    try:
+        yield
+    finally:
+        _wms_user_token.reset(context_token)
+
+
+def get_wms_user_token() -> str | None:
+    """返回当前 Workflow 执行上下文中的 WMS 用户令牌。"""
+    return _wms_user_token.get()
 
 
 class BaseMcpClient(ABC):
@@ -13,6 +31,12 @@ class BaseMcpClient(ABC):
     @abstractmethod
     async def get_transport(self):
         raise NotImplementedError("get_mcp_client_transport() must be implemented in subclasses.")
+
+    @asynccontextmanager
+    async def get_tool_transport(self):
+        """建立用于实际工具执行的 MCP 传输。"""
+        async with self.get_transport() as transport:
+            yield transport
 
     @asynccontextmanager
     async def initialize(self):
@@ -33,9 +57,11 @@ class BaseMcpClient(ABC):
         """
         Call a tool.
         """
-        async with self.initialize() as client_session:
-            try:
-                resp = await client_session.call_tool(name, arguments)
-            except Exception as e:
-                return f"Tool call failed: {str(e)}"
+        async with self.get_tool_transport() as (read, write):
+            async with ClientSession(read, write) as client_session:
+                await client_session.initialize()
+                try:
+                    resp = await client_session.call_tool(name, arguments)
+                except Exception as e:
+                    return f"Tool call failed: {str(e)}"
         return resp.model_dump_json()
